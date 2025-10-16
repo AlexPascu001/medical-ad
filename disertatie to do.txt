@@ -1,0 +1,20 @@
+mai multe ancore: repel intre ancore (imaginile "normale" - reprezentate de mai multe ancore)
+
+pornire de la eigenfaces => le invatam si folosim toti termenii
+
+
+dupa ce finalizam antrenarea => toate sample-urile normale sa se aglomereze in jurul unui anchor
+
+anomalii finale => dist(sample test, cea mai apropiata ancora) 
+calculez curva ROC si scot AUC (toate thresholdurile pozitive, true positive rate, etc)
+metrici: image AUROC, pixel level AUROC
+
+daca avem ancora => ne uitam la metrica generala (mse/distanta, pixel-wise test => anumite regiuni mai indepartate de ancora)
+
+
+finetunez modelul + folosesc ancorele la test-time ca sa vedem cea mai apropiata ancora de imagine si la aceea ne referim
+
+
+incercam sa venim cu niste ancore (cluster centroids, eigenfaces) (input space? embedding space?) care incearca sa traga sampleurile din jurul lor spre ele
+
+cand ar fi o anomalie: ar tb sa nu fie aproape de nicio ancora
