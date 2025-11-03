@@ -1,0 +1,50 @@
+# Default Configuration for BMAD Brain MRI Anomaly Detection
+
+seed: 42
+output_dir: './experiments/bmad_baseline'
+
+# Data configuration
+data:
+  data_root: '../data/BraTS2021_slice'  # Root directory of the dataset
+  target_size: [240, 240]  # Image resolution (H, W) - actual BraTS slice size
+
+# Anchor configuration
+anchor:
+  strategy: 'eigenface'     # Strategy: 'eigenface' (PCA + clustering) or 'kmeans' (direct clustering)
+  n_components: 50          # Number of PCA components (M) - only for eigenface strategy
+  n_anchors: 8              # Number of anchors (K)
+  max_images_for_pca: 5000  # Max images to use for anchor generation (memory constraint)
+
+# Model configuration
+model:
+  backbone: 'vit_small_patch16_dinov3.lvd1689m'  # Options: vit_small_patch16_dinov3.lvd1689m
+  freeze_backbone: true       # Freeze DINOv3 weights (only train projection head)
+  projection_dim: 128         # Trainable projection head dimension (set to null to disable)
+
+# Loss configuration
+loss:
+  margin: 1.0             # Margin m for repeller term (anchors should be >= 2m apart)
+  alpha: 1.0              # Weight for attractor term (pull samples to anchors)
+  beta: 1.0               # Weight for repeller term (push anchors apart)
+  distance_metric: 'euclidean'  # Distance metric: 'euclidean' or 'cosine'
+  use_dense: false        # Use dense features for localization
+  global_weight: 1.0      # Weight for global loss
+  dense_weight: 0.5       # Weight for dense loss
+  spatial_reduction: 'mean'  # 'mean' or 'max' for dense loss
+
+# Training configuration
+training:
+  epochs: 50
+  batch_size: 64
+  num_workers: 4
+  lr: 0.0001
+  weight_decay: 0.000001
+  use_amp: true           # Mixed precision training
+  log_interval: 50        # Log every N batches
+  val_interval: 1         # Validate every N epochs
+  early_stopping_patience: 10
+
+# Evaluation configuration
+eval:
+  compute_pixel: true     # Compute pixel-level AUROC
+  bootstrap_samples: 1000 # Number of bootstrap samples for CI

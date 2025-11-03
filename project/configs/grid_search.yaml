@@ -1,0 +1,217 @@
+# Hyperparameter Grid Search Configurations
+# Run multiple experiments with different settings
+
+# Experiment 1: K=4 anchors
+experiment_k4:
+  seed: 42
+  output_dir: './experiments/bmad_k4'
+  anchor:
+    n_components: 50
+    n_anchors: 4
+    max_images_for_pca: 5000
+  model:
+    backbone: 'dinov2_vitb14'
+    freeze_backbone: true
+  loss:
+    margin_attract: 0.2
+    margin_repel: 0.4
+    alpha: 1.0
+    beta: 1.0
+  training:
+    epochs: 50
+    batch_size: 64
+    lr: 1e-4
+
+# Experiment 5: M=100 PCA components
+experiment_m100:
+  seed: 42
+  output_dir: './experiments/bmad_m100'
+  anchor:
+    n_components: 100
+    n_anchors: 8
+    max_images_for_pca: 5000
+  model:
+    backbone: 'dinov2_vitb14'
+    freeze_backbone: true
+  loss:
+    margin_attract: 0.2
+    margin_repel: 0.4
+    alpha: 1.0
+    beta: 1.0
+  training:
+    epochs: 50
+    batch_size: 64
+    lr: 1e-4
+
+# Experiment 6: Finetuned backbone
+experiment_finetune:
+  seed: 42
+  output_dir: './experiments/bmad_finetune'
+  anchor:
+    n_components: 50
+    n_anchors: 8
+    max_images_for_pca: 5000
+  model:
+    backbone: 'dinov2_vitb14'
+    freeze_backbone: false
+    projection_dim: 512
+  loss:
+    margin_attract: 0.2
+    margin_repel: 0.4
+    alpha: 1.0
+    beta: 1.0
+  training:
+    epochs: 50
+    batch_size: 32  # Smaller batch for finetuning
+    lr: 1e-5  # Lower LR for finetuning
+    weight_decay: 1e-5
+
+# Experiment 7: Dense features for localization
+experiment_dense:
+  seed: 42
+  output_dir: './experiments/bmad_dense'
+  anchor:
+    n_components: 50
+    n_anchors: 8
+    max_images_for_pca: 5000
+  model:
+    backbone: 'dinov2_vitb14'
+    freeze_backbone: true
+  loss:
+    margin_attract: 0.2
+    margin_repel: 0.4
+    alpha: 1.0
+    beta: 1.0
+    use_dense: true
+    global_weight: 1.0
+    dense_weight: 0.5
+  training:
+    epochs: 50
+    batch_size: 48
+    lr: 1e-4
+
+# Experiment 8: Tight margins
+experiment_tight_margins:
+  seed: 42
+  output_dir: './experiments/bmad_tight_margins'
+  anchor:
+    n_components: 50
+    n_anchors: 8
+    max_images_for_pca: 5000
+  model:
+    backbone: 'dinov2_vitb14'
+    freeze_backbone: true
+  loss:
+    margin_attract: 0.1
+    margin_repel: 0.3
+    alpha: 1.0
+    beta: 1.0
+  training:
+    epochs: 50
+    batch_size: 64
+    lr: 1e-4
+
+# Experiment 9: Wide margins
+experiment_wide_margins:
+  seed: 42
+  output_dir: './experiments/bmad_wide_margins'
+  anchor:
+    n_components: 50
+    n_anchors: 8
+    max_images_for_pca: 5000
+  model:
+    backbone: 'dinov2_vitb14'
+    freeze_backbone: true
+  loss:
+    margin_attract: 0.3
+    margin_repel: 0.6
+    alpha: 1.0
+    beta: 1.0
+  training:
+    epochs: 50
+    batch_size: 64
+    lr: 1e-4
+
+# Experiment 10: Small backbone (ViT-S)
+experiment_vits:
+  seed: 42
+  output_dir: './experiments/bmad_vits'
+  anchor:
+    n_components: 50
+    n_anchors: 8
+    max_images_for_pca: 5000
+  model:
+    backbone: 'dinov2_vits14'
+    freeze_backbone: true
+  loss:
+    margin_attract: 0.2
+    margin_repel: 0.4
+    alpha: 1.0
+    beta: 1.0
+  training:
+    epochs: 50
+    batch_size: 64
+    lr: 1e-4
+    freeze_backbone: true
+  loss:
+    margin_attract: 0.2
+    margin_repel: 0.4
+    alpha: 1.0
+    beta: 1.0
+  training:
+    epochs: 50
+    batch_size: 64
+    lr: 1e-4
+
+# Experiment 2: K=8 anchors (baseline)
+experiment_k8:
+  seed: 42
+  output_dir: './experiments/bmad_k8'
+  anchor:
+    n_components: 50
+    n_anchors: 8
+    max_images_for_pca: 5000
+  model:
+    backbone: 'dinov2_vitb14'
+    freeze_backbone: true
+  loss:
+    margin_attract: 0.2
+    margin_repel: 0.4
+    alpha: 1.0
+    beta: 1.0
+  training:
+    epochs: 50
+    batch_size: 64
+    lr: 1e-4
+
+# Experiment 3: K=16 anchors
+experiment_k16:
+  seed: 42
+  output_dir: './experiments/bmad_k16'
+  anchor:
+    n_components: 50
+    n_anchors: 16
+    max_images_for_pca: 5000
+  model:
+    backbone: 'dinov2_vitb14'
+    freeze_backbone: true
+  loss:
+    margin_attract: 0.2
+    margin_repel: 0.4
+    alpha: 1.0
+    beta: 1.0
+  training:
+    epochs: 50
+    batch_size: 64
+    lr: 1e-4
+
+# Experiment 4: M=20 PCA components
+experiment_m20:
+  seed: 42
+  output_dir: './experiments/bmad_m20'
+  anchor:
+    n_components: 20
+    n_anchors: 8
+    max_images_for_pca: 5000
+  model:
+    backbone: 'dinov2_vitb14'

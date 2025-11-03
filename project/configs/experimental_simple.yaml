@@ -1,0 +1,51 @@
+# EXPERIMENTAL Configuration - K-means anchors, no projection head
+# Alternative approach to test if simpler is better
+
+seed: 42
+output_dir: './experiments/bmad_kmeans_simple'
+
+# Data configuration
+data:
+  data_root: '../data/BraTS2021_slice'
+  target_size: [240, 240]
+
+# Anchor configuration - Try K-means directly
+anchor:
+  strategy: 'kmeans'  # Direct clustering instead of PCA
+  n_components: 50  # Not used for kmeans
+  n_anchors: 16  # More anchors to capture variability
+  max_images_for_pca: 5000
+
+# Model configuration - Simpler: no projection head
+model:
+  backbone: 'vit_small_patch16_dinov3.lvd1689m'
+  freeze_backbone: true
+  projection_dim: null  # No projection head (use backbone features directly)
+
+# Loss configuration - Attractor only
+loss:
+  margin: 1.0
+  alpha: 1.0
+  beta: 0.0  # No repeller
+  distance_metric: 'euclidean'
+  use_dense: true
+  global_weight: 1.0
+  dense_weight: 0.3  # Lower weight for dense
+  spatial_reduction: 'mean'
+
+# Training configuration - Since no trainable params, this is evaluation only
+training:
+  epochs: 1  # No training needed (frozen backbone, no projection)
+  batch_size: 64
+  num_workers: 4
+  lr: 0.0001
+  weight_decay: 0.000001
+  use_amp: true
+  log_interval: 50
+  val_interval: 1
+  early_stopping_patience: 10
+
+# Evaluation configuration
+eval:
+  compute_pixel: true
+  bootstrap_samples: 1000
