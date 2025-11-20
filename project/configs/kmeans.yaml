@@ -1,0 +1,51 @@
+# K-Means Centroid Anchor Configuration
+# Uses k-means clustering in image space to generate anchors
+
+seed: 42
+output_dir: './experiments/bmad_baseline'  # Will be auto-renamed to bmad_kmeans_k8
+
+# Data configuration
+data:
+  data_root: '../data/BraTS2021_slice'
+  target_size: [240, 240]
+
+# Anchor configuration - K-MEANS
+anchor:
+  strategy: 'kmeans'           # K-means clustering in image space
+  n_components: 50             # Not used for kmeans strategy
+  n_anchors: 8                 # Number of anchors (K) - try 4, 8, 16, 32
+  max_images_for_pca: 5000     # Max images for clustering
+
+# Model configuration
+model:
+  backbone: 'vit_small_patch16_dinov3.lvd1689m'
+  freeze_backbone: true
+  projection_dim: 128
+
+# Loss configuration
+loss:
+  margin: 1.0
+  alpha: 1.0
+  beta: 0.0                    # No repeller
+  distance_metric: 'euclidean'
+  use_dense: false
+  global_weight: 1.0
+  dense_weight: 0.5
+  spatial_reduction: 'mean'
+
+# Training configuration
+training:
+  epochs: 50
+  batch_size: 64
+  num_workers: 4
+  lr: 0.0001
+  weight_decay: 0.000001
+  use_amp: true
+  log_interval: 50
+  val_interval: 1
+  early_stopping_patience: 10
+
+# Evaluation configuration
+eval:
+  compute_pixel: true
+  bootstrap_samples: 1000

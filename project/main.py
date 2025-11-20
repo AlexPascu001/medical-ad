@@ -232,7 +232,8 @@ def create_model(config: dict, anchor_global: torch.Tensor, anchor_dense: torch.
     detector = AnomalyDetector(
         backbone=backbone,
         anchor_global_embeddings=anchor_global,
-        anchor_dense_embeddings=anchor_dense
+        anchor_dense_embeddings=anchor_dense,
+        distance_metric=config['loss']['distance_metric']
     )
     
     return detector
@@ -269,6 +270,26 @@ def create_criterion(config: dict) -> CombinedAnchorLoss:
     return criterion
 
 
+def generate_experiment_name(config: dict, base_dir: str = './experiments') -> str:
+    """
+    Generate experiment name based on anchor and distance configuration
+    
+    Format: <base_name>_<strategy>_k<num_anchors>_<distance>
+    Example: bmad_eigenface_k8_cosine, bmad_random_k16_l2, bmad_kmeans_k4_cosine
+    """
+    base_name = Path(base_dir).name if '/' in base_dir or '\\' in base_dir else 'bmad'
+    strategy = config['anchor']['strategy']
+    n_anchors = config['anchor']['n_anchors']
+    distance = config['loss']['distance_metric']
+    
+    # Abbreviate distance metric
+    dist_abbrev = 'cos' if distance == 'cosine' else 'l2'
+    
+    exp_name = f"{base_name}_{strategy}_k{n_anchors}_{dist_abbrev}"
+    
+    return exp_name
+
+
 def main(args):
     """Main training pipeline"""
     # Load config
@@ -277,8 +298,17 @@ def main(args):
     # Set seed
     set_seed(config['seed'])
     
+    # Auto-generate experiment name if using default output_dir or if requested
+    if args.auto_name or config['output_dir'] == './experiments/bmad_baseline':
+        # Extract base directory
+        base_output = Path(config['output_dir']).parent
+        exp_name = generate_experiment_name(config, str(base_output))
+        save_dir = base_output / exp_name
+        config['output_dir'] = str(save_dir)
+    else:
+        save_dir = Path(config['output_dir'])
+    
     # Create output directory
-    save_dir = Path(config['output_dir'])
     save_dir.mkdir(parents=True, exist_ok=True)
     
     # Save config
@@ -290,6 +320,8 @@ def main(args):
     print("="*80)
     print(f"Output directory: {save_dir}")
     print(f"Config: {args.config}")
+    print(f"Anchor strategy: {config['anchor']['strategy']}")
+    print(f"Number of anchors: {config['anchor']['n_anchors']}")
     
     # Setup device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -475,6 +507,8 @@ if __name__ == '__main__':
                         help='Skip anchor generation if already exists')
     parser.add_argument('--eval-only', action='store_true',
                         help='Only run evaluation on existing model')
+    parser.add_argument('--auto-name', action='store_true',
+                        help='Auto-generate experiment name from anchor config (strategy_k<n_anchors>)')
     
     args = parser.parse_args()
     main(args)

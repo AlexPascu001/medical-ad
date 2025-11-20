@@ -317,6 +317,94 @@ class KMeansCentroidAnchorStrategy(AnchorStrategy):
         print(f"  {self.n_anchors} anchors")
 
 
+class RandomAnchorStrategy(AnchorStrategy):
+    """
+    Random anchor generation - baseline strategy
+    
+    Simply selects random images from the training set as anchors.
+    This serves as a baseline to compare against more sophisticated methods.
+    """
+    
+    def __init__(
+        self,
+        n_anchors: int = 8,
+        random_state: int = 42
+    ):
+        """
+        Args:
+            n_anchors: Number of anchors (K)
+            random_state: Random seed
+        """
+        self.n_anchors = n_anchors
+        self.random_state = random_state
+        self.anchor_images = None
+        self.selected_indices = None
+        
+    def fit(self, images: np.ndarray) -> np.ndarray:
+        """
+        Generate anchors by randomly selecting images
+        
+        Steps:
+        1. Randomly select K images from training set
+        2. Use them directly as anchors
+        """
+        N, H, W = images.shape
+        print(f"\n{'='*80}")
+        print(f"RANDOM ANCHOR GENERATION (BASELINE)")
+        print(f"{'='*80}")
+        print(f"Input: {N} images of size {H}×{W}")
+        
+        # Set random seed for reproducibility
+        np.random.seed(self.random_state)
+        
+        # Randomly select K images
+        print(f"\nRandomly selecting {self.n_anchors} images as anchors...")
+        self.selected_indices = np.random.choice(N, size=self.n_anchors, replace=False)
+        
+        anchor_images = []
+        for k, idx in enumerate(self.selected_indices):
+            anchor_images.append(images[idx])
+            print(f"   Anchor {k}: Selected image index {idx}")
+        
+        self.anchor_images = np.array(anchor_images)  # (K, H, W)
+        
+        print(f"\n{'='*80}")
+        print(f"✓ Generated {self.n_anchors} random anchors")
+        print(f"{'='*80}\n")
+        
+        return self.anchor_images
+    
+    def get_anchor_images(self) -> np.ndarray:
+        """Return anchor images"""
+        return self.anchor_images
+    
+    def save(self, path: str):
+        """Save random strategy state"""
+        state = {
+            'strategy': 'random',
+            'n_anchors': self.n_anchors,
+            'random_state': self.random_state,
+            'anchor_images': self.anchor_images,
+            'selected_indices': self.selected_indices
+        }
+        with open(path, 'wb') as f:
+            pickle.dump(state, f)
+        print(f"Saved random strategy to {path}")
+    
+    def load(self, path: str):
+        """Load random strategy state"""
+        with open(path, 'rb') as f:
+            state = pickle.load(f)
+        
+        self.n_anchors = state['n_anchors']
+        self.random_state = state['random_state']
+        self.anchor_images = state['anchor_images']
+        self.selected_indices = state['selected_indices']
+        
+        print(f"Loaded random strategy from {path}")
+        print(f"  {self.n_anchors} anchors")
+
+
 class AnchorGenerator:
     """
     Factory class for anchor generation with modular strategy selection
@@ -331,7 +419,7 @@ class AnchorGenerator:
     ):
         """
         Args:
-            strategy: 'eigenface' or 'kmeans'
+            strategy: 'eigenface', 'kmeans', or 'random'
             n_components: PCA components (only for eigenface)
             n_anchors: Number of anchors (K)
             random_state: Random seed
@@ -349,9 +437,14 @@ class AnchorGenerator:
                 n_anchors=n_anchors,
                 random_state=random_state
             )
+        elif strategy == 'random':
+            self.strategy = RandomAnchorStrategy(
+                n_anchors=n_anchors,
+                random_state=random_state
+            )
         else:
             raise ValueError(f"Unknown strategy: {strategy}. "
-                           f"Choose 'eigenface' or 'kmeans'")
+                           f"Choose 'eigenface', 'kmeans', or 'random'")
     
     def fit(self, images: np.ndarray) -> np.ndarray:
         """Generate anchors using selected strategy"""
@@ -381,6 +474,8 @@ class AnchorGenerator:
             gen.strategy = EigenfaceAnchorStrategy.__new__(EigenfaceAnchorStrategy)
         elif strategy_name == 'kmeans':
             gen.strategy = KMeansCentroidAnchorStrategy.__new__(KMeansCentroidAnchorStrategy)
+        elif strategy_name == 'random':
+            gen.strategy = RandomAnchorStrategy.__new__(RandomAnchorStrategy)
         else:
             raise ValueError(f"Unknown strategy: {strategy_name}")
         

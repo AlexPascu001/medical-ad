@@ -149,17 +149,20 @@ class AnomalyDetector(nn.Module):
         self,
         backbone: DINOv3Backbone,
         anchor_global_embeddings: torch.Tensor,
-        anchor_dense_embeddings: Optional[torch.Tensor] = None
+        anchor_dense_embeddings: Optional[torch.Tensor] = None,
+        distance_metric: str = 'cosine'
     ):
         """
         Args:
             backbone: DINOv3Backbone model
             anchor_global_embeddings: (K, D) fixed anchor embeddings in backbone space
             anchor_dense_embeddings: (K, H', W', D) fixed dense anchor features in backbone space
+            distance_metric: 'cosine' or 'euclidean' for computing distances
         """
         super().__init__()
         
         self.backbone = backbone
+        self.distance_metric = distance_metric
         
         # Store original anchors in backbone space (not trainable)
         self.register_buffer('anchor_global_original', anchor_global_embeddings)
@@ -172,6 +175,7 @@ class AnomalyDetector(nn.Module):
         self.n_anchors = len(anchor_global_embeddings)
         
         print(f"Initialized detector with {self.n_anchors} anchors")
+        print(f"Distance metric: {distance_metric}")
         if backbone.projection is not None:
             print(f"  Anchors will be projected through trainable head during forward pass")
     
@@ -216,10 +220,14 @@ class AnomalyDetector(nn.Module):
         # Get projected anchors (will use projection head if it exists)
         anchor_global, anchor_dense = self._get_projected_anchors()
         
-        # Compute distances to anchors (cosine distance = 1 - cosine similarity)
-        # Global distances
-        cosine_sim = torch.mm(global_feat, anchor_global.t())  # (B, K)
-        global_distances = 1.0 - cosine_sim  # (B, K)
+        # Compute distances to anchors
+        if self.distance_metric == 'cosine':
+            # Cosine distance = 1 - cosine similarity
+            cosine_sim = torch.mm(global_feat, anchor_global.t())  # (B, K)
+            global_distances = 1.0 - cosine_sim  # (B, K)
+        else:  # euclidean
+            # L2 distance
+            global_distances = torch.cdist(global_feat, anchor_global, p=2)  # (B, K)
         
         output = {
             'global_feat': global_feat,
@@ -232,24 +240,37 @@ class AnomalyDetector(nn.Module):
             B, H_p, W_p, D = dense_feat.shape
             K = self.n_anchors
             
-            # Normalize dense features
-            dense_feat_norm = F.normalize(dense_feat, dim=-1)  # (B, H', W', D)
-            anchor_dense_norm = F.normalize(anchor_dense, dim=-1)  # (K, H', W', D)
-            
-            # Compute per-patch distances to each anchor
-            # Reshape for batch computation
-            dense_flat = dense_feat_norm.view(B, -1, D)  # (B, H'*W', D)
-            anchor_flat = anchor_dense_norm.view(K, -1, D)  # (K, H'*W', D)
-            
-            # Compute cosine similarity for all patches
-            dense_distances = torch.zeros(B, K, H_p * W_p, device=x.device)
-            
-            for k in range(K):
-                # (B, H'*W', D) @ (D, H'*W') -> (B, H'*W', H'*W')
-                sim = torch.bmm(dense_flat, anchor_flat[k].t().unsqueeze(0).expand(B, -1, -1))
-                # Take diagonal (corresponding patches)
-                sim_diag = sim.diagonal(dim1=1, dim2=2)  # (B, H'*W')
-                dense_distances[:, k] = 1.0 - sim_diag
+            if self.distance_metric == 'cosine':
+                # Normalize dense features
+                dense_feat_norm = F.normalize(dense_feat, dim=-1)  # (B, H', W', D)
+                anchor_dense_norm = F.normalize(anchor_dense, dim=-1)  # (K, H', W', D)
+                
+                # Compute per-patch distances to each anchor
+                # Reshape for batch computation
+                dense_flat = dense_feat_norm.view(B, -1, D)  # (B, H'*W', D)
+                anchor_flat = anchor_dense_norm.view(K, -1, D)  # (K, H'*W', D)
+                
+                # Compute cosine similarity for all patches
+                dense_distances = torch.zeros(B, K, H_p * W_p, device=x.device)
+                
+                for k in range(K):
+                    # (B, H'*W', D) @ (D, H'*W') -> (B, H'*W', H'*W')
+                    sim = torch.bmm(dense_flat, anchor_flat[k].t().unsqueeze(0).expand(B, -1, -1))
+                    # Take diagonal (corresponding patches)
+                    sim_diag = sim.diagonal(dim1=1, dim2=2)  # (B, H'*W')
+                    dense_distances[:, k] = 1.0 - sim_diag
+            else:  # euclidean
+                # Reshape for L2 distance computation
+                dense_flat = dense_feat.view(B, H_p * W_p, D)  # (B, H'*W', D)
+                anchor_flat = anchor_dense.view(K, H_p * W_p, D)  # (K, H'*W', D)
+                
+                # Compute L2 distances
+                dense_distances = torch.zeros(B, K, H_p * W_p, device=x.device)
+                
+                for k in range(K):
+                    # L2 distance for each patch to corresponding anchor patch
+                    dist = torch.norm(dense_flat - anchor_flat[k].unsqueeze(0), dim=2, p=2)  # (B, H'*W')
+                    dense_distances[:, k] = dist
             
             # Reshape to spatial
             dense_distances = dense_distances.view(B, K, H_p, W_p)  # (B, K, H', W')
