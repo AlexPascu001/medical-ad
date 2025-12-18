@@ -35,3 +35,24 @@ cand ar fi o anomalie: ar tb sa nu fie aproape de nicio ancora
 - cred ca in realitate am avea nevoie de mini decoder pentru scor de anomalii la nivel de pixel
 - sa fac o vizualizare cu t-sne pe embedding space: sa plotez ancorele, un subset de img normale si un subset de img anormale
 - unele metode din BMAD genereaza pseudoanomalii, sa verific care 
+
+
+####################################
+
+- poate aplic pe ancore in loc de samples + ancore
+- ideea e ca daca o ancora nimereste undeva langa un cluster de puncte, incercam sa o migram spre cluster si apoi sa apropiem punctele
+- realocarea punctelor in timpul antrenarii cu ancore learnable (? todo)
+- iau ancorele si atribui ancora pt punctele din jurul ei => gen fac un pseudo labeling cu label(sample) == cea mai apropiata ancora; si sa le atrag incontinuu spre asta: contrastive learning loss (aplica softamx pe cos sim(ancora, sample). centerloss, infonce? ceva contrastive loss. aplic loss pe ancora si ex apropiate de ea ca si cum ele ar fi class prototypes si samples sa convearga la prototipuri; sau cu CAM loss dar ancore nu sunt learnable deci doar attractor
+- daca plotez o data la 5-10 epoci tsne ar tb sa vad ca se apropie din ce in ce mai aproape
+- daca incerc sa fac fiecare cu fiecare se incearca sa le duca spre centrul distributiei
+- problema: separarea punctelor pe ancore
+- ancore learnable => se pot misca in spatiu
+- daca merge mai bine cu random: un motiv ca ancorele sunt luate din exemple
+- in loc sa luam centroizii kmeans sau eigenfaces, sa luam cele mai apropiate exemple de centroid/eigen (dupa ce vedem experimentele)
+- la partea de predictive: luam distanta/cos sim intre sample si cea mai app ancora si vad distanta
+
+#######################################
+- sa vedem experimentele pt learnable anchors (componenta de repel) cu cele 3 strategii
+- sa vedem daca strategia influenteaza sau nu. daca random e cea mai buna => sa vedem alte strategii.
+- sa incercam un model mai mare
+- integrare decoder

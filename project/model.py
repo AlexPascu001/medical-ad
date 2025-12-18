@@ -150,53 +150,74 @@ class AnomalyDetector(nn.Module):
         backbone: DINOv3Backbone,
         anchor_global_embeddings: torch.Tensor,
         anchor_dense_embeddings: Optional[torch.Tensor] = None,
-        distance_metric: str = 'cosine'
+        distance_metric: str = 'cosine',
+        learnable_anchors: bool = False
     ):
         """
         Args:
             backbone: DINOv3Backbone model
-            anchor_global_embeddings: (K, D) fixed anchor embeddings in backbone space
-            anchor_dense_embeddings: (K, H', W', D) fixed dense anchor features in backbone space
+            anchor_global_embeddings: (K, D) anchor embeddings (initial values)
+            anchor_dense_embeddings: (K, H', W', D) dense anchor features (initial values)
             distance_metric: 'cosine' or 'euclidean' for computing distances
+            learnable_anchors: If True, make anchors trainable parameters
         """
         super().__init__()
         
         self.backbone = backbone
         self.distance_metric = distance_metric
+        self.learnable_anchors = learnable_anchors
         
-        # Store original anchors in backbone space (not trainable)
-        self.register_buffer('anchor_global_original', anchor_global_embeddings)
-        
-        if anchor_dense_embeddings is not None:
-            self.register_buffer('anchor_dense_original', anchor_dense_embeddings)
+        # Store anchors as either buffers (fixed) or parameters (learnable)
+        if learnable_anchors:
+            # Learnable anchors: trainable parameters
+            self.anchor_global = nn.Parameter(anchor_global_embeddings.clone())
+            if anchor_dense_embeddings is not None:
+                self.anchor_dense = nn.Parameter(anchor_dense_embeddings.clone())
+            else:
+                self.anchor_dense = None
+            print(f"  ✓ Anchors are LEARNABLE ({anchor_global_embeddings.shape[0]} × {anchor_global_embeddings.shape[1]}D)")
         else:
-            self.anchor_dense_original = None
+            # Fixed anchors: non-trainable buffers
+            self.register_buffer('anchor_global', anchor_global_embeddings)
+            if anchor_dense_embeddings is not None:
+                self.register_buffer('anchor_dense', anchor_dense_embeddings)
+            else:
+                self.anchor_dense = None
+            print(f"  ✓ Anchors are FIXED (not learnable)")
         
         self.n_anchors = len(anchor_global_embeddings)
         
         print(f"Initialized detector with {self.n_anchors} anchors")
         print(f"Distance metric: {distance_metric}")
-        if backbone.projection is not None:
-            print(f"  Anchors will be projected through trainable head during forward pass")
     
     def _get_projected_anchors(self):
-        """Get anchors projected through the trainable head (if exists)"""
+        """Get anchors (potentially projected through trainable head)"""
         if self.backbone.projection is None:
-            # No projection head - use original anchors
-            return self.anchor_global_original, self.anchor_dense_original
+            # No projection head - use current anchors directly
+            anchor_global = self.anchor_global
+            if self.distance_metric == 'cosine':
+                anchor_global = F.normalize(anchor_global, dim=1)
+            return anchor_global, self.anchor_dense
         
         # Project anchors through the trainable head
-        anchor_global_projected = self.backbone.projection(self.anchor_global_original)
-        anchor_global_projected = F.normalize(anchor_global_projected, dim=1)
+        anchor_global_projected = self.backbone.projection(self.anchor_global)
+        
+        # Normalize if using cosine distance
+        if self.distance_metric == 'cosine':
+            anchor_global_projected = F.normalize(anchor_global_projected, dim=1)
         
         # Project dense anchors if they exist
         anchor_dense_projected = None
-        if self.anchor_dense_original is not None:
-            K, H_p, W_p, D = self.anchor_dense_original.shape
+        if self.anchor_dense is not None:
+            K, H_p, W_p, D = self.anchor_dense.shape
             # Reshape and project
-            dense_flat = self.anchor_dense_original.view(K, H_p * W_p, D)  # (K, H'*W', D)
+            dense_flat = self.anchor_dense.view(K, H_p * W_p, D)  # (K, H'*W', D)
             dense_projected = self.backbone.projection(dense_flat.view(-1, D))  # (K*H'*W', D_proj)
             anchor_dense_projected = dense_projected.view(K, H_p, W_p, -1)  # (K, H', W', D_proj)
+            
+            if self.distance_metric == 'cosine':
+                # Normalize dense features
+                anchor_dense_projected = F.normalize(anchor_dense_projected, dim=-1)
         
         return anchor_global_projected, anchor_dense_projected
     

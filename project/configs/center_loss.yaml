@@ -1,0 +1,84 @@
+# Center Loss Configuration
+# Recommended for learnable anchors - simpler than CAM loss
+# Pulls both samples toward anchors AND anchors toward samples
+
+# Output directory (will auto-generate name based on config)
+output_dir: './experiments/bmad_baseline'
+
+# Dataset configuration
+data:
+  data_root: './data/BraTS2021_slice'
+  target_size: [240, 240]
+  num_workers: 4
+  batch_size: 32
+
+# Anchor configuration
+anchor:
+  strategy: 'random'  # 'eigenface', 'kmeans', 'random'
+  n_components: 50  # Number of PCA components (only for eigenface)
+  n_anchors: 8
+  n_samples: 2000
+  max_images_for_pca: 5000  # Max images for anchor generation
+  learnable: true  # Enable learnable anchors with Center Loss
+  init_from: null  # Optional: path to experiment dir to init from
+
+# Model configuration
+model:
+  backbone: 'vit_small_patch16_dinov3.lvd1689m'
+  freeze_backbone: true
+  projection_dim: 128  # Add projection head for better embeddings
+
+# Loss configuration
+loss:
+  type: 'center'  # Use Center Loss
+  distance_metric: 'euclidean'  # 'euclidean' or 'cosine'
+  
+  # Center Loss parameters
+  lambda_center: 1.0    # Pull samples + anchors together
+  lambda_repel: 0.1     # Push anchors apart
+  margin: 1.0           # Minimum distance between anchors
+  
+  # Dense loss (optional)
+  use_dense: false
+  global_weight: 1.0
+  dense_weight: 0.5
+  spatial_reduction: 'mean'
+
+# Training configuration
+training:
+  epochs: 30
+  batch_size: 32
+  num_workers: 4
+  lr: 0.0001
+  weight_decay: 0.0001
+  use_amp: true
+  log_interval: 50
+  val_interval: 1
+  early_stopping_patience: 10
+
+# Optimizer configuration
+optimizer:
+  type: 'adamw'
+  betas: [0.9, 0.999]
+  eps: 1e-8
+
+# Scheduler configuration
+scheduler:
+  type: 'cosine'
+  warmup_epochs: 5
+  min_lr: 1e-6
+
+# Evaluation configuration
+eval:
+  compute_pixel_auroc: true
+  save_predictions: true
+  n_visualization_samples: 10
+
+# Output configuration
+output:
+  base_dir: './experiments'
+  save_checkpoints: true
+  checkpoint_interval: 5
+
+# Random seed
+seed: 42

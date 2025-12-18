@@ -17,6 +17,7 @@ from data import BMADPreprocessor, create_dataloaders
 from anchors import AnchorGenerator, compute_anchor_embeddings, visualize_anchors
 from model import DINOv3Backbone, AnomalyDetector
 from loss import AnchorMarginLoss, DenseAnchorMarginLoss, CombinedAnchorLoss
+from contrastive_loss import CenterLoss, InfoNCEAnchorLoss, HybridAnchorLoss, CombinedContrastiveLoss
 from train import Trainer
 from eval import evaluate_comprehensive, visualize_predictions, analyze_anchor_assignments
 
@@ -228,45 +229,121 @@ def create_model(config: dict, anchor_global: torch.Tensor, anchor_dense: torch.
         pretrained=True
     )
     
+    # Check if anchors should be learnable
+    learnable_anchors = config['anchor'].get('learnable', False)
+    
     # Create detector
     detector = AnomalyDetector(
         backbone=backbone,
         anchor_global_embeddings=anchor_global,
         anchor_dense_embeddings=anchor_dense,
-        distance_metric=config['loss']['distance_metric']
+        distance_metric=config['loss']['distance_metric'],
+        learnable_anchors=learnable_anchors
     )
     
     return detector
 
 
-def create_criterion(config: dict) -> CombinedAnchorLoss:
-    """Create loss function"""
-    # Global loss
-    global_loss = AnchorMarginLoss(
-        margin=config['loss']['margin'],
-        alpha=config['loss']['alpha'],
-        beta=config['loss']['beta'],
-        distance_metric=config['loss']['distance_metric']
-    )
+def create_criterion(config: dict):
+    """
+    Create loss function based on config.
     
-    # Dense loss (optional)
-    dense_loss = None
-    if config['loss']['use_dense']:
-        dense_loss = DenseAnchorMarginLoss(
+    Supports:
+    - 'cam': Class Anchor Margin Loss (original, attractor + repeller + min-norm)
+    - 'center': Center Loss (pull samples + anchors toward each other)
+    - 'infonce': InfoNCE contrastive loss (soft assignments with temperature)
+    - 'hybrid': Hybrid of Center + InfoNCE (best of both)
+    
+    For learnable anchors, 'center', 'infonce', or 'hybrid' are recommended.
+    """
+    loss_type = config['loss'].get('type', 'cam')  # Default to CAM loss for backward compatibility
+    
+    print(f"\nCreating loss function: {loss_type}")
+    
+    if loss_type == 'cam':
+        # Original CAM loss (dense branch disabled until decoder exists)
+        global_loss = AnchorMarginLoss(
             margin=config['loss']['margin'],
             alpha=config['loss']['alpha'],
             beta=config['loss']['beta'],
-            spatial_reduction=config['loss']['spatial_reduction']
+            gamma=config['loss'].get('gamma', 0.0),
+            min_norm=config['loss'].get('min_norm', 0.5),
+            distance_metric=config['loss']['distance_metric']
+        )
+
+        dense_loss = None  # disabled for now
+        config['loss']['use_dense'] = False
+        # Combined loss
+        criterion = CombinedAnchorLoss(
+            global_loss=global_loss,
+            dense_loss=dense_loss,
+            global_weight=config['loss']['global_weight'],
+            dense_weight=config['loss']['dense_weight']
         )
     
-    # Combined loss
-    criterion = CombinedAnchorLoss(
-        global_loss=global_loss,
-        dense_loss=dense_loss,
-        global_weight=config['loss']['global_weight'],
-        dense_weight=config['loss']['dense_weight']
-    )
+    elif loss_type == 'center':
+        # Center Loss (dense branch disabled)
+        global_loss = CenterLoss(
+            distance_metric=config['loss']['distance_metric'],
+            lambda_center=config['loss'].get('lambda_center', 1.0),
+            lambda_repel=config['loss'].get('lambda_repel', 0.1),
+            margin=config['loss']['margin']
+        )
+
+        dense_loss = None
+        config['loss']['use_dense'] = False
+
+        criterion = CombinedContrastiveLoss(
+            global_loss=global_loss,
+            dense_loss=dense_loss,
+            global_weight=config['loss']['global_weight'],
+            dense_weight=config['loss']['dense_weight']
+        )
     
+    elif loss_type == 'infonce':
+        # InfoNCE Loss (dense branch disabled)
+        global_loss = InfoNCEAnchorLoss(
+            temperature=config['loss'].get('temperature', 0.07),
+            lambda_repel=config['loss'].get('lambda_repel', 0.1),
+            margin=config['loss']['margin'],
+            distance_metric=config['loss']['distance_metric']
+        )
+
+        dense_loss = None
+        config['loss']['use_dense'] = False
+
+        criterion = CombinedContrastiveLoss(
+            global_loss=global_loss,
+            dense_loss=dense_loss,
+            global_weight=config['loss']['global_weight'],
+            dense_weight=config['loss']['dense_weight']
+        )
+    
+    elif loss_type == 'hybrid':
+        # Hybrid: Center + InfoNCE (dense branch disabled)
+        global_loss = HybridAnchorLoss(
+            lambda_center=config['loss'].get('lambda_center', 1.0),
+            lambda_infonce=config['loss'].get('lambda_infonce', 0.5),
+            lambda_repel=config['loss'].get('lambda_repel', 0.1),
+            temperature=config['loss'].get('temperature', 0.07),
+            margin=config['loss']['margin'],
+            distance_metric=config['loss']['distance_metric']
+        )
+
+        dense_loss = None
+        config['loss']['use_dense'] = False
+
+        criterion = CombinedContrastiveLoss(
+            global_loss=global_loss,
+            dense_loss=dense_loss,
+            global_weight=config['loss']['global_weight'],
+            dense_weight=config['loss']['dense_weight']
+        )
+    
+    else:
+        raise ValueError(f"Unknown loss type: {loss_type}. Choose from: cam, center, infonce, hybrid")
+    
+    print(f"  ✓ Loss type: {loss_type}")
     return criterion
 
 
@@ -290,6 +367,18 @@ def generate_experiment_name(config: dict, base_dir: str = './experiments') -> s
     return exp_name
 
 
+def make_unique_dir(base: Path) -> Path:
+    """Create a unique directory by adding numeric suffix if needed."""
+    if not base.exists():
+        return base
+    idx = 1
+    while True:
+        cand = base.parent / f"{base.name}_{idx}"
+        if not cand.exists():
+            return cand
+        idx += 1
+
+
 def main(args):
     """Main training pipeline"""
     # Load config
@@ -298,15 +387,19 @@ def main(args):
     # Set seed
     set_seed(config['seed'])
     
-    # Auto-generate experiment name if using default output_dir or if requested
-    if args.auto_name or config['output_dir'] == './experiments/bmad_baseline':
-        # Extract base directory
+    # Auto/explicit experiment naming and uniqueness
+    if args.exp_name:
+        save_dir = Path(config['output_dir']) / args.exp_name
+    elif args.auto_name or config['output_dir'] == './experiments/bmad_baseline':
         base_output = Path(config['output_dir']).parent
         exp_name = generate_experiment_name(config, str(base_output))
         save_dir = base_output / exp_name
-        config['output_dir'] = str(save_dir)
     else:
         save_dir = Path(config['output_dir'])
+
+    # Avoid overwrite by uniquifying when directory exists
+    save_dir = make_unique_dir(save_dir)
+    config['output_dir'] = str(save_dir)
     
     # Create output directory
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -338,7 +431,7 @@ def main(args):
     train_paths, val_paths, val_labels, val_mask_paths, test_paths, test_labels, test_mask_paths = load_dataset_paths(data_root)
     
     if not train_paths:
-        print("\n⚠️  WARNING: No data found!")
+        print("\nWARNING: No data found!")
         print(f"Please check that the dataset exists at: {data_root}")
         print("Expected structure: train/good/*.png, valid/good/img/*.png, etc.")
         return
@@ -364,7 +457,36 @@ def main(args):
     # ===== STAGE 2: Anchor Generation =====
     preprocessor = BMADPreprocessor(target_size=tuple(config['data']['target_size']))
     
-    if args.skip_anchors and (save_dir / 'anchor_embeddings.pt').exists():
+    # Check if we should load anchors from another experiment (for learnable anchors)
+    init_from = config['anchor'].get('init_from', None)
+    
+    if init_from is not None:
+        print(f"\nLoading anchors from: {init_from}")
+        init_anchor_path = Path(init_from) / 'anchor_embeddings.pt'
+        if not init_anchor_path.exists():
+            raise FileNotFoundError(f"Cannot initialize anchors from {init_from}: anchor_embeddings.pt not found")
+        
+        anchor_data = torch.load(init_anchor_path, weights_only=False)
+        if isinstance(anchor_data, dict):
+            anchor_global = anchor_data.get('anchor_global', anchor_data.get('global'))
+            anchor_dense = anchor_data.get('anchor_dense', anchor_data.get('dense'))
+            anchor_images = anchor_data.get('anchor_images', None)
+        else:
+            anchor_global = anchor_data
+            anchor_dense = None
+            anchor_images = None
+        
+        print(f"✓ Loaded anchors: {anchor_global.shape}")
+        
+        # Save to current experiment directory
+        torch.save({
+            'anchor_images': anchor_images,
+            'anchor_global': anchor_global,
+            'anchor_dense': anchor_dense,
+            'initialized_from': str(init_from)
+        }, save_dir / 'anchor_embeddings.pt')
+        
+    elif args.skip_anchors and (save_dir / 'anchor_embeddings.pt').exists():
         print("\nLoading existing anchors...")
         anchor_data = torch.load(save_dir / 'anchor_embeddings.pt', weights_only=False)
         anchor_images = anchor_data['anchor_images']
@@ -424,7 +546,8 @@ def main(args):
             save_dir=save_dir,
             use_amp=config['training']['use_amp'],
             log_interval=config['training']['log_interval'],
-            val_interval=config['training']['val_interval']
+            val_interval=config['training']['val_interval'],
+            fixed_pseudo_labels=config['training'].get('fixed_pseudo_labels', False)
         )
         
         trainer.train(
@@ -463,12 +586,13 @@ def main(args):
     eval_dir = save_dir / 'evaluation'
     eval_dir.mkdir(exist_ok=True)
     
+    compute_pixel = config.get('eval', {}).get('compute_pixel', False)
     results = evaluate_comprehensive(
         model=model,
         dataloader=test_loader,
         device=device,
         save_dir=eval_dir,
-        compute_pixel=config['eval']['compute_pixel'],
+        compute_pixel=compute_pixel,
         target_size=tuple(config['data']['target_size'])
     )
     
@@ -509,6 +633,8 @@ if __name__ == '__main__':
                         help='Only run evaluation on existing model')
     parser.add_argument('--auto-name', action='store_true',
                         help='Auto-generate experiment name from anchor config (strategy_k<n_anchors>)')
+    parser.add_argument('--exp-name', type=str, default=None,
+                        help='Explicit experiment name subfolder (overrides auto-name)')
     
     args = parser.parse_args()
     main(args)

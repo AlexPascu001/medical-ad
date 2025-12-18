@@ -1,0 +1,55 @@
+# Configuration for Learnable Anchors (Integrated Version)
+# Use with: python project/main.py --config project/configs/learnable_anchors_integrated.yaml
+
+seed: 42
+output_dir: './experiments/bmad_learnable_eigenface_k8_l2'
+
+# Data configuration
+data:
+  data_root: './data/BraTS2021_slice'
+  target_size: [240, 240]
+
+# Anchor configuration
+anchor:
+  strategy: 'eigenface'     # Not used when init_from is specified
+  n_components: 50
+  n_anchors: 8
+  max_images_for_pca: 5000
+  learnable: true           # ✓ Make anchors learnable
+  init_from: './experiments/bmad_eigenface_k8_l2'  # ✓ Initialize from this experiment
+
+# Model configuration
+model:
+  backbone: 'vit_small_patch16_dinov3.lvd1689m'
+  freeze_backbone: true     # Keep backbone frozen, train projection + anchors
+  projection_dim: 128
+
+# Loss configuration (CAM Loss)
+loss:
+  margin: 1.0               # Minimum distance between anchors
+  alpha: 1.0                # Weight for attractor (pull to anchors)
+  beta: 1.0                 # Weight for repeller (push anchors apart)
+  gamma: 0.1                # ✓ Weight for min-norm (prevent collapse) - SET > 0 for learnable anchors!
+  min_norm: 0.5             # Minimum anchor norm threshold
+  distance_metric: 'euclidean'
+  use_dense: false
+  global_weight: 1.0
+  dense_weight: 0.5
+  spatial_reduction: 'mean'
+
+# Training configuration
+training:
+  epochs: 30                # Fewer epochs since starting from pre-trained
+  batch_size: 64
+  num_workers: 4
+  lr: 0.0001                # Learning rate for projection + anchors
+  weight_decay: 0.000001
+  use_amp: true
+  log_interval: 50
+  val_interval: 1
+  early_stopping_patience: 10
+
+# Evaluation configuration
+eval:
+  compute_pixel: true
+  bootstrap_samples: 1000

@@ -1,0 +1,38 @@
+anchor:
+  max_images_for_pca: 5000
+  n_anchors: 8
+  n_components: 50
+  strategy: random
+data:
+  data_root: ./data/BraTS2021_slice
+  target_size:
+  - 240
+  - 240
+eval:
+  bootstrap_samples: 1000
+  compute_pixel: true
+loss:
+  alpha: 1.0
+  beta: 1.0
+  dense_weight: 0.5
+  distance_metric: euclidean
+  global_weight: 1.0
+  margin: 1.0
+  spatial_reduction: mean
+  use_dense: false
+model:
+  backbone: vit_small_patch16_dinov3.lvd1689m
+  freeze_backbone: true
+  projection_dim: 128
+output_dir: ./experiments/bmad_random_k8_l2_trial4
+seed: 56
+training:
+  batch_size: 64
+  early_stopping_patience: 10
+  epochs: 50
+  log_interval: 50
+  lr: 0.0001
+  num_workers: 4
+  use_amp: true
+  val_interval: 1
+  weight_decay: 1.0e-06

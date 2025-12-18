@@ -5,15 +5,17 @@ output_dir: './experiments/bmad_baseline'
 
 # Data configuration
 data:
-  data_root: '../data/BraTS2021_slice'  # Root directory of the dataset
+  data_root: './data/BraTS2021_slice'  # Root directory of the dataset
   target_size: [240, 240]  # Image resolution (H, W) - actual BraTS slice size
 
 # Anchor configuration
 anchor:
-  strategy: 'eigenface'     # Strategy: 'eigenface' (PCA + clustering) or 'kmeans' (direct clustering)
+  strategy: 'eigenface'     # Strategy: 'eigenface' (PCA + clustering) or 'kmeans' (direct clustering) or 'random'
   n_components: 50          # Number of PCA components (M) - only for eigenface strategy
   n_anchors: 8              # Number of anchors (K)
   max_images_for_pca: 5000  # Max images to use for anchor generation (memory constraint)
+  learnable: false          # Make anchors learnable parameters (requires gamma > 0 for min-norm loss)
+  init_from: null           # Path to experiment dir to initialize learnable anchors from (optional)
 
 # Model configuration
 model:
@@ -26,6 +28,8 @@ loss:
   margin: 1.0             # Margin m for repeller term (anchors should be >= 2m apart)
   alpha: 1.0              # Weight for attractor term (pull samples to anchors)
   beta: 1.0               # Weight for repeller term (push anchors apart)
+  gamma: 0.0              # Weight for min-norm term (prevent anchor collapse, use 0.1 for learnable anchors)
+  min_norm: 0.5           # Minimum norm threshold for anchors (only used if gamma > 0)
   distance_metric: 'euclidean'  # Distance metric: 'euclidean' or 'cosine'
   use_dense: false        # Use dense features for localization
   global_weight: 1.0      # Weight for global loss
@@ -43,6 +47,7 @@ training:
   log_interval: 50        # Log every N batches
   val_interval: 1         # Validate every N epochs
   early_stopping_patience: 10
+  fixed_pseudo_labels: true
 
 # Evaluation configuration
 eval:

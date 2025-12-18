@@ -1,0 +1,59 @@
+anchor:
+  init_from: null
+  learnable: true
+  max_images_for_pca: 5000
+  n_anchors: 8
+  n_components: 50
+  n_samples: 2000
+  strategy: random
+data:
+  batch_size: 32
+  data_root: ./data/BraTS2021_slice
+  num_workers: 4
+  target_size:
+  - 240
+  - 240
+eval:
+  compute_pixel_auroc: true
+  n_visualization_samples: 10
+  save_predictions: true
+loss:
+  dense_weight: 0.5
+  distance_metric: euclidean
+  global_weight: 1.0
+  lambda_repel: 0.3
+  margin: 1.0
+  spatial_reduction: mean
+  temperature: 0.5
+  type: infonce
+  use_dense: false
+model:
+  backbone: vit_small_patch16_dinov3.lvd1689m
+  freeze_backbone: true
+  projection_dim: 128
+optimizer:
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1e-8
+  type: adamw
+output:
+  base_dir: ./experiments
+  checkpoint_interval: 5
+  save_checkpoints: true
+output_dir: experiments\bmad_baseline\infonce_temp0.5lambda0.3
+scheduler:
+  min_lr: 1e-6
+  type: cosine
+  warmup_epochs: 5
+seed: 42
+training:
+  batch_size: 32
+  early_stopping_patience: 10
+  epochs: 30
+  log_interval: 50
+  lr: 0.0001
+  num_workers: 4
+  use_amp: true
+  val_interval: 1
+  weight_decay: 0.0001

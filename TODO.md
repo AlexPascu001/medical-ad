@@ -57,7 +57,7 @@
 ## 10.11.2025
 
 - [ ] prima ancora + dupa alegem ancore cu probabilitate direct proportionala cu dist cosinus fata de ancorele alese
-- [ ] vizualizare t-sne cu aceleasi img pentru toate experimentele (random, kmeans, eigenface) si sa vedem cum se distribuie ancorele si img normale/anormale in embedding space
-- [ ] rulare 5 experimente pt random/kmeans/eigenface cu diferite seeduri si sa vedem variance in rezultate
+- [x] vizualizare t-sne cu aceleasi img pentru toate experimentele (random, kmeans, eigenface) si sa vedem cum se distribuie ancorele si img normale/anormale in embedding space
+- [x] rulare 5 experimente pt random/kmeans/eigenface cu diferite seeduri si sa vedem variance in rezultate
 - [ ] dupa ce vedem rezultatele cele mai bune, sa incercam ancorele learnable pt metoda potrivita
 - [ ] 

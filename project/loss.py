@@ -1,5 +1,5 @@
 """
-Anchor-Margin Loss: Attractor + Repeller Terms
+Anchor-Margin Loss: Attractor + Repeller Terms (paper-accurate)
 Implements Class Anchor Margin Loss from https://arxiv.org/abs/2306.00630
 
 Attractor: L_A(x_i, C) = (1/2) * ||e_i - c_{y_i}||_2^2
@@ -22,6 +22,7 @@ class AnchorMarginLoss(nn.Module):
     
     Attractor: Pull samples of same class toward their anchor (tight intra-class)
     Repeller: Push different class anchors apart (clear inter-class separation)
+    Min-Norm: Prevent anchor collapse to zero (optional, for learnable anchors)
     
     NOTE: This version uses L2 (Euclidean) distance, not cosine distance.
     Features should be normalized if using normalized embeddings.
@@ -32,6 +33,8 @@ class AnchorMarginLoss(nn.Module):
         margin: float = 1.0,
         alpha: float = 1.0,
         beta: float = 1.0,
+        gamma: float = 0.0,
+        min_norm: float = 0.5,
         distance_metric: str = 'euclidean'
     ):
         """
@@ -39,6 +42,8 @@ class AnchorMarginLoss(nn.Module):
             margin: Margin m for repeller term (anchors should be >= 2m apart)
             alpha: Weight for attractor loss (default: 1.0)
             beta: Weight for repeller loss (default: 1.0)
+            gamma: Weight for min-norm loss (default: 0.0, use 0.1 for learnable anchors)
+            min_norm: Minimum norm threshold for anchors (default: 0.5)
             distance_metric: 'euclidean' or 'cosine' distance
         """
         super().__init__()
@@ -46,13 +51,16 @@ class AnchorMarginLoss(nn.Module):
         self.margin = margin
         self.alpha = alpha
         self.beta = beta
+        self.gamma = gamma
+        self.min_norm = min_norm
         self.distance_metric = distance_metric
         
     def forward(
         self,
         embeddings: torch.Tensor,
         anchor_embeddings: torch.Tensor,
-        return_components: bool = False
+        return_components: bool = False,
+        fixed_assignments: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Compute anchor-margin loss following the paper formulation
@@ -68,55 +76,65 @@ class AnchorMarginLoss(nn.Module):
         B, D = embeddings.shape
         K, _ = anchor_embeddings.shape
         
-        # === COMPUTE DISTANCES ===
+        # === COMPUTE DISTANCES (paper-accurate; normalize for cosine) ===
         if self.distance_metric == 'euclidean':
-            # Compute pairwise L2 distances: ||e_i - c_k||_2
-            # Shape: (B, K)
             distances = torch.cdist(embeddings, anchor_embeddings, p=2)
+            anchors_for_repeller = anchor_embeddings
         else:  # cosine
-            # Normalize and compute cosine distance
             embeddings_norm = F.normalize(embeddings, p=2, dim=1)
             anchors_norm = F.normalize(anchor_embeddings, p=2, dim=1)
-            # Cosine distance = 1 - cosine similarity
             similarities = embeddings_norm @ anchors_norm.T  # (B, K)
             distances = 1.0 - similarities
+            anchors_for_repeller = anchors_norm  # keep anchors unit-norm for repeller
         
-        # Find nearest anchor for each sample
-        min_distances, assigned_anchors = distances.min(dim=1)  # (B,), (B,)
+        # Find nearest anchor for each sample, or use fixed pseudo-labels if provided
+        if fixed_assignments is not None:
+            assigned_anchors = fixed_assignments
+            min_distances = distances[torch.arange(B, device=embeddings.device), assigned_anchors]
+        else:
+            min_distances, assigned_anchors = distances.min(dim=1)  # (B,), (B,)
         
-        # === ATTRACTOR TERM ===
-        # L_A(x_i, C) = (1/2) * ||e_i - c_{y_i}||_2^2
-        # Pull samples toward their assigned anchor
+        # === ATTRACTOR TERM (paper) ===
+        # 0.5 * ||e_i - c_{y_i}||^2, averaged over batch
         loss_attract = 0.5 * (min_distances ** 2).mean()
         
         # === REPELLER TERM ===
-        # L_R(C) = (1/2) * Σ_{y≠y'} max(0, 2m - ||c_y - c_{y'}||_2)^2
-        # Push different anchors apart (operates on anchor-anchor distances)
+        # L_R(C) = (1/(K(K-1))) * Σⱼ≠ₖ max(0, m - ||c_j - c_k||_2)
+        # Push different anchors apart by at least margin m
         
         # Compute all pairwise anchor distances: (K, K)
         if self.distance_metric == 'euclidean':
-            anchor_distances = torch.cdist(anchor_embeddings, anchor_embeddings, p=2)
+            anchor_distances = torch.cdist(anchors_for_repeller, anchors_for_repeller, p=2)
         else:
-            anchor_sims = anchors_norm @ anchors_norm.T
+            anchor_sims = anchors_for_repeller @ anchors_for_repeller.T
             anchor_distances = 1.0 - anchor_sims
         
         # Create mask to exclude diagonal (self-distances)
         mask = ~torch.eye(K, dtype=torch.bool, device=anchor_distances.device)
         
-        # Compute hinge loss: max(0, 2m - ||c_y - c_{y'}||_2)
-        violations = torch.relu(2.0 * self.margin - anchor_distances)  # (K, K)
+        # Paper hinge: 0.5 * (max(0, 2m - ||c_j - c_k||))^2
+        violations = torch.relu(2 * self.margin - anchor_distances)
+        violations_masked = violations[mask]
+        loss_repel = 0.5 * (violations_masked ** 2).mean()
         
-        # Square and sum over all pairs (excluding diagonal)
-        violations_masked = violations * mask.float()
-        loss_repel = 0.5 * (violations_masked ** 2).sum() / (K * (K - 1))  # Average over pairs
+        # === MIN-NORM TERM (for learnable anchors) ===
+        # L_N(C) = (1/K) * Σₖ max(0, δ - ||c_k||_2)
+        # Prevent anchor collapse to zero (still meaningful for cosine if anchors drift)
+        loss_norm = torch.tensor(0.0, device=embeddings.device, dtype=embeddings.dtype)
+        if self.gamma > 0:
+            anchor_norms = torch.norm(anchor_embeddings, p=2, dim=1)  # (K,)
+            norm_violations = torch.relu(self.min_norm - anchor_norms)  # (K,)
+            loss_norm = norm_violations.mean()
         
         # === COMBINED LOSS ===
-        total_loss = self.alpha * loss_attract + self.beta * loss_repel
+        # L_total = λ₁ * L_attract + λ₂ * L_repel + λ₃ * L_norm
+        total_loss = self.alpha * loss_attract + self.beta * loss_repel + self.gamma * loss_norm
         
         result = {
             'loss': total_loss,
             'loss_attract': loss_attract.item(),
-            'loss_repel': loss_repel.item()
+            'loss_repel': loss_repel.item(),
+            'loss_norm': loss_norm.item() if self.gamma > 0 else 0.0
         }
         
         if return_components:
@@ -169,7 +187,7 @@ class DenseAnchorMarginLoss(nn.Module):
         return_components: bool = False
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute dense anchor-margin loss
+        Compute dense anchor-margin loss (disabled: kept for reference)
         
         Args:
             dense_embeddings: (B, D, H', W') per-patch embeddings
@@ -179,45 +197,20 @@ class DenseAnchorMarginLoss(nn.Module):
         Returns:
             Dictionary with loss values
         """
-        B, D, H, W = dense_embeddings.shape
-        K, _ = anchor_embeddings.shape
-        
-        # Reshape: (B, D, H, W) -> (B, H*W, D)
-        embeddings_flat = dense_embeddings.permute(0, 2, 3, 1).reshape(B * H * W, D)
-        
-        # Compute distances to all anchors: (B*H*W, K)
-        distances = torch.cdist(embeddings_flat, anchor_embeddings, p=2)
-        
-        # Find nearest anchor per patch
-        min_distances, assigned = distances.min(dim=1)  # (B*H*W,)
-        
-        # === ATTRACTOR TERM ===
-        # L_A = (1/2) * ||e_patch - c_nearest||_2^2
-        loss_attract = 0.5 * (min_distances ** 2)
-        
-        if self.spatial_reduction == 'mean':
-            loss_attract = loss_attract.mean()
-        else:  # max
-            loss_attract = loss_attract.view(B, H * W).max(dim=1)[0].mean()
-        
-        # No repeller term for dense features (operates on anchors, not patches)
-        loss_repel = torch.tensor(0.0, device=dense_embeddings.device)
-        
-        # === COMBINED ===
-        total_loss = self.alpha * loss_attract
-        
+        # Dense loss path intentionally disabled until a decoder-based pixel head exists.
+        # Returning zeros keeps the interface stable without contributing to total loss.
+        device = dense_embeddings.device
+        zero = torch.tensor(0.0, device=device)
         result = {
-            'loss': total_loss,
-            'loss_attract': loss_attract.item(),
-            'loss_repel': loss_repel.item()
+            'loss': zero,
+            'loss_attract': 0.0,
+            'loss_repel': 0.0
         }
-        
         if return_components:
             result.update({
-                'min_distance': min_distances.mean().item(),
-                'spatial_max_distance': distances.max().item()
+                'min_distance': 0.0,
+                'spatial_max_distance': 0.0
             })
-        
         return result
 
 
@@ -260,11 +253,13 @@ class CombinedAnchorLoss(nn.Module):
         Returns:
             Dictionary with losses
         """
-        # Global loss
+        # Global loss (optionally with fixed pseudo-labels if provided in outputs)
+        fixed_assignments = outputs.get('fixed_assignments')
         global_result = self.global_loss(
             outputs['global_feat'], 
             anchor_embeddings, 
-            return_components=True
+            return_components=True,
+            fixed_assignments=fixed_assignments
         )
         total_loss = self.global_weight * global_result['loss']
         
@@ -273,25 +268,11 @@ class CombinedAnchorLoss(nn.Module):
             'loss_global': global_result['loss'],
             'loss_global_attract': global_result['loss_attract'],
             'loss_global_repel': global_result['loss_repel'],
+            'loss_global_norm': global_result.get('loss_norm', 0.0),
             'assigned_anchors': global_result['assigned_anchors']
         }
         
-        # Dense loss if available
-        if self.dense_loss is not None and 'dense_feat' in outputs:
-            # Reshape dense features from (B, H', W', D) to (B, D, H', W')
-            dense_feat = outputs['dense_feat'].permute(0, 3, 1, 2)
-            dense_result = self.dense_loss(
-                dense_feat,
-                anchor_embeddings,
-                return_components=True
-            )
-            total_loss = total_loss + self.dense_weight * dense_result['loss']
-            
-            result.update({
-                'loss': total_loss,
-                'loss_dense': dense_result['loss'],
-                'loss_dense_attract': dense_result['loss_attract'],
-                'loss_dense_repel': dense_result['loss_repel']
-            })
+        # Dense loss is currently disabled (per-patch, not pixel-wise). Keep stub for future decoder.
+        result['loss'] = total_loss
         
         return result

@@ -303,6 +303,10 @@ def main():
                        help='Output path (default: same as checkpoint dir)')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
+    parser.add_argument('--indices-file', type=str, default='cache/tsne_indices.pkl',
+                       help='Path to save/load consistent sample indices')
+    parser.add_argument('--force-new-indices', action='store_true',
+                       help='Force generation of new sample indices')
     
     args = parser.parse_args()
     
@@ -322,9 +326,10 @@ def main():
     print("\nLoading datasets...")
     data_root = Path(config['data']['data_root'])
     if not data_root.is_absolute():
-        # Make relative to checkpoint directory
-        checkpoint_dir = Path(args.checkpoint).parent
-        data_root = (checkpoint_dir / '..' / '..' / data_root).resolve()
+        # Config paths are relative to workspace root, not checkpoint dir
+        # So we need to resolve from current working directory
+        data_root = Path.cwd() / data_root
+        data_root = data_root.resolve()
     
     preprocessor = BMADPreprocessor(target_size=tuple(config['data']['target_size']))
     
@@ -346,11 +351,52 @@ def main():
         is_training=False
     )
     
-    # Extract embeddings for normal images
-    print(f"\nExtracting embeddings for {args.n_normal} normal images...")
-    normal_indices = [i for i, label in enumerate(all_labels) if label == 0]
-    normal_subset_indices = np.random.choice(normal_indices, size=min(args.n_normal, len(normal_indices)), replace=False)
+    # Load or generate consistent sample indices
+    indices_path = Path(args.indices_file)
+    indices_path.parent.mkdir(parents=True, exist_ok=True)
     
+    normal_indices = [i for i, label in enumerate(all_labels) if label == 0]
+    anomaly_indices = [i for i, label in enumerate(all_labels) if label == 1]
+    
+    if indices_path.exists() and not args.force_new_indices:
+        print(f"\n✓ Loading consistent sample indices from: {indices_path}")
+        with open(indices_path, 'rb') as f:
+            saved_indices = pickle.load(f)
+        normal_subset_indices = saved_indices['normal']
+        anomaly_subset_indices = saved_indices['anomaly']
+        print(f"  Using {len(normal_subset_indices)} normal + {len(anomaly_subset_indices)} anomaly samples")
+        print(f"  This ensures fair comparison across all experiments!")
+    else:
+        print(f"\n→ Generating new sample indices (seed={args.seed})...")
+        np.random.seed(args.seed)
+        normal_subset_indices = np.random.choice(
+            normal_indices, 
+            size=min(args.n_normal, len(normal_indices)), 
+            replace=False
+        )
+        if len(anomaly_indices) > 0:
+            anomaly_subset_indices = np.random.choice(
+                anomaly_indices, 
+                size=min(args.n_anomaly, len(anomaly_indices)), 
+                replace=False
+            )
+        else:
+            anomaly_subset_indices = np.array([], dtype=int)
+        
+        # Save for future experiments
+        with open(indices_path, 'wb') as f:
+            pickle.dump({
+                'normal': normal_subset_indices,
+                'anomaly': anomaly_subset_indices,
+                'seed': args.seed,
+                'n_normal': len(normal_subset_indices),
+                'n_anomaly': len(anomaly_subset_indices)
+            }, f)
+        print(f"✓ Saved indices to: {indices_path}")
+        print(f"  Future experiments will use the SAME samples for fair comparison!")
+    
+    # Extract embeddings for normal images
+    print(f"\nExtracting embeddings for {len(normal_subset_indices)} normal images...")
     normal_embeddings = []
     with torch.no_grad():
         for idx in normal_subset_indices:
@@ -362,12 +408,8 @@ def main():
     normal_embeddings = np.vstack(normal_embeddings)
     
     # Extract embeddings for anomaly images
-    print(f"Extracting embeddings for {args.n_anomaly} anomaly images...")
-    anomaly_indices = [i for i, label in enumerate(all_labels) if label == 1]
-    
-    if len(anomaly_indices) > 0:
-        anomaly_subset_indices = np.random.choice(anomaly_indices, size=min(args.n_anomaly, len(anomaly_indices)), replace=False)
-        
+    print(f"Extracting embeddings for {len(anomaly_subset_indices)} anomaly images...")
+    if len(anomaly_subset_indices) > 0:
         anomaly_embeddings = []
         with torch.no_grad():
             for idx in anomaly_subset_indices:

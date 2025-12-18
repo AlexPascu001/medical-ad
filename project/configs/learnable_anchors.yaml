@@ -1,0 +1,45 @@
+# Configuration for Learnable Anchors with CAM Loss
+
+seed: 42
+output_dir: './experiments/bmad_learnable_eigenface'
+
+# Data configuration
+data:
+  data_root: './data/BraTS2021_slice'
+  target_size: [240, 240]
+
+# Learnable Anchors configuration
+learnable_anchors:
+  init_from: './experiments/bmad_eigenface_k8_l2/best_model.pth'  # Path to experiment with initial anchors
+  freeze_anchors: false  # Set to true to keep anchors fixed (baseline)
+  
+  # CAM Loss weights
+  lambda_attractor: 1.0   # Weight for attractor loss (pull to anchors)
+  lambda_repeller: 1.0    # Weight for repeller loss (push anchors apart)
+  lambda_norm: 0.1        # Weight for min-norm loss (prevent collapse)
+  
+  # CAM Loss hyperparameters
+  margin: 1.0             # Minimum distance between anchors
+  min_norm: 0.5           # Minimum anchor norm threshold
+
+# Model configuration (same as base)
+model:
+  backbone: 'vit_small_patch16_dinov3.lvd1689m'
+  freeze_backbone: true   # Keep backbone frozen, only train projection + anchors
+  projection_dim: 128
+
+# Loss configuration
+loss:
+  distance_metric: 'euclidean'  # 'euclidean' or 'cosine'
+
+# Training configuration
+training:
+  epochs: 30              # Fewer epochs since we start from pre-trained
+  batch_size: 64
+  num_workers: 4
+  lr: 0.0001              # Learning rate for projection + anchors
+  weight_decay: 0.000001
+  use_amp: true
+  log_interval: 50
+  val_interval: 1
+  early_stopping_patience: 10

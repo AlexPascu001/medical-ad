@@ -15,7 +15,7 @@ anchor:
   strategy: 'eigenface'     # Options: 'eigenface', 'kmeans', 'random'
   n_components: 50
   n_anchors: 8
-  max_images_for_pca: 5000
+  max_images_for_pca: 5000  
 
 # Model configuration
 model:

@@ -14,6 +14,7 @@ from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from sklearn.manifold import TSNE
 
 from model import AnomalyDetector
 from loss import CombinedAnchorLoss
@@ -34,7 +35,8 @@ class Trainer:
         save_dir: Path,
         use_amp: bool = True,
         log_interval: int = 50,
-        val_interval: int = 1
+        val_interval: int = 1,
+        fixed_pseudo_labels: bool = False
     ):
         """
         Args:
@@ -67,6 +69,11 @@ class Trainer:
         self.epoch = 0
         self.global_step = 0
         self.best_val_auroc = 0.0
+
+        # Fixed set for TSNE tracking
+        self.tsne_samples = self._prepare_tsne_samples(normal_count=500, anomaly_count=100)
+        self.fixed_assignments = None
+        self.fixed_pseudo = fixed_pseudo_labels
         
         # Enhanced history tracking
         self.history = {
@@ -81,6 +88,7 @@ class Trainer:
             'val_loss': [],
             'val_loss_attract': [],
             'val_loss_repel': [],
+            'val_loss_norm': [],
             'val_loss_dense': [],
             'val_image_auroc': [],
             'val_pixel_auroc': [],
@@ -89,6 +97,123 @@ class Trainer:
             'epochs': [],
             'learning_rates': []
         }
+
+        if self.fixed_pseudo:
+            self._precompute_pseudo_labels()
+
+        # Precompute pseudo-labels if enabled in config
+        self.fixed_pseudo = getattr(self, 'fixed_pseudo', False)
+
+    def _prepare_tsne_samples(self, normal_count: int = 500, anomaly_count: int = 100):
+        """Collect a fixed pool of samples for TSNE visualization (CPU tensors)."""
+        normals = []
+        anomalies = []
+
+        # Use val_loader (has both classes) to grab a stable subset
+        for batch in self.val_loader:
+            images = batch['image']  # already preprocessed tensors
+            labels = batch['label']
+            for img, lbl in zip(images, labels):
+                if lbl.item() == 0 and len(normals) < normal_count:
+                    normals.append(img.cpu())
+                elif lbl.item() == 1 and len(anomalies) < anomaly_count:
+                    anomalies.append(img.cpu())
+            if len(normals) >= normal_count and len(anomalies) >= anomaly_count:
+                break
+
+        if len(normals) == 0:
+            print("TSNE prep warning: no normal samples collected")
+        if len(anomalies) == 0:
+            print("TSNE prep warning: no anomalous samples collected")
+
+        images = normals + anomalies
+        labels = [0] * len(normals) + [1] * len(anomalies)
+
+        if len(images) == 0:
+            return None
+
+        return {
+            'images': torch.stack(images),
+            'labels': torch.tensor(labels, dtype=torch.long)
+        }
+
+    def _precompute_pseudo_labels(self):
+        """Compute fixed nearest-anchor assignments once before training."""
+        print("\nPrecomputing fixed pseudo-labels (nearest anchors)...")
+        self.model.eval()
+        mapping = {}
+
+        # Use a non-dropping, non-shuffling loader to cover all samples
+        preload = DataLoader(
+            self.train_loader.dataset,
+            batch_size=self.train_loader.batch_size,
+            shuffle=False,
+            num_workers=self.train_loader.num_workers,
+            pin_memory=self.train_loader.pin_memory,
+            drop_last=False
+        )
+
+        with torch.no_grad():
+            for batch in tqdm(preload, desc='Pseudo-labeling'):
+                images = batch['image'].to(self.device)
+                paths = batch['path']
+
+                outputs = self.model(images, return_dense=False)
+                distances = outputs['global_distances']  # (B, K)
+                assigned = distances.argmin(dim=1).cpu().tolist()
+
+                for p, a in zip(paths, assigned):
+                    mapping[str(p)] = int(a)
+
+        self.fixed_assignments = mapping
+        print(f"✓ Pseudo-labels computed for {len(mapping)} samples")
+
+    def _save_tsne(self, epoch: int, final: bool = False):
+        """Compute embeddings for fixed samples + anchors and save TSNE plot."""
+        if self.tsne_samples is None:
+            return
+
+        self.model.eval()
+        save_dir = self.save_dir / 'tsne'
+        save_dir.mkdir(exist_ok=True, parents=True)
+
+        with torch.no_grad():
+            imgs = self.tsne_samples['images'].to(self.device)
+            labels = self.tsne_samples['labels']
+
+            outputs = self.model(imgs, return_dense=False)
+            sample_embeds = outputs['global_feat'].detach().cpu().numpy()
+
+            anchor_global, _ = self.model._get_projected_anchors()
+            anchor_np = anchor_global.detach().cpu().numpy()
+
+        data = np.vstack([sample_embeds, anchor_np])
+        label_vec = np.concatenate([
+            labels.numpy(),
+            np.full(anchor_np.shape[0], 2, dtype=np.int64)  # 2 = anchor
+        ])
+
+        # TSNE parameters
+        total_points = data.shape[0]
+        perplexity = max(5, min(30, (total_points - 1) // 3))
+        tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, init='pca')
+        coords = tsne.fit_transform(data)
+
+        # Plot
+        plt.figure(figsize=(8, 6))
+        colors = {0: 'steelblue', 1: 'crimson', 2: 'orange'}
+        labels_map = {0: 'normal', 1: 'anomaly', 2: 'anchor'}
+        for cls in [0, 1, 2]:
+            mask = label_vec == cls
+            if mask.any():
+                plt.scatter(coords[mask, 0], coords[mask, 1], s=12, alpha=0.7, c=colors[cls], label=labels_map[cls])
+        plt.legend()
+        plt.title(f'TSNE epoch {epoch}' if not final else 'TSNE final')
+        plt.tight_layout()
+
+        fname = 'tsne_final.png' if final else f'tsne_epoch_{epoch:03d}.png'
+        plt.savefig(save_dir / fname, dpi=150)
+        plt.close()
     
     def train_epoch(self) -> Dict[str, float]:
         """Train for one epoch"""
@@ -98,28 +223,37 @@ class Trainer:
             'loss': 0.0,
             'loss_attract': 0.0,
             'loss_repel': 0.0,
+            'loss_norm': 0.0,
             'loss_dense': 0.0,
             'loss_dense_attract': 0.0
         }
         
         anchor_assignments = np.zeros(self.model.n_anchors)
         
-        # Get projected anchor embeddings for loss computation
-        # Detach to prevent backprop through anchor computation
-        anchor_global, _ = self.model._get_projected_anchors()
-        anchor_global = anchor_global.detach()
-        
         pbar = tqdm(self.train_loader, desc=f'Epoch {self.epoch}')
         
         for batch_idx, batch in enumerate(pbar):
             images = batch['image'].to(self.device)
+            fixed_assign = None
+            if self.fixed_pseudo:
+                fixed_assign = torch.tensor(
+                    [self.fixed_assignments[str(p)] for p in batch['path']],
+                    device=self.device,
+                    dtype=torch.long
+                )
             
             # Forward pass
             self.optimizer.zero_grad()
             
+            # Get fresh anchor embeddings for this batch
+            # This must be inside the loop to avoid reusing computation graph
+            anchor_global, _ = self.model._get_projected_anchors()
+            
             if self.use_amp:
                 with autocast('cuda'):
-                    outputs = self.model(images, return_dense=True)  # Enable dense for loss
+                    outputs = self.model(images, return_dense=False)  # Dense loss disabled
+                    if fixed_assign is not None:
+                        outputs['fixed_assignments'] = fixed_assign
                     loss_dict = self.criterion(outputs, anchor_global)
                     loss = loss_dict['loss']
                 
@@ -128,7 +262,9 @@ class Trainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                outputs = self.model(images, return_dense=True)  # Enable dense for loss
+                outputs = self.model(images, return_dense=False)  # Dense loss disabled
+                if fixed_assign is not None:
+                    outputs['fixed_assignments'] = fixed_assign
                 loss_dict = self.criterion(outputs, anchor_global)
                 loss = loss_dict['loss']
                 
@@ -137,13 +273,23 @@ class Trainer:
             
             # Track metrics
             epoch_metrics['loss'] += loss.item()
-            epoch_metrics['loss_attract'] += loss_dict['loss_global_attract']
-            epoch_metrics['loss_repel'] += loss_dict['loss_global_repel']
             
-            # Track dense metrics if available
-            if 'loss_dense' in loss_dict:
-                epoch_metrics['loss_dense'] += loss_dict['loss_dense']
-                epoch_metrics['loss_dense_attract'] += loss_dict['loss_dense_attract']
+            # Handle different loss types (CAM vs Contrastive)
+            # CAM loss: loss_global_attract, loss_global_repel, loss_global_norm
+            # Contrastive: loss_global_loss_center, loss_global_loss_infonce, loss_global_loss_repel
+            if 'loss_global_attract' in loss_dict:
+                # CAM loss
+                epoch_metrics['loss_attract'] += loss_dict['loss_global_attract']
+                epoch_metrics['loss_repel'] += loss_dict['loss_global_repel']
+                epoch_metrics['loss_norm'] += loss_dict.get('loss_global_norm', 0.0)
+            else:
+                # Contrastive loss - aggregate all components
+                epoch_metrics['loss_attract'] += loss_dict.get('loss_global_loss_center', 0.0)
+                epoch_metrics['loss_attract'] += loss_dict.get('loss_global_loss_infonce', 0.0)
+                epoch_metrics['loss_repel'] += loss_dict.get('loss_global_loss_repel', 0.0)
+                epoch_metrics['loss_norm'] += 0.0  # No norm loss in contrastive
+            
+            # Dense path disabled; keep zero defaults
             
             # Track anchor assignments
             assigned = loss_dict['assigned_anchors'].cpu().numpy()
@@ -154,9 +300,24 @@ class Trainer:
             if batch_idx % self.log_interval == 0:
                 postfix_dict = {
                     'loss': f"{loss.item():.4f}",
-                    'attr': f"{loss_dict['loss_global_attract']:.4f}",
-                    'rep': f"{loss_dict['loss_global_repel']:.4f}"
                 }
+                
+                # Add loss components based on loss type
+                if 'loss_global_attract' in loss_dict:
+                    # CAM loss
+                    postfix_dict['attr'] = f"{loss_dict['loss_global_attract']:.4f}"
+                    postfix_dict['rep'] = f"{loss_dict['loss_global_repel']:.4f}"
+                    if loss_dict.get('loss_global_norm', 0.0) > 0:
+                        postfix_dict['norm'] = f"{loss_dict['loss_global_norm']:.4f}"
+                else:
+                    # Contrastive loss
+                    if 'loss_global_loss_center' in loss_dict:
+                        postfix_dict['ctr'] = f"{loss_dict['loss_global_loss_center']:.4f}"
+                    if 'loss_global_loss_infonce' in loss_dict:
+                        postfix_dict['inf'] = f"{loss_dict['loss_global_loss_infonce']:.4f}"
+                    if 'loss_global_loss_repel' in loss_dict:
+                        postfix_dict['rep'] = f"{loss_dict['loss_global_loss_repel']:.4f}"
+                
                 if 'loss_dense' in loss_dict:
                     postfix_dict['dense'] = f"{loss_dict['loss_dense']:.4f}"
                 pbar.set_postfix(postfix_dict)
@@ -187,23 +348,30 @@ class Trainer:
             'loss_dense': 0.0
         }
         
+        # Get anchors for validation loss computation
+        # No need to detach since we're inside torch.no_grad() anyway
         anchor_global, _ = self.model._get_projected_anchors()
-        anchor_global = anchor_global.detach()
         
         with torch.no_grad():
             for batch in self.val_loader:
                 images = batch['image'].to(self.device)
                 
                 # Compute loss
-                outputs = self.model(images, return_dense=True)
+                outputs = self.model(images, return_dense=False)
                 loss_dict = self.criterion(outputs, anchor_global)
                 
                 val_loss_metrics['loss'] += loss_dict['loss'].item()
-                val_loss_metrics['loss_attract'] += loss_dict['loss_global_attract']
-                val_loss_metrics['loss_repel'] += loss_dict['loss_global_repel']
                 
-                if 'loss_dense' in loss_dict:
-                    val_loss_metrics['loss_dense'] += loss_dict['loss_dense']
+                # Handle different loss types
+                if 'loss_global_attract' in loss_dict:
+                    val_loss_metrics['loss_attract'] += loss_dict['loss_global_attract']
+                    val_loss_metrics['loss_repel'] += loss_dict['loss_global_repel']
+                else:
+                    val_loss_metrics['loss_attract'] += loss_dict.get('loss_global_loss_center', 0.0)
+                    val_loss_metrics['loss_attract'] += loss_dict.get('loss_global_loss_infonce', 0.0)
+                    val_loss_metrics['loss_repel'] += loss_dict.get('loss_global_loss_repel', 0.0)
+                
+                # Dense loss disabled
         
         # Average loss metrics
         num_batches = len(self.val_loader)
@@ -254,17 +422,27 @@ class Trainer:
             self.history['train_loss'].append(train_metrics['loss'])
             self.history['train_loss_attract'].append(train_metrics['loss_attract'])
             self.history['train_loss_repel'].append(train_metrics['loss_repel'])
-            self.history['train_loss_dense'].append(train_metrics.get('loss_dense', 0.0))
-            self.history['train_loss_dense_attract'].append(train_metrics.get('loss_dense_attract', 0.0))
+            # Dense loss disabled; keep zeros for compatibility
+            self.history['train_loss_dense'].append(0.0)
+            self.history['train_loss_dense_attract'].append(0.0)
             self.history['epochs'].append(epoch)
             
             print(f"\nEpoch {epoch} Summary:")
             print(f"  Train Loss: {train_metrics['loss']:.4f}")
             print(f"    Attractor: {train_metrics['loss_attract']:.4f}")
-            if self.criterion.global_loss.beta > 0:
+            
+            # Check if repeller is enabled (different attribute names for different losses)
+            repeller_enabled = False
+            if hasattr(self.criterion.global_loss, 'beta'):
+                repeller_enabled = self.criterion.global_loss.beta > 0
+            elif hasattr(self.criterion.global_loss, 'lambda_repel'):
+                repeller_enabled = self.criterion.global_loss.lambda_repel > 0
+            
+            if repeller_enabled:
                 print(f"    Repeller: {train_metrics['loss_repel']:.4f}")
             else:
-                print(f"    Repeller: {train_metrics['loss_repel']:.4f} (disabled, beta=0)")
+                print(f"    Repeller: {train_metrics['loss_repel']:.4f} (disabled)")
+                
             if train_metrics.get('loss_dense', 0.0) > 0:
                 print(f"    Dense: {train_metrics['loss_dense']:.4f} (Attr: {train_metrics.get('loss_dense_attract', 0.0):.4f})")
             print(f"  Anchor Balance: min={np.min(train_metrics['anchor_balance']):.3f}, max={np.max(train_metrics['anchor_balance']):.3f}, std={np.std(train_metrics['anchor_balance']):.3f}")
@@ -278,7 +456,7 @@ class Trainer:
                 self.history['val_loss'].append(val_metrics['loss'])
                 self.history['val_loss_attract'].append(val_metrics['loss_attract'])
                 self.history['val_loss_repel'].append(val_metrics['loss_repel'])
-                self.history['val_loss_dense'].append(val_metrics.get('loss_dense', 0.0))
+                self.history['val_loss_dense'].append(0.0)
                 self.history['val_image_auroc'].append(val_metrics['image_auroc'])
                 if 'pixel_auroc' in val_metrics:
                     self.history['val_pixel_auroc'].append(val_metrics['pixel_auroc'])
@@ -286,10 +464,19 @@ class Trainer:
                 print(f"\n  Validation Results:")
                 print(f"    Val Loss: {val_metrics['loss']:.4f}")
                 print(f"      Attractor: {val_metrics['loss_attract']:.4f}")
-                if self.criterion.global_loss.beta > 0:
+                
+                # Check if repeller is enabled (different attribute names for different losses)
+                repeller_enabled = False
+                if hasattr(self.criterion.global_loss, 'beta'):
+                    repeller_enabled = self.criterion.global_loss.beta > 0
+                elif hasattr(self.criterion.global_loss, 'lambda_repel'):
+                    repeller_enabled = self.criterion.global_loss.lambda_repel > 0
+                
+                if repeller_enabled:
                     print(f"      Repeller: {val_metrics['loss_repel']:.4f}")
                 else:
-                    print(f"      Repeller: {val_metrics['loss_repel']:.4f} (disabled, beta=0)")
+                    print(f"      Repeller: {val_metrics['loss_repel']:.4f} (disabled)")
+                    
                 if val_metrics.get('loss_dense', 0.0) > 0:
                     print(f"      Dense: {val_metrics['loss_dense']:.4f}")
                 print(f"    Image AUROC: {val_metrics['image_auroc']:.4f}")
@@ -308,11 +495,14 @@ class Trainer:
                 # Early stopping
                 if patience_counter >= early_stopping_patience:
                     print(f"\nEarly stopping after {epoch+1} epochs")
+                    # Save TSNE snapshot before breaking
+                    self._save_tsne(epoch=epoch+1, final=True)
                     break
             
             # Save regular checkpoint
             if (epoch + 1) % 5 == 0:
                 self.save_checkpoint(f'checkpoint_epoch_{epoch+1}.pth')
+                self._save_tsne(epoch=epoch+1)
             
             # Update scheduler
             if scheduler is not None:
@@ -327,6 +517,7 @@ class Trainer:
         self.save_checkpoint('final_model.pth')
         self.save_history()
         self.plot_training_curves()
+        self._save_tsne(epoch=self.epoch + 1, final=True)
         
         print(f"\nTraining complete!")
         print(f"Best validation AUROC: {self.best_val_auroc:.4f}")

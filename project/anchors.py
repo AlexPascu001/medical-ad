@@ -138,30 +138,39 @@ class EigenfaceAnchorStrategy(AnchorStrategy):
         centroids = self.kmeans.cluster_centers_  # (K, M)
         self.anchor_coefficients = centroids
         
-        # Step 4: Reconstruct anchor images from cluster centroids
-        print(f"\n4. Reconstructing anchor images...")
+        # Step 4: Select real samples closest to each centroid (sample-anchored)
+        print(f"\n4. Selecting closest real samples to centroids...")
         anchor_images = []
-        
+        anchor_indices = []
+
         for k in range(self.n_anchors):
-            # Reconstruct: X_anchor = μ + Σ(c_i * e_i)
-            # where c_i are centroid coefficients and e_i are eigenvectors
-            anchor_centered = centroids[k] @ self.eigenvectors  # (H*W,)
-            anchor_flat = anchor_centered + self.mean_image  # Add mean back
-            anchor_img = anchor_flat.reshape(H, W)
+            cluster_mask = cluster_labels == k
+            count = cluster_mask.sum()
+            if count == 0:
+                print(f"   Anchor {k}: empty cluster, falling back to global nearest")
+                # Global nearest to this centroid
+                dists = np.linalg.norm(coefficients - centroids[k], axis=1)
+                idx = int(np.argmin(dists))
+            else:
+                cluster_coeffs = coefficients[cluster_mask]
+                dists = np.linalg.norm(cluster_coeffs - centroids[k], axis=1)
+                local_idx = int(np.argmin(dists))
+                idx = np.where(cluster_mask)[0][local_idx]
+
+            anchor_indices.append(idx)
+            anchor_img = images[idx]
             anchor_images.append(anchor_img)
-            
-            # Count samples assigned to this anchor
-            count = (cluster_labels == k).sum()
+
             coeff_norm = np.linalg.norm(centroids[k])
-            print(f"   Anchor {k}: {count:4d} images assigned, "
-                  f"coeff norm = {coeff_norm:.3f}")
-        
+            print(f"   Anchor {k}: {count:4d} images assigned, coeff norm = {coeff_norm:.3f}, nearest sample idx = {idx}")
+
         self.anchor_images = np.array(anchor_images)  # (K, H, W)
-        
+        self.anchor_coefficients = centroids
+
         print(f"\n{'='*80}")
-        print(f"✓ Generated {self.n_anchors} eigenface-based anchors")
+        print(f"✓ Selected {self.n_anchors} sample-based eigenface anchors")
         print(f"{'='*80}\n")
-        
+
         return self.anchor_images
     
     def get_anchor_images(self) -> np.ndarray:
@@ -257,39 +266,43 @@ class KMeansCentroidAnchorStrategy(AnchorStrategy):
             n_clusters=self.n_anchors,
             n_init=10,
             random_state=self.random_state,
-            max_iter=self.max_iter,
-            verbose=0
+            max_iter=self.max_iter
         )
         
         cluster_labels = self.kmeans.fit_predict(X)
         centroids = self.kmeans.cluster_centers_  # (K, H*W)
-        
-        # Reshape centroids to images
-        anchor_images = []
+        self.anchor_images = []
+
+        # Select real samples closest to each centroid
         for k in range(self.n_anchors):
-            anchor_img = centroids[k].reshape(H, W)
-            anchor_images.append(anchor_img)
-            
-            count = (cluster_labels == k).sum()
-            inertia = np.sum((X[cluster_labels == k] - centroids[k])**2)
-            print(f"   Anchor {k}: {count:4d} images assigned, "
-                  f"inertia = {inertia:.2e}")
+            mask = cluster_labels == k
+            count = mask.sum()
+            if count == 0:
+                print(f"   Anchor {k}: empty cluster, falling back to global nearest")
+                dists = np.linalg.norm(X - centroids[k], axis=1)
+                idx = int(np.argmin(dists))
+            else:
+                cluster_X = X[mask]
+                dists = np.linalg.norm(cluster_X - centroids[k], axis=1)
+                local_idx = int(np.argmin(dists))
+                idx = np.where(mask)[0][local_idx]
+
+            anchor_img = images[idx]
+            self.anchor_images.append(anchor_img)
+            print(f"   Anchor {k}: {count:4d} images assigned, nearest sample idx = {idx}")
         
-        self.anchor_images = np.array(anchor_images)  # (K, H, W)
+        self.anchor_images = np.array(self.anchor_images)
         
         print(f"\n{'='*80}")
-        print(f"✓ Generated {self.n_anchors} KMeans centroid anchors")
-        print(f"  Total inertia: {self.kmeans.inertia_:.2e}")
+        print(f"✓ Generated {self.n_anchors} sample-based k-means anchors")
         print(f"{'='*80}\n")
         
         return self.anchor_images
-    
+
     def get_anchor_images(self) -> np.ndarray:
-        """Return anchor images"""
         return self.anchor_images
     
     def save(self, path: str):
-        """Save KMeans strategy state"""
         state = {
             'strategy': 'kmeans',
             'n_anchors': self.n_anchors,
