@@ -56,3 +56,8 @@ cand ar fi o anomalie: ar tb sa nu fie aproape de nicio ancora
 - sa vedem daca strategia influenteaza sau nu. daca random e cea mai buna => sa vedem alte strategii.
 - sa incercam un model mai mare
 - integrare decoder
+
+#######################################
+- posibila eroare la ancore/loss/de ce ancorele pare ca se misca/migreaza spre centru ??
+- fac pe un batch/toy example si vad daca sample-urile se duc sau nu cum trebuie spre ancore. speranta/ipoteza era ca o separare mai buna ar consta in aducerea inspre ancore a unor grupuri de puncte, si aceste grupulete sa fie departe de anomalii, dar nu se intampla asta
+- fara asta nu putem trece mai departe

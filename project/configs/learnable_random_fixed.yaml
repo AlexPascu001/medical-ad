@@ -1,0 +1,62 @@
+# Configuration for Learnable Anchors with Random Initialization + Fixed Labels
+# This uses the CAM Loss (Class Anchor Margin Loss) approach with:
+# - Anchors initialized from random samples
+# - Pseudo-labels fixed once before training (sample -> nearest anchor mapping)
+# - Learnable anchor embeddings that move in embedding space during training
+
+seed: 42
+output_dir: './experiments/bmad_learnable_random_fixed'
+
+# Data configuration
+data:
+  data_root: '../data/BraTS2021_slice'
+  target_size: [240, 240]
+
+# Anchor configuration
+anchor:
+  strategy: 'random'        # Random sample selection for anchor initialization
+  n_components: 50          # Not used for random, kept for compatibility
+  n_anchors: 8              # Number of anchors (K)
+  max_images_for_pca: 5000  # Max images for anchor generation
+  learnable: true           # CRITICAL: Make anchors learnable parameters
+  init_from: null           # Initialize from scratch (not from another experiment)
+
+# Model configuration
+model:
+  backbone: 'vit_small_patch16_dinov3.lvd1689m'
+  freeze_backbone: true     # Keep backbone frozen, only train projection + anchors
+  projection_dim: 128       # Projection head dimension
+
+# Loss configuration (CAM Loss)
+loss:
+  type: 'cam'               # Use Class Anchor Margin Loss
+  margin: 1.0               # Minimum margin between anchors (m)
+  alpha: 1.0                # Weight for attractor term (pull samples to anchors)
+  beta: 1.0                 # Weight for repeller term (push anchors apart)
+  gamma: 0.1                # Weight for min-norm term (prevent anchor collapse)
+  min_norm: 0.5             # Minimum norm threshold for anchors
+  distance_metric: 'euclidean'  # Distance metric: 'euclidean' or 'cosine'
+  use_dense: false          # Dense features disabled
+  global_weight: 1.0
+  dense_weight: 0.0
+
+# Training configuration
+training:
+  epochs: 50
+  batch_size: 64
+  num_workers: 4
+  lr: 0.0001
+  weight_decay: 0.000001
+  use_amp: true
+  log_interval: 50
+  val_interval: 1
+  early_stopping_patience: 15
+  # Pseudo-label configuration
+  fixed_pseudo_labels: true    # Compute sample->anchor assignments once before training
+  dynamic_reassignment: false  # Do NOT recompute during training
+  reassignment_interval: 5     # Ignored since dynamic_reassignment=false
+
+# Evaluation configuration
+eval:
+  compute_pixel: true
+  bootstrap_samples: 1000

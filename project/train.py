@@ -15,6 +15,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.manifold import TSNE
+from sklearn.decomposition import PCA
 
 from model import AnomalyDetector
 from loss import CombinedAnchorLoss
@@ -36,7 +37,9 @@ class Trainer:
         use_amp: bool = True,
         log_interval: int = 50,
         val_interval: int = 1,
-        fixed_pseudo_labels: bool = False
+        fixed_pseudo_labels: bool = False,
+        dynamic_reassignment: bool = False,
+        reassignment_interval: int = 5
     ):
         """
         Args:
@@ -50,6 +53,9 @@ class Trainer:
             use_amp: Use mixed precision training
             log_interval: Logging frequency (batches)
             val_interval: Validation frequency (epochs)
+            fixed_pseudo_labels: If True, compute pseudo-labels once before training
+            dynamic_reassignment: If True, recompute pseudo-labels every reassignment_interval epochs
+            reassignment_interval: Epochs between pseudo-label recomputation (only if dynamic_reassignment=True)
         """
         self.model = model
         self.criterion = criterion
@@ -74,6 +80,10 @@ class Trainer:
         self.tsne_samples = self._prepare_tsne_samples(normal_count=500, anomaly_count=100)
         self.fixed_assignments = None
         self.fixed_pseudo = fixed_pseudo_labels
+        
+        # Dynamic label reassignment for learnable anchors
+        self.dynamic_reassignment = dynamic_reassignment
+        self.reassignment_interval = reassignment_interval
         
         # Enhanced history tracking
         self.history = {
@@ -105,37 +115,331 @@ class Trainer:
         self.fixed_pseudo = getattr(self, 'fixed_pseudo', False)
 
     def _prepare_tsne_samples(self, normal_count: int = 500, anomaly_count: int = 100):
-        """Collect a fixed pool of samples for TSNE visualization (CPU tensors)."""
-        normals = []
-        anomalies = []
+        """Collect a fixed pool of samples for visualization (CPU tensors)."""
+        # No longer used - we visualize ALL training samples instead
+        return None
 
-        # Use val_loader (has both classes) to grab a stable subset
-        for batch in self.val_loader:
-            images = batch['image']  # already preprocessed tensors
-            labels = batch['label']
-            for img, lbl in zip(images, labels):
-                if lbl.item() == 0 and len(normals) < normal_count:
-                    normals.append(img.cpu())
-                elif lbl.item() == 1 and len(anomalies) < anomaly_count:
-                    anomalies.append(img.cpu())
-            if len(normals) >= normal_count and len(anomalies) >= anomaly_count:
-                break
+    def _visualize_training_samples(self, epoch: int, max_samples: int = 2000, max_lines_per_anchor: int = 150):
+        """
+        Visualize ALL training samples with lines to their assigned anchors.
+        Uses both t-SNE and PCA projections.
+        
+        Args:
+            epoch: Current epoch number
+            max_samples: Maximum samples to visualize (for memory/speed)
+            max_lines_per_anchor: Maximum lines to draw per anchor (for visibility)
+        """
+        print(f"\n  Generating training visualization (epoch {epoch})...")
+        
+        self.model.eval()
+        save_dir = self.save_dir / 'visualizations'
+        save_dir.mkdir(exist_ok=True, parents=True)
+        
+        # Collect all training embeddings and assignments
+        all_embeddings = []
+        all_assignments = []
+        
+        # Use non-shuffled loader
+        eval_loader = DataLoader(
+            self.train_loader.dataset,
+            batch_size=self.train_loader.batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+            drop_last=False
+        )
+        
+        with torch.no_grad():
+            anchor_global, _ = self.model._get_projected_anchors()
+            
+            for batch in tqdm(eval_loader, desc='    Collecting embeddings', leave=False):
+                images = batch['image'].to(self.device)
+                outputs = self.model(images, return_dense=False)
+                embeddings = outputs['global_feat']
+                distances = outputs['global_distances']
+                assignments = distances.argmin(dim=1)
+                
+                all_embeddings.append(embeddings.cpu())
+                all_assignments.append(assignments.cpu())
+        
+        all_embeddings = torch.cat(all_embeddings, dim=0)
+        all_assignments = torch.cat(all_assignments, dim=0)
+        anchors = anchor_global.cpu()
+        
+        n_samples = all_embeddings.shape[0]
+        n_anchors = anchors.shape[0]
+        
+        # Subsample if too many
+        if n_samples > max_samples:
+            indices = torch.randperm(n_samples)[:max_samples]
+            all_embeddings = all_embeddings[indices]
+            all_assignments = all_assignments[indices]
+            n_samples = max_samples
+        
+        emb_np = all_embeddings.numpy()
+        anc_np = anchors.numpy()
+        assign_np = all_assignments.numpy()
+        
+        # Combine for dimensionality reduction
+        all_points = np.vstack([emb_np, anc_np])
+        
+        colors = plt.cm.tab10(np.linspace(0, 1, n_anchors))
+        
+        fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+        
+        # === Plot 1: t-SNE ===
+        ax = axes[0]
+        perplexity = min(30, len(all_points) - 1)
+        tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, init='pca')
+        coords_2d = tsne.fit_transform(all_points)
+        
+        sample_coords = coords_2d[:n_samples]
+        anchor_coords = coords_2d[n_samples:]
+        
+        # Draw lines from samples to their assigned anchors
+        for k in range(n_anchors):
+            mask = assign_np == k
+            indices = np.where(mask)[0]
+            if len(indices) > max_lines_per_anchor:
+                indices = np.random.choice(indices, max_lines_per_anchor, replace=False)
+            for idx in indices:
+                ax.plot(
+                    [sample_coords[idx, 0], anchor_coords[k, 0]],
+                    [sample_coords[idx, 1], anchor_coords[k, 1]],
+                    c=colors[k], alpha=0.15, linewidth=0.5, zorder=1
+                )
+        
+        # Plot samples colored by assignment
+        for k in range(n_anchors):
+            mask = assign_np == k
+            count = mask.sum()
+            if count > 0:
+                ax.scatter(sample_coords[mask, 0], sample_coords[mask, 1], 
+                          c=[colors[k]], s=15, alpha=0.6, label=f'Anchor {k} (n={count})', zorder=2)
+        
+        # Plot anchors (big stars)
+        for k in range(n_anchors):
+            ax.scatter(anchor_coords[k, 0], anchor_coords[k, 1],
+                      c=[colors[k]], s=500, marker='*', edgecolors='black', linewidths=2, zorder=10)
+            ax.annotate(f'A{k}', (anchor_coords[k, 0], anchor_coords[k, 1]),
+                       fontsize=12, fontweight='bold', ha='center', va='center', zorder=11)
+        
+        ax.set_title(f't-SNE (N={n_samples})', fontsize=13, fontweight='bold')
+        ax.legend(fontsize=8, loc='upper right')
+        ax.grid(True, alpha=0.3)
+        
+        # === Plot 2: PCA ===
+        ax = axes[1]
+        pca = PCA(n_components=2)
+        coords_pca = pca.fit_transform(all_points)
+        
+        sample_pca = coords_pca[:n_samples]
+        anchor_pca = coords_pca[n_samples:]
+        
+        # Draw lines
+        for k in range(n_anchors):
+            mask = assign_np == k
+            indices = np.where(mask)[0]
+            if len(indices) > max_lines_per_anchor:
+                indices = np.random.choice(indices, max_lines_per_anchor, replace=False)
+            for idx in indices:
+                ax.plot(
+                    [sample_pca[idx, 0], anchor_pca[k, 0]],
+                    [sample_pca[idx, 1], anchor_pca[k, 1]],
+                    c=colors[k], alpha=0.15, linewidth=0.5, zorder=1
+                )
+        
+        # Plot samples
+        for k in range(n_anchors):
+            mask = assign_np == k
+            count = mask.sum()
+            if count > 0:
+                ax.scatter(sample_pca[mask, 0], sample_pca[mask, 1],
+                          c=[colors[k]], s=15, alpha=0.6, label=f'Anchor {k} (n={count})', zorder=2)
+        
+        # Plot anchors
+        for k in range(n_anchors):
+            ax.scatter(anchor_pca[k, 0], anchor_pca[k, 1],
+                      c=[colors[k]], s=500, marker='*', edgecolors='black', linewidths=2, zorder=10)
+            ax.annotate(f'A{k}', (anchor_pca[k, 0], anchor_pca[k, 1]),
+                       fontsize=12, fontweight='bold', ha='center', va='center', zorder=11)
+        
+        # Mark origin
+        ax.axhline(y=0, color='red', linestyle='--', alpha=0.3)
+        ax.axvline(x=0, color='red', linestyle='--', alpha=0.3)
+        ax.scatter([0], [0], c='red', s=100, marker='x', zorder=5, label='Origin')
+        
+        ax.set_title(f'PCA (N={n_samples})', fontsize=13, fontweight='bold')
+        ax.legend(fontsize=8, loc='upper right')
+        ax.grid(True, alpha=0.3)
+        
+        plt.suptitle(f'Training Samples - Epoch {epoch}', fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(save_dir / f'train_epoch_{epoch:03d}.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"    Saved: {save_dir / f'train_epoch_{epoch:03d}.png'}")
 
-        if len(normals) == 0:
-            print("TSNE prep warning: no normal samples collected")
-        if len(anomalies) == 0:
-            print("TSNE prep warning: no anomalous samples collected")
+    def _visualize_test_samples(self, test_loader: DataLoader, save_name: str = 'test_final'):
+        """
+        Visualize test samples (normal and anomaly) with anchors.
+        Shows how normal vs anomaly samples relate to the learned anchors.
+        
+        Args:
+            test_loader: DataLoader with test samples (has both normal and anomaly)
+            save_name: Name for the saved file
+        """
+        print(f"\n  Generating test visualization...")
+        
+        self.model.eval()
+        save_dir = self.save_dir / 'visualizations'
+        save_dir.mkdir(exist_ok=True, parents=True)
+        
+        # Collect all test embeddings
+        all_embeddings = []
+        all_labels = []  # 0=normal, 1=anomaly
+        all_distances = []  # Distance to nearest anchor
+        
+        with torch.no_grad():
+            anchor_global, _ = self.model._get_projected_anchors()
+            
+            for batch in tqdm(test_loader, desc='    Collecting test embeddings', leave=False):
+                images = batch['image'].to(self.device)
+                labels = batch['label']
+                
+                outputs = self.model(images, return_dense=False)
+                embeddings = outputs['global_feat']
+                distances = outputs['global_distances']
+                min_dist = distances.min(dim=1)[0]  # Distance to nearest anchor
+                
+                all_embeddings.append(embeddings.cpu())
+                all_labels.append(labels)
+                all_distances.append(min_dist.cpu())
+        
+        all_embeddings = torch.cat(all_embeddings, dim=0)
+        all_labels = torch.cat(all_labels, dim=0)
+        all_distances = torch.cat(all_distances, dim=0)
+        anchors = anchor_global.cpu()
+        
+        n_samples = all_embeddings.shape[0]
+        n_anchors = anchors.shape[0]
+        n_normal = (all_labels == 0).sum().item()
+        n_anomaly = (all_labels == 1).sum().item()
+        
+        emb_np = all_embeddings.numpy()
+        anc_np = anchors.numpy()
+        labels_np = all_labels.numpy()
+        distances_np = all_distances.numpy()
+        
+        # Combine for dimensionality reduction
+        all_points = np.vstack([emb_np, anc_np])
+        
+        fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+        
+        # Colors for normal/anomaly
+        normal_color = 'steelblue'
+        anomaly_color = 'crimson'
+        anchor_colors = plt.cm.tab10(np.linspace(0, 1, n_anchors))
+        
+        # === Plot 1: t-SNE ===
+        ax = axes[0]
+        perplexity = min(30, len(all_points) - 1)
+        tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, init='pca')
+        coords_2d = tsne.fit_transform(all_points)
+        
+        sample_coords = coords_2d[:n_samples]
+        anchor_coords = coords_2d[n_samples:]
+        
+        # Plot normal samples
+        normal_mask = labels_np == 0
+        ax.scatter(sample_coords[normal_mask, 0], sample_coords[normal_mask, 1], 
+                  c=normal_color, s=15, alpha=0.5, label=f'Normal (n={n_normal})', zorder=2)
+        
+        # Plot anomaly samples
+        anomaly_mask = labels_np == 1
+        ax.scatter(sample_coords[anomaly_mask, 0], sample_coords[anomaly_mask, 1], 
+                  c=anomaly_color, s=15, alpha=0.5, label=f'Anomaly (n={n_anomaly})', zorder=3)
+        
+        # Plot anchors (big stars)
+        for k in range(n_anchors):
+            ax.scatter(anchor_coords[k, 0], anchor_coords[k, 1],
+                      c=[anchor_colors[k]], s=500, marker='*', edgecolors='black', linewidths=2, zorder=10)
+            ax.annotate(f'A{k}', (anchor_coords[k, 0], anchor_coords[k, 1]),
+                       fontsize=12, fontweight='bold', ha='center', va='center', zorder=11)
+        
+        ax.set_title(f't-SNE (N={n_samples})', fontsize=13, fontweight='bold')
+        ax.legend(fontsize=10, loc='upper right')
+        ax.grid(True, alpha=0.3)
+        
+        # === Plot 2: PCA ===
+        ax = axes[1]
+        pca = PCA(n_components=2)
+        coords_pca = pca.fit_transform(all_points)
+        
+        sample_pca = coords_pca[:n_samples]
+        anchor_pca = coords_pca[n_samples:]
+        
+        # Plot normal samples
+        ax.scatter(sample_pca[normal_mask, 0], sample_pca[normal_mask, 1], 
+                  c=normal_color, s=15, alpha=0.5, label=f'Normal (n={n_normal})', zorder=2)
+        
+        # Plot anomaly samples
+        ax.scatter(sample_pca[anomaly_mask, 0], sample_pca[anomaly_mask, 1], 
+                  c=anomaly_color, s=15, alpha=0.5, label=f'Anomaly (n={n_anomaly})', zorder=3)
+        
+        # Plot anchors
+        for k in range(n_anchors):
+            ax.scatter(anchor_pca[k, 0], anchor_pca[k, 1],
+                      c=[anchor_colors[k]], s=500, marker='*', edgecolors='black', linewidths=2, zorder=10)
+            ax.annotate(f'A{k}', (anchor_pca[k, 0], anchor_pca[k, 1]),
+                       fontsize=12, fontweight='bold', ha='center', va='center', zorder=11)
+        
+        # Mark origin
+        ax.axhline(y=0, color='gray', linestyle='--', alpha=0.3)
+        ax.axvline(x=0, color='gray', linestyle='--', alpha=0.3)
+        
+        ax.set_title(f'PCA (N={n_samples})', fontsize=13, fontweight='bold')
+        ax.legend(fontsize=10, loc='upper right')
+        ax.grid(True, alpha=0.3)
+        
+        # Compute and display statistics
+        normal_dist_mean = distances_np[normal_mask].mean()
+        anomaly_dist_mean = distances_np[anomaly_mask].mean()
+        
+        fig.text(0.5, 0.02, 
+                f'Mean distance to nearest anchor - Normal: {normal_dist_mean:.4f}, Anomaly: {anomaly_dist_mean:.4f}',
+                ha='center', fontsize=11, style='italic')
+        
+        plt.suptitle(f'Test Samples: Normal vs Anomaly', fontsize=14, fontweight='bold')
+        plt.tight_layout(rect=[0, 0.05, 1, 0.95])
+        plt.savefig(save_dir / f'{save_name}.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"    Saved: {save_dir / f'{save_name}.png'}")
+        print(f"    Normal samples mean dist: {normal_dist_mean:.4f}")
+        print(f"    Anomaly samples mean dist: {anomaly_dist_mean:.4f}")
+        
+        # Also create a histogram of distances
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.hist(distances_np[normal_mask], bins=50, alpha=0.7, color=normal_color, 
+                label=f'Normal (n={n_normal}, μ={normal_dist_mean:.3f})')
+        ax.hist(distances_np[anomaly_mask], bins=50, alpha=0.7, color=anomaly_color,
+                label=f'Anomaly (n={n_anomaly}, μ={anomaly_dist_mean:.3f})')
+        ax.set_xlabel('Distance to Nearest Anchor', fontsize=12)
+        ax.set_ylabel('Count', fontsize=12)
+        ax.set_title('Distribution of Distances to Nearest Anchor', fontsize=13, fontweight='bold')
+        ax.legend(fontsize=10)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(save_dir / f'{save_name}_histogram.png', dpi=150)
+        plt.close()
+        
+        print(f"    Saved: {save_dir / f'{save_name}_histogram.png'}")
 
-        images = normals + anomalies
-        labels = [0] * len(normals) + [1] * len(anomalies)
-
-        if len(images) == 0:
-            return None
-
-        return {
-            'images': torch.stack(images),
-            'labels': torch.tensor(labels, dtype=torch.long)
-        }
+    def _save_tsne(self, epoch: int, final: bool = False):
+        """Legacy method - redirects to new visualization."""
+        # Call the new comprehensive visualization
+        self._visualize_training_samples(epoch=epoch)
 
     def _precompute_pseudo_labels(self):
         """Compute fixed nearest-anchor assignments once before training."""
@@ -167,53 +471,6 @@ class Trainer:
 
         self.fixed_assignments = mapping
         print(f"✓ Pseudo-labels computed for {len(mapping)} samples")
-
-    def _save_tsne(self, epoch: int, final: bool = False):
-        """Compute embeddings for fixed samples + anchors and save TSNE plot."""
-        if self.tsne_samples is None:
-            return
-
-        self.model.eval()
-        save_dir = self.save_dir / 'tsne'
-        save_dir.mkdir(exist_ok=True, parents=True)
-
-        with torch.no_grad():
-            imgs = self.tsne_samples['images'].to(self.device)
-            labels = self.tsne_samples['labels']
-
-            outputs = self.model(imgs, return_dense=False)
-            sample_embeds = outputs['global_feat'].detach().cpu().numpy()
-
-            anchor_global, _ = self.model._get_projected_anchors()
-            anchor_np = anchor_global.detach().cpu().numpy()
-
-        data = np.vstack([sample_embeds, anchor_np])
-        label_vec = np.concatenate([
-            labels.numpy(),
-            np.full(anchor_np.shape[0], 2, dtype=np.int64)  # 2 = anchor
-        ])
-
-        # TSNE parameters
-        total_points = data.shape[0]
-        perplexity = max(5, min(30, (total_points - 1) // 3))
-        tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, init='pca')
-        coords = tsne.fit_transform(data)
-
-        # Plot
-        plt.figure(figsize=(8, 6))
-        colors = {0: 'steelblue', 1: 'crimson', 2: 'orange'}
-        labels_map = {0: 'normal', 1: 'anomaly', 2: 'anchor'}
-        for cls in [0, 1, 2]:
-            mask = label_vec == cls
-            if mask.any():
-                plt.scatter(coords[mask, 0], coords[mask, 1], s=12, alpha=0.7, c=colors[cls], label=labels_map[cls])
-        plt.legend()
-        plt.title(f'TSNE epoch {epoch}' if not final else 'TSNE final')
-        plt.tight_layout()
-
-        fname = 'tsne_final.png' if final else f'tsne_epoch_{epoch:03d}.png'
-        plt.savefig(save_dir / fname, dpi=150)
-        plt.close()
     
     def train_epoch(self) -> Dict[str, float]:
         """Train for one epoch"""
@@ -229,6 +486,9 @@ class Trainer:
         }
         
         anchor_assignments = np.zeros(self.model.n_anchors)
+        
+        # Check if model has pixel decoder for dense/pixel loss
+        use_pixel_decoder = getattr(self.model, 'use_pixel_decoder', False)
         
         pbar = tqdm(self.train_loader, desc=f'Epoch {self.epoch}')
         
@@ -251,7 +511,8 @@ class Trainer:
             
             if self.use_amp:
                 with autocast('cuda'):
-                    outputs = self.model(images, return_dense=False)  # Dense loss disabled
+                    # Enable dense features if pixel decoder is available
+                    outputs = self.model(images, return_dense=use_pixel_decoder)
                     if fixed_assign is not None:
                         outputs['fixed_assignments'] = fixed_assign
                     loss_dict = self.criterion(outputs, anchor_global)
@@ -262,7 +523,7 @@ class Trainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                outputs = self.model(images, return_dense=False)  # Dense loss disabled
+                outputs = self.model(images, return_dense=use_pixel_decoder)
                 if fixed_assign is not None:
                     outputs['fixed_assignments'] = fixed_assign
                 loss_dict = self.criterion(outputs, anchor_global)
@@ -289,7 +550,11 @@ class Trainer:
                 epoch_metrics['loss_repel'] += loss_dict.get('loss_global_loss_repel', 0.0)
                 epoch_metrics['loss_norm'] += 0.0  # No norm loss in contrastive
             
-            # Dense path disabled; keep zero defaults
+            # Dense/pixel loss tracking
+            if 'loss_dense' in loss_dict:
+                epoch_metrics['loss_dense'] += loss_dict['loss_dense'].item() if isinstance(loss_dict['loss_dense'], torch.Tensor) else loss_dict['loss_dense']
+            if 'loss_dense_attract' in loss_dict:
+                epoch_metrics['loss_dense_attract'] += loss_dict['loss_dense_attract']
             
             # Track anchor assignments
             assigned = loss_dict['assigned_anchors'].cpu().numpy()
@@ -318,8 +583,9 @@ class Trainer:
                     if 'loss_global_loss_repel' in loss_dict:
                         postfix_dict['rep'] = f"{loss_dict['loss_global_loss_repel']:.4f}"
                 
-                if 'loss_dense' in loss_dict:
-                    postfix_dict['dense'] = f"{loss_dict['loss_dense']:.4f}"
+                if 'loss_dense' in loss_dict and loss_dict['loss_dense'] > 0:
+                    loss_dense_val = loss_dict['loss_dense'].item() if isinstance(loss_dict['loss_dense'], torch.Tensor) else loss_dict['loss_dense']
+                    postfix_dict['pix'] = f"{loss_dense_val:.4f}"
                 pbar.set_postfix(postfix_dict)
             
             self.global_step += 1
@@ -352,12 +618,15 @@ class Trainer:
         # No need to detach since we're inside torch.no_grad() anyway
         anchor_global, _ = self.model._get_projected_anchors()
         
+        # Check if model has pixel decoder
+        use_pixel_decoder = getattr(self.model, 'use_pixel_decoder', False)
+        
         with torch.no_grad():
             for batch in self.val_loader:
                 images = batch['image'].to(self.device)
                 
-                # Compute loss
-                outputs = self.model(images, return_dense=False)
+                # Compute loss (enable dense if pixel decoder available)
+                outputs = self.model(images, return_dense=use_pixel_decoder)
                 loss_dict = self.criterion(outputs, anchor_global)
                 
                 val_loss_metrics['loss'] += loss_dict['loss'].item()
@@ -409,11 +678,26 @@ class Trainer:
         print(f"Device: {self.device}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}")
         
+        # Print pseudo-label configuration
+        if self.fixed_pseudo:
+            if self.dynamic_reassignment:
+                print(f"Pseudo-labels: DYNAMIC (reassign every {self.reassignment_interval} epochs)")
+            else:
+                print(f"Pseudo-labels: FIXED (computed once before training)")
+        else:
+            print(f"Pseudo-labels: NONE (use nearest anchor per batch)")
+        
         patience_counter = 0
         
         for epoch in range(num_epochs):
             self.epoch = epoch
             start_time = time.time()
+            
+            # Dynamic pseudo-label reassignment (for learnable anchors)
+            if self.dynamic_reassignment and self.fixed_pseudo:
+                if epoch > 0 and epoch % self.reassignment_interval == 0:
+                    print(f"\n  >> Recomputing pseudo-labels (epoch {epoch})...")
+                    self._precompute_pseudo_labels()
             
             # Train epoch
             train_metrics = self.train_epoch()

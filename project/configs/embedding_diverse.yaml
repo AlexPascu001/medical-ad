@@ -1,0 +1,54 @@
+# Embedding-Diverse Anchor Strategy Configuration
+# Uses farthest point sampling in DINO embedding space for maximum anchor diversity
+
+# Anchor configuration
+anchor:
+  strategy: embedding_diverse
+  n_anchors: 8
+  n_components: 50  # Not used for this strategy but kept for compatibility
+  max_images_for_pca: 5000  # Number of images to consider for anchor selection
+
+# Data settings
+data:
+  data_root: ./data/BraTS2021_slice
+  target_size: [240, 240]
+
+# Model settings
+model:
+  backbone: vit_small_patch16_dinov3.lvd1689m
+  freeze_backbone: true
+  projection_dim: 128
+
+# Training settings
+training:
+  epochs: 50
+  batch_size: 64
+  lr: 0.0001
+  weight_decay: 0.000001
+  num_workers: 4
+  log_interval: 50
+  val_interval: 1
+  early_stopping_patience: 10
+  use_amp: true
+  fixed_pseudo_labels: true  # Fixed assignment to nearest anchor
+
+# Loss settings
+loss:
+  alpha: 1.0    # Attractor strength
+  beta: 0.0     # Repeller strength (disabled)
+  gamma: 0.0    # Min-norm regularization (disabled)
+  margin: 1.0
+  distance_metric: euclidean
+  global_weight: 1.0
+  dense_weight: 0.5
+  use_dense: false
+
+# Evaluation settings
+eval:
+  compute_pixel: true
+  bootstrap_samples: 1000
+
+# Random seed
+seed: 42
+
+# Output directory will be set automatically by main.py

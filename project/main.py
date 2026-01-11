@@ -139,13 +139,28 @@ def prepare_anchors(
     train_images: list,
     preprocessor: BMADPreprocessor,
     config: dict,
-    save_dir: Path
+    save_dir: Path,
+    backbone_for_projection: DINOv3Backbone = None,
+    device: torch.device = None
 ) -> tuple:
     """
-    Prepare anchor images and embeddings
+    Prepare anchor images and embeddings.
+    
+    CRITICAL: If backbone_for_projection is provided, anchors are projected through
+    that SPECIFIC backbone's projection head. This ensures anchors and samples use
+    the SAME projection weights. The anchors are then stored in PROJECTED space
+    and NOT re-projected during training (acting as fixed targets).
+    
+    Args:
+        train_images: List of training image paths
+        preprocessor: Image preprocessor
+        config: Configuration dictionary
+        save_dir: Directory to save anchor data
+        backbone_for_projection: If provided, project anchors through THIS backbone
+        device: Device for computation
     
     Returns:
-        anchor_images, anchor_global_embeddings, anchor_dense_embeddings
+        anchor_images, anchor_global_embeddings (PROJECTED if backbone provided), anchor_dense_embeddings
     """
     print("\n" + "="*80)
     print("ANCHOR GENERATION")
@@ -184,32 +199,62 @@ def prepare_anchors(
     
     # Compute anchor embeddings
     print("\nComputing anchor embeddings with DINOv3...")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    backbone = DINOv3Backbone(
-        model_name=config['model']['backbone'],
-        freeze_backbone=True,
-        pretrained=True
-    )
-    backbone = backbone.to(device)
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    projection_dim = config['model'].get('projection_dim', None)
+    
+    if backbone_for_projection is not None:
+        # Use the PROVIDED backbone (same one the model will use)
+        # This ensures anchors and samples use the SAME projection weights
+        print(f"  Using provided backbone for projection (ensuring same weights as model)")
+        backbone = backbone_for_projection
+        use_model_backbone = True
+    else:
+        # Create a temporary backbone (legacy behavior - NOT recommended with projection)
+        print(f"  Creating temporary backbone for embedding extraction")
+        backbone = DINOv3Backbone(
+            model_name=config['model']['backbone'],
+            freeze_backbone=True,
+            projection_dim=projection_dim,
+            pretrained=True
+        )
+        backbone = backbone.to(device)
+        use_model_backbone = False
+    
     backbone.eval()
     
+    # Extract embeddings - use return_projected=True if we have a projection head
+    has_projection = backbone.projection is not None
     anchor_global, anchor_dense = compute_anchor_embeddings(
         anchor_images=anchor_images,
         backbone_model=backbone,
         device=device,
-        batch_size=8
+        batch_size=8,
+        return_projected=has_projection  # Get projected embeddings if projection exists
     )
     
     # Save embeddings
     torch.save({
         'anchor_images': anchor_images,
         'anchor_global': anchor_global,
-        'anchor_dense': anchor_dense
+        'anchor_dense': anchor_dense,
+        'projection_dim': projection_dim if has_projection else None,
+        'is_projected': has_projection,
+        'used_model_backbone': use_model_backbone
     }, save_dir / 'anchor_embeddings.pt')
     
     print(f"\nAnchor preparation complete!")
     print(f"  Global embeddings: {anchor_global.shape}")
+    if has_projection:
+        print(f"  Anchors are in PROJECTED space ({anchor_global.shape[1]}D)")
+        if use_model_backbone:
+            print(f"  ✓ Projected through MODEL's backbone - same weights as training!")
+        else:
+            print(f"  ⚠ Projected through TEMPORARY backbone - weights differ from model!")
+    else:
+        print(f"  Anchors are in RAW space (384D) - no projection head")
     print(f"  Dense embeddings: {anchor_dense.shape}")
     
     return anchor_images, anchor_global, anchor_dense
@@ -221,24 +266,50 @@ def create_model(config: dict, anchor_global: torch.Tensor, anchor_dense: torch.
     print("MODEL CREATION")
     print("="*80)
     
-    # Create backbone
+    # Check if pixel decoder is requested
+    use_pixel_decoder = config['model'].get('use_pixel_decoder', False)
+    multi_scale_indices = config['model'].get('multi_scale_indices', [2, 5, 8, 11])
+    
+    # Create backbone with multi-scale support if pixel decoder is enabled
     backbone = DINOv3Backbone(
         model_name=config['model']['backbone'],
         freeze_backbone=config['model']['freeze_backbone'],
         projection_dim=config['model'].get('projection_dim', None),
-        pretrained=True
+        pretrained=True,
+        multi_scale_indices=multi_scale_indices if use_pixel_decoder else None
     )
     
     # Check if anchors should be learnable
     learnable_anchors = config['anchor'].get('learnable', False)
     
-    # Create detector
+    # CRITICAL: Anchors are already in PROJECTED space (from prepare_anchors).
+    # They were projected ONCE through a fresh projection head and stored.
+    # The model will use them as FIXED targets - NOT re-project them.
+    # This prevents collapse: the projection head learns to map samples TO
+    # these fixed anchor locations, rather than collapsing everything together.
+    projection_dim = config['model'].get('projection_dim', None)
+    if projection_dim:
+        print(f"\nAnchors are in PROJECTED space: {anchor_global.shape}")
+        print(f"  They are FIXED targets - will NOT be re-projected during training")
+        print(f"  Projection head learns to map samples TO these fixed anchors")
+    else:
+        print(f"\nAnchors are in RAW space: {anchor_global.shape}")
+        print(f"  No projection head configured")
+    
+    # Get target size from config
+    target_size = tuple(config['data']['target_size'])
+    
+    # Create detector with anchors_already_projected=True
     detector = AnomalyDetector(
         backbone=backbone,
         anchor_global_embeddings=anchor_global,
         anchor_dense_embeddings=anchor_dense,
         distance_metric=config['loss']['distance_metric'],
-        learnable_anchors=learnable_anchors
+        learnable_anchors=learnable_anchors,
+        use_pixel_decoder=use_pixel_decoder,
+        decoder_hidden_dim=config['model'].get('decoder_hidden_dim', 256),
+        target_size=target_size,
+        anchors_already_projected=projection_dim is not None  # NEW: Tell model anchors are pre-projected
     )
     
     return detector
@@ -257,11 +328,14 @@ def create_criterion(config: dict):
     For learnable anchors, 'center', 'infonce', or 'hybrid' are recommended.
     """
     loss_type = config['loss'].get('type', 'cam')  # Default to CAM loss for backward compatibility
+    use_pixel_decoder = config['model'].get('use_pixel_decoder', False)
     
     print(f"\nCreating loss function: {loss_type}")
+    if use_pixel_decoder:
+        print(f"  Pixel decoder enabled: dense loss will be computed")
     
     if loss_type == 'cam':
-        # Original CAM loss (dense branch disabled until decoder exists)
+        # Original CAM loss
         global_loss = AnchorMarginLoss(
             margin=config['loss']['margin'],
             alpha=config['loss']['alpha'],
@@ -271,8 +345,17 @@ def create_criterion(config: dict):
             distance_metric=config['loss']['distance_metric']
         )
 
-        dense_loss = None  # disabled for now
-        config['loss']['use_dense'] = False
+        # Create dense loss if pixel decoder is enabled
+        dense_loss = None
+        if use_pixel_decoder:
+            dense_loss = DenseAnchorMarginLoss(
+                margin=config['loss']['margin'],
+                alpha=config['loss']['alpha'],
+                distance_metric=config['loss']['distance_metric'],
+                spatial_reduction='mean'
+            )
+            print(f"  Dense loss: DenseAnchorMarginLoss (alpha={config['loss']['alpha']})")
+        
         # Combined loss
         criterion = CombinedAnchorLoss(
             global_loss=global_loss,
@@ -454,7 +537,27 @@ def main(args):
     print(f"Val batches: {len(val_loader)}")
     print(f"Test batches: {len(test_loader)}")
     
-    # ===== STAGE 2: Anchor Generation =====
+    # ===== STAGE 2: Create Model Backbone FIRST =====
+    # We need to create the backbone first so we can project anchors through
+    # the SAME projection head that will be used during training
+    print("\n" + "="*80)
+    print("CREATING BACKBONE")
+    print("="*80)
+    
+    use_pixel_decoder = config['model'].get('use_pixel_decoder', False)
+    multi_scale_indices = config['model'].get('multi_scale_indices', [2, 5, 8, 11])
+    projection_dim = config['model'].get('projection_dim', None)
+    
+    backbone = DINOv3Backbone(
+        model_name=config['model']['backbone'],
+        freeze_backbone=config['model']['freeze_backbone'],
+        projection_dim=projection_dim,
+        pretrained=True,
+        multi_scale_indices=multi_scale_indices if use_pixel_decoder else None
+    )
+    backbone = backbone.to(device)
+    
+    # ===== STAGE 3: Anchor Generation (using model's backbone) =====
     preprocessor = BMADPreprocessor(target_size=tuple(config['data']['target_size']))
     
     # Check if we should load anchors from another experiment (for learnable anchors)
@@ -493,18 +596,48 @@ def main(args):
         anchor_global = anchor_data['anchor_global']
         anchor_dense = anchor_data['anchor_dense']
     else:
+        # CRITICAL: Pass the MODEL's backbone so anchors use the SAME projection weights
         anchor_images, anchor_global, anchor_dense = prepare_anchors(
             train_images=train_paths,
             preprocessor=preprocessor,
             config=config,
-            save_dir=save_dir
+            save_dir=save_dir,
+            backbone_for_projection=backbone,  # Use MODEL's backbone!
+            device=device
         )
     
-    # ===== STAGE 3: Model Creation =====
-    model = create_model(config, anchor_global, anchor_dense)
+    # ===== STAGE 4: Complete Model Creation =====
+    # Now create the full detector with the backbone and anchors
+    learnable_anchors = config['anchor'].get('learnable', False)
+    target_size = tuple(config['data']['target_size'])
+    
+    print("\n" + "="*80)
+    print("MODEL CREATION")
+    print("="*80)
+    
+    # Anchors are already projected through THIS backbone's projection head
+    # So they're in the SAME coordinate system as samples will be
+    if projection_dim:
+        print(f"Anchors are in PROJECTED space: {anchor_global.shape}")
+        print(f"  Projected through MODEL's backbone - same weights as training!")
+        print(f"  They are FIXED targets - will NOT be re-projected")
+    else:
+        print(f"Anchors are in RAW space: {anchor_global.shape}")
+    
+    model = AnomalyDetector(
+        backbone=backbone,
+        anchor_global_embeddings=anchor_global,
+        anchor_dense_embeddings=anchor_dense,
+        distance_metric=config['loss']['distance_metric'],
+        learnable_anchors=learnable_anchors,
+        use_pixel_decoder=use_pixel_decoder,
+        decoder_hidden_dim=config['model'].get('decoder_hidden_dim', 256),
+        target_size=target_size,
+        anchors_already_projected=projection_dim is not None
+    )
     model = model.to(device)
     
-    # ===== STAGE 4: Training Setup =====
+    # ===== STAGE 5: Training Setup =====
     criterion = create_criterion(config)
     
     # Get trainable parameters
@@ -547,7 +680,9 @@ def main(args):
             use_amp=config['training']['use_amp'],
             log_interval=config['training']['log_interval'],
             val_interval=config['training']['val_interval'],
-            fixed_pseudo_labels=config['training'].get('fixed_pseudo_labels', False)
+            fixed_pseudo_labels=config['training'].get('fixed_pseudo_labels', False),
+            dynamic_reassignment=config['training'].get('dynamic_reassignment', False),
+            reassignment_interval=config['training'].get('reassignment_interval', 5)
         )
         
         trainer.train(
@@ -613,6 +748,10 @@ def main(args):
         device=device,
         save_dir=eval_dir
     )
+    
+    # Generate test sample visualization (normal vs anomaly)
+    print("\nGenerating test sample visualization...")
+    trainer._visualize_test_samples(test_loader=test_loader, save_name='test_final')
     
     print("\n" + "="*80)
     print("TRAINING COMPLETE")

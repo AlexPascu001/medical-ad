@@ -1,18 +1,41 @@
-# Learnable Anchors with CAM Loss
-
-Implementation of learnable anchor embeddings using Class Anchor Margin (CAM) Loss, based on:
-
-**"Class Anchor Margin Loss for Content-Based Image Retrieval"**  
-Alexandru Ghita, Radu Tudor Ionescu  
-arXiv:2306.00630
+# Learnable Anchors for Medical Anomaly Detection
 
 ## Overview
 
-This extension allows anchors to be **learnable parameters** that are optimized during training, rather than fixed prototypes. The anchors are initialized from a pre-trained experiment (eigenface, k-means, or random) and then fine-tuned using the CAM loss.
+This document describes the implementation of **Learnable Anchors** based on the Class Anchor Margin (CAM) Loss from the paper:
 
-## CAM Loss Components
+> **"Class Anchor Margin Loss for Content-Based Image Retrieval"**  
+> Alexandru Ghita, Radu Tudor Ionescu  
+> arXiv:2306.00630
 
-The total loss consists of three terms:
+The key idea is to use learnable anchor embeddings that can move in the embedding space during training, allowing them to better capture the structure of normal samples.
+
+## Concept
+
+### Standard (Fixed) Anchors
+In the baseline approach, anchors are:
+1. Selected from training images (random, k-means, eigenface)
+2. Embedded using DINOv3 backbone
+3. **Fixed** during training - only the projection head is trained
+
+### Learnable Anchors
+With learnable anchors:
+1. Anchors start from the same initialization (random, k-means, eigenface)
+2. Anchor embeddings become **trainable parameters**
+3. The CAM Loss has three components:
+   - **Attractor**: Pulls samples toward their assigned anchor
+   - **Repeller**: Pushes different anchors apart (by margin m)
+   - **Min-Norm**: Prevents anchors from collapsing to zero
+
+### Pseudo-Label Assignment
+Each training sample is assigned to its nearest anchor ("pseudo-label"). Two strategies:
+
+1. **Fixed Labels**: Compute assignments once before training, keep them fixed
+2. **Dynamic Labels**: Recompute assignments every N epochs as anchors move
+
+## Loss Function
+
+The CAM Loss is defined as:
 
 $$L_{CAM} = \lambda_1 L_{attractor} + \lambda_2 L_{repeller} + \lambda_3 L_{norm}$$
 
@@ -228,6 +251,61 @@ Learnable anchor models are compatible with existing evaluation:
 python project/eval.py \
     --checkpoint experiments/bmad_learnable_eigenface/best_model.pth
 ```
+
+## New Experiments (Added)
+
+### Running All Experiments
+
+```bash
+# Run all 9 experiments
+python project/run_learnable_experiments.py --all
+
+# Run only learnable experiments
+python project/run_learnable_experiments.py --learnable-only
+
+# Run specific strategies
+python project/run_learnable_experiments.py --strategies random kmeans
+```
+
+### Configuration Files
+
+**Baseline (Fixed Anchors):**
+- `configs/fixed_random.yaml`
+- `configs/fixed_kmeans.yaml`  
+- `configs/fixed_eigenface.yaml`
+
+**Learnable + Fixed Labels:**
+- `configs/learnable_random_fixed.yaml`
+- `configs/learnable_kmeans_fixed.yaml`
+- `configs/learnable_eigenface_fixed.yaml`
+
+**Learnable + Dynamic Labels:**
+- `configs/learnable_random_dynamic.yaml`
+- `configs/learnable_kmeans_dynamic.yaml`
+- `configs/learnable_eigenface_dynamic.yaml`
+
+### Visualization from Checkpoints
+
+```bash
+python project/visualize_from_checkpoint.py --experiment experiments/bmad_learnable_random_fixed
+```
+
+### Compare Results
+
+```bash
+python project/compare_experiment_results.py --experiments-dir experiments
+```
+
+## Experiment Matrix
+
+| Strategy   | Fixed Anchors | Learnable + Fixed Labels | Learnable + Dynamic Labels |
+|------------|---------------|--------------------------|----------------------------|
+| Random     | ✓             | ✓                        | ✓                          |
+| K-Means    | ✓             | ✓                        | ✓                          |
+| Eigenface  | ✓             | ✓                        | ✓                          |
+
+**Total: 9 experiments**
+
 
 ## Citation
 

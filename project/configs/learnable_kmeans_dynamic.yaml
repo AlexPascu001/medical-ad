@@ -1,0 +1,60 @@
+# Configuration for Learnable Anchors with K-Means Initialization + Dynamic Labels
+# This uses the CAM Loss (Class Anchor Margin Loss) approach with:
+# - Anchors initialized from samples closest to k-means cluster centroids
+# - Pseudo-labels RECOMPUTED every N epochs as anchors move
+# - Learnable anchor embeddings
+
+seed: 42
+output_dir: './experiments/bmad_learnable_kmeans_dynamic'
+
+# Data configuration
+data:
+  data_root: '../data/BraTS2021_slice'
+  target_size: [240, 240]
+
+# Anchor configuration
+anchor:
+  strategy: 'kmeans'
+  n_components: 50
+  n_anchors: 8
+  max_images_for_pca: 5000
+  learnable: true
+  init_from: null
+
+# Model configuration
+model:
+  backbone: 'vit_small_patch16_dinov3.lvd1689m'
+  freeze_backbone: true
+  projection_dim: 128
+
+# Loss configuration (CAM Loss)
+loss:
+  type: 'cam'
+  margin: 1.0
+  alpha: 1.0
+  beta: 1.0
+  gamma: 0.1
+  min_norm: 0.5
+  distance_metric: 'euclidean'
+  use_dense: false
+  global_weight: 1.0
+  dense_weight: 0.0
+
+# Training configuration
+training:
+  epochs: 50
+  batch_size: 64
+  num_workers: 4
+  lr: 0.0001
+  weight_decay: 0.000001
+  use_amp: true
+  log_interval: 50
+  val_interval: 1
+  early_stopping_patience: 15
+  fixed_pseudo_labels: true
+  dynamic_reassignment: true   # Recompute labels as anchors move
+  reassignment_interval: 5
+
+eval:
+  compute_pixel: true
+  bootstrap_samples: 1000

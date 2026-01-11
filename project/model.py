@@ -1,18 +1,157 @@
 """
-DINOv3 Backbone Wrapper with Global and Dense Feature Extraction
-Supports frozen and finetunable modes
+DINOv3 Backbone Wrapper with Global, Dense, and Multi-Scale Feature Extraction
+Supports frozen and finetunable modes with optional pixel-level decoder
 """
 
 import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
+
+
+class FeaturePyramidDecoder(nn.Module):
+    """
+    Feature Pyramid Network (FPN) style decoder for pixel-level embeddings.
+    
+    Takes multi-scale features from DINOv3 intermediate layers and produces
+    dense pixel-level embeddings through lateral connections and progressive upsampling.
+    
+    Architecture:
+        - Lateral connections: 1x1 conv to reduce channel dims
+        - Top-down pathway: upsample + add for feature fusion
+        - Progressive upsampling: 15x15 -> 30 -> 60 -> 120 -> 240
+        - Output: pixel embeddings (B, output_dim, H, W)
+    """
+    
+    def __init__(
+        self,
+        in_dim: int = 384,
+        hidden_dim: int = 256,
+        output_dim: int = 128,
+        num_scales: int = 4,
+        target_size: Tuple[int, int] = (240, 240)
+    ):
+        """
+        Args:
+            in_dim: Input feature dimension from backbone (384 for ViT-S)
+            hidden_dim: Hidden dimension for FPN layers
+            output_dim: Output pixel embedding dimension
+            num_scales: Number of multi-scale features (default 4)
+            target_size: Target output spatial size (H, W)
+        """
+        super().__init__()
+        
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.num_scales = num_scales
+        self.target_size = target_size
+        
+        # Lateral connections (1x1 conv to reduce dims)
+        self.lateral_convs = nn.ModuleList([
+            nn.Conv2d(in_dim, hidden_dim, kernel_size=1)
+            for _ in range(num_scales)
+        ])
+        
+        # Smooth convs after feature fusion (3x3 conv)
+        self.smooth_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+                nn.BatchNorm2d(hidden_dim),
+                nn.ReLU(inplace=True)
+            )
+            for _ in range(num_scales)
+        ])
+        
+        # Progressive upsampling blocks: 15 -> 30 -> 60 -> 120 -> 240
+        # Each block does 2x upsampling with refinement
+        self.upsample_blocks = nn.ModuleList([
+            self._make_upsample_block(hidden_dim, hidden_dim)
+            for _ in range(4)  # 4 blocks for 16x total upsampling
+        ])
+        
+        # Final projection to output dimension
+        self.output_proj = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim // 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim // 2, output_dim, kernel_size=1)
+        )
+        
+        self._init_weights()
+    
+    def _make_upsample_block(self, in_channels: int, out_channels: int) -> nn.Sequential:
+        """Create an upsampling block with ConvTranspose + residual refinement"""
+        return nn.Sequential(
+            nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+    
+    def _init_weights(self):
+        """Initialize weights with kaiming normal"""
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+    
+    def forward(self, multi_scale_features: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Forward pass through FPN decoder.
+        
+        Args:
+            multi_scale_features: List of (B, H', W', D) features from different layers
+                                  Ordered from shallow to deep (e.g., layers [2, 5, 8, 11])
+        
+        Returns:
+            pixel_embeddings: (B, output_dim, H, W) pixel-level embeddings
+        """
+        assert len(multi_scale_features) == self.num_scales, \
+            f"Expected {self.num_scales} features, got {len(multi_scale_features)}"
+        
+        # Convert from (B, H', W', D) to (B, D, H', W') for conv operations
+        features = [f.permute(0, 3, 1, 2) for f in multi_scale_features]
+        
+        # Apply lateral connections
+        laterals = [conv(f) for conv, f in zip(self.lateral_convs, features)]
+        
+        # Top-down pathway with feature fusion (from deepest to shallowest)
+        # Start from deepest feature
+        fused = laterals[-1]
+        for i in range(self.num_scales - 2, -1, -1):
+            # Upsample deeper feature to match shallower
+            upsampled = F.interpolate(fused, size=laterals[i].shape[2:], mode='bilinear', align_corners=False)
+            # Add lateral connection
+            fused = laterals[i] + upsampled
+            # Smooth
+            fused = self.smooth_convs[i](fused)
+        
+        # Progressive upsampling to target size
+        x = fused
+        for upsample_block in self.upsample_blocks:
+            x = upsample_block(x)
+        
+        # Ensure exact target size
+        if x.shape[2:] != self.target_size:
+            x = F.interpolate(x, size=self.target_size, mode='bilinear', align_corners=False)
+        
+        # Project to output dimension
+        pixel_embeddings = self.output_proj(x)  # (B, output_dim, H, W)
+        
+        return pixel_embeddings
 
 
 class DINOv3Backbone(nn.Module):
     """
-    DINOv3 feature extractor with global and dense outputs
+    DINOv3 feature extractor with global, dense, and multi-scale outputs
     """
     
     def __init__(
@@ -20,7 +159,8 @@ class DINOv3Backbone(nn.Module):
         model_name: str = "vit_small_patch16_dinov3.lvd1689m",
         freeze_backbone: bool = True,
         projection_dim: Optional[int] = None,
-        pretrained: bool = True
+        pretrained: bool = True,
+        multi_scale_indices: Optional[List[int]] = None
     ):
         """
         Args:
@@ -28,12 +168,14 @@ class DINOv3Backbone(nn.Module):
             freeze_backbone: Whether to freeze backbone weights
             projection_dim: If set, add trainable projection head to this dimension
             pretrained: Load pretrained weights
+            multi_scale_indices: Block indices to extract features from (e.g., [2, 5, 8, 11])
         """
         super().__init__()
         
         self.model_name = model_name
         self.freeze_backbone = freeze_backbone
         self.projection_dim = projection_dim
+        self.multi_scale_indices = multi_scale_indices or []
 
         # Load DINOv2 model from timm
         print(f"Loading {model_name}...")
@@ -43,7 +185,13 @@ class DINOv3Backbone(nn.Module):
         self.embed_dim = self.backbone.embed_dim
         self.patch_size = self.backbone.patch_embed.patch_size[0]
         
-        print(f"Backbone embed_dim: {self.embed_dim}, patch_size: {self.patch_size}")
+        # Get number of blocks for validation
+        self.num_blocks = len(self.backbone.blocks)
+        
+        print(f"Backbone embed_dim: {self.embed_dim}, patch_size: {self.patch_size}, num_blocks: {self.num_blocks}")
+        
+        if self.multi_scale_indices:
+            print(f"Multi-scale feature extraction enabled at blocks: {self.multi_scale_indices}")
         
         # Freeze backbone if requested
         if freeze_backbone:
@@ -63,26 +211,72 @@ class DINOv3Backbone(nn.Module):
             print(f"Added trainable projection head: {self.embed_dim} -> {self.embed_dim // 2} -> {projection_dim}")
             print(f"  Trainable parameters: {sum(p.numel() for p in self.projection.parameters() if p.requires_grad):,}")
     
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _extract_multi_scale_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
-        Extract global and dense features
+        Extract features from multiple intermediate layers using timm's API.
         
         Args:
             x: Input images (B, C, H, W)
             
         Returns:
+            final_features: (B, N_tokens, D) final layer output
+            intermediate_features: List of (B, H', W', D) features from specified blocks
+        """
+        B, C, H, W = x.shape
+        h_patches = H // self.patch_size
+        w_patches = W // self.patch_size
+        num_register_tokens = 4
+        
+        # Use forward_intermediates to get features from specific blocks
+        # This returns the final output and a list of intermediate features
+        final_features, intermediates = self.backbone.forward_intermediates(
+            x,
+            indices=self.multi_scale_indices,
+            return_prefix_tokens=False,  # Don't include CLS/register tokens
+            norm=True,  # Apply layer norm
+            output_fmt='NLC'  # (B, N_patches, D) format
+        )
+        
+        # Reshape intermediates to spatial format
+        multi_scale_features = []
+        for feat in intermediates:
+            # feat shape: (B, N_patches, D)
+            feat_spatial = feat.view(B, h_patches, w_patches, -1)  # (B, H', W', D)
+            multi_scale_features.append(feat_spatial)
+        
+        return final_features, multi_scale_features
+    
+    def forward(self, x: torch.Tensor, return_multi_scale: bool = False) -> Dict[str, torch.Tensor]:
+        """
+        Extract global and dense features
+        
+        Args:
+            x: Input images (B, C, H, W)
+            return_multi_scale: Whether to return multi-scale features for decoder
+            
+        Returns:
             Dictionary with:
                 'global': (B, D) global embedding
                 'dense': (B, H', W', D) dense feature map
+                'multi_scale': List of (B, H', W', D) multi-scale features (if requested)
         """
         B, C, H, W = x.shape
         
-        # Get patch embeddings from backbone
-        if self.freeze_backbone:
-            with torch.no_grad():
-                features = self.backbone.forward_features(x)
+        # Multi-scale extraction path
+        if return_multi_scale and self.multi_scale_indices:
+            if self.freeze_backbone:
+                with torch.no_grad():
+                    features, multi_scale_features = self._extract_multi_scale_features(x)
+            else:
+                features, multi_scale_features = self._extract_multi_scale_features(x)
         else:
-            features = self.backbone.forward_features(x)
+            # Standard single-scale extraction
+            if self.freeze_backbone:
+                with torch.no_grad():
+                    features = self.backbone.forward_features(x)
+            else:
+                features = self.backbone.forward_features(x)
+            multi_scale_features = None
         
         # DINOv3 returns a tensor (B, N_tokens, D) where N_tokens = 1 (cls) + N_register + N_patches
         # DINOv3 models have 4 register tokens after the CLS token
@@ -127,10 +321,16 @@ class DINOv3Backbone(nn.Module):
         # Normalize global features
         global_feat = F.normalize(global_feat, dim=1)
         
-        return {
+        result = {
             'global': global_feat,
             'dense': dense_feat
         }
+        
+        # Add multi-scale features if requested
+        if return_multi_scale and multi_scale_features is not None:
+            result['multi_scale'] = multi_scale_features
+        
+        return result
     
     def train(self, mode: bool = True):
         """Override train to keep backbone frozen if requested"""
@@ -142,7 +342,12 @@ class DINOv3Backbone(nn.Module):
 
 class AnomalyDetector(nn.Module):
     """
-    Complete anomaly detection model with DINOv3 backbone and anchor-based scoring
+    Complete anomaly detection model with DINOv3 backbone, optional pixel decoder,
+    and anchor-based scoring for both global and pixel-level anomaly detection.
+    
+    CRITICAL: When anchors_already_projected=True, anchors are stored in PROJECTED
+    space and NOT re-projected during forward pass. This prevents collapse where
+    the projection head learns to map everything to one point.
     """
     
     def __init__(
@@ -151,75 +356,146 @@ class AnomalyDetector(nn.Module):
         anchor_global_embeddings: torch.Tensor,
         anchor_dense_embeddings: Optional[torch.Tensor] = None,
         distance_metric: str = 'cosine',
-        learnable_anchors: bool = False
+        learnable_anchors: bool = False,
+        use_pixel_decoder: bool = False,
+        decoder_hidden_dim: int = 256,
+        target_size: Tuple[int, int] = (240, 240),
+        anchors_already_projected: bool = False
     ):
         """
         Args:
             backbone: DINOv3Backbone model
-            anchor_global_embeddings: (K, D) anchor embeddings (initial values)
-            anchor_dense_embeddings: (K, H', W', D) dense anchor features (initial values)
+            anchor_global_embeddings: (K, D) anchor embeddings. If anchors_already_projected=True,
+                                      these are in PROJECTED space (e.g., 128D) and will be used
+                                      as-is. Otherwise, they're in RAW space (384D) and will be
+                                      projected through backbone.projection during forward.
+            anchor_dense_embeddings: (K, H', W', D) dense anchor features
             distance_metric: 'cosine' or 'euclidean' for computing distances
             learnable_anchors: If True, make anchors trainable parameters
+            use_pixel_decoder: If True, add FPN decoder for pixel-level predictions
+            decoder_hidden_dim: Hidden dimension for decoder layers
+            target_size: Target output size for pixel predictions (H, W)
+            anchors_already_projected: If True, anchors are already in projected space and
+                                       should NOT be re-projected. This is the correct approach
+                                       to prevent collapse with trainable projection heads.
         """
         super().__init__()
         
         self.backbone = backbone
         self.distance_metric = distance_metric
         self.learnable_anchors = learnable_anchors
+        self.use_pixel_decoder = use_pixel_decoder
+        self.target_size = target_size
+        self.anchors_already_projected = anchors_already_projected
         
-        # Store anchors as either buffers (fixed) or parameters (learnable)
-        if learnable_anchors:
-            # Learnable anchors: trainable parameters
-            self.anchor_global = nn.Parameter(anchor_global_embeddings.clone())
-            if anchor_dense_embeddings is not None:
-                self.anchor_dense = nn.Parameter(anchor_dense_embeddings.clone())
+        # Store anchors - behavior depends on anchors_already_projected flag
+        if anchors_already_projected:
+            # CORRECT APPROACH: Anchors are already in projected space (e.g., 128D)
+            # They are FIXED targets that the projection head learns to map samples TO
+            # This prevents collapse because anchors don't move with the projection
+            if learnable_anchors:
+                self.anchor_global = nn.Parameter(anchor_global_embeddings.clone())
+                if anchor_dense_embeddings is not None:
+                    self.anchor_dense = nn.Parameter(anchor_dense_embeddings.clone())
+                else:
+                    self.anchor_dense = None
+                print(f"  ✓ Anchors are LEARNABLE in PROJECTED space ({anchor_global_embeddings.shape[0]} × {anchor_global_embeddings.shape[1]}D)")
             else:
-                self.anchor_dense = None
-            print(f"  ✓ Anchors are LEARNABLE ({anchor_global_embeddings.shape[0]} × {anchor_global_embeddings.shape[1]}D)")
+                self.register_buffer('anchor_global', anchor_global_embeddings)
+                if anchor_dense_embeddings is not None:
+                    self.register_buffer('anchor_dense', anchor_dense_embeddings)
+                else:
+                    self.anchor_dense = None
+                print(f"  ✓ Anchors are FIXED in PROJECTED space ({anchor_global_embeddings.shape[0]} × {anchor_global_embeddings.shape[1]}D)")
+                print(f"    They will NOT be re-projected - acting as fixed targets")
+            
+            # No raw anchors needed
+            self.anchor_global_raw = None
+            self.anchor_dense_raw = None
         else:
-            # Fixed anchors: non-trainable buffers
-            self.register_buffer('anchor_global', anchor_global_embeddings)
-            if anchor_dense_embeddings is not None:
-                self.register_buffer('anchor_dense', anchor_dense_embeddings)
+            # LEGACY: Anchors in RAW space, will be re-projected each forward pass
+            # WARNING: This can cause collapse with trainable projection heads!
+            if learnable_anchors:
+                self.anchor_global_raw = nn.Parameter(anchor_global_embeddings.clone())
+                if anchor_dense_embeddings is not None:
+                    self.anchor_dense_raw = nn.Parameter(anchor_dense_embeddings.clone())
+                else:
+                    self.anchor_dense_raw = None
+                print(f"  ✓ Anchors are LEARNABLE in RAW space ({anchor_global_embeddings.shape[0]} × {anchor_global_embeddings.shape[1]}D)")
             else:
-                self.anchor_dense = None
-            print(f"  ✓ Anchors are FIXED (not learnable)")
+                self.register_buffer('anchor_global_raw', anchor_global_embeddings)
+                if anchor_dense_embeddings is not None:
+                    self.register_buffer('anchor_dense_raw', anchor_dense_embeddings)
+                else:
+                    self.anchor_dense_raw = None
+                print(f"  ⚠ Anchors are FIXED in RAW space ({anchor_global_embeddings.shape[0]} × {anchor_global_embeddings.shape[1]}D)")
+                print(f"    WARNING: Will be re-projected each forward - may cause issues!")
+            
+            # No projected anchors stored
+            self.anchor_global = None
+            self.anchor_dense = None
         
         self.n_anchors = len(anchor_global_embeddings)
+        
+        # Initialize pixel decoder if requested
+        self.pixel_decoder = None
+        if use_pixel_decoder:
+            if not backbone.multi_scale_indices:
+                raise ValueError("Pixel decoder requires multi_scale_indices to be set in backbone")
+            
+            output_dim = backbone.projection_dim if backbone.projection_dim else backbone.embed_dim
+            self.pixel_decoder = FeaturePyramidDecoder(
+                in_dim=backbone.embed_dim,
+                hidden_dim=decoder_hidden_dim,
+                output_dim=output_dim,
+                num_scales=len(backbone.multi_scale_indices),
+                target_size=target_size
+            )
+            print(f"  ✓ Pixel decoder enabled: {backbone.embed_dim}D -> {output_dim}D at {target_size}")
+            print(f"    Decoder parameters: {sum(p.numel() for p in self.pixel_decoder.parameters()):,}")
         
         print(f"Initialized detector with {self.n_anchors} anchors")
         print(f"Distance metric: {distance_metric}")
     
     def _get_projected_anchors(self):
-        """Get anchors (potentially projected through trainable head)"""
-        if self.backbone.projection is None:
-            # No projection head - use current anchors directly
+        """
+        Get anchors in projected space for distance computation.
+        
+        If anchors_already_projected=True: Returns stored anchors directly (they're
+        already in projected space and serve as FIXED targets).
+        
+        If anchors_already_projected=False: Projects raw anchors through current
+        projection head (LEGACY - can cause collapse with trainable projection!).
+        """
+        if self.anchors_already_projected:
+            # CORRECT: Anchors are already in projected space - use directly
+            # These are FIXED targets that don't change as projection trains
             anchor_global = self.anchor_global
-            if self.distance_metric == 'cosine':
-                anchor_global = F.normalize(anchor_global, dim=1)
-            return anchor_global, self.anchor_dense
-        
-        # Project anchors through the trainable head
-        anchor_global_projected = self.backbone.projection(self.anchor_global)
-        
-        # Normalize if using cosine distance
-        if self.distance_metric == 'cosine':
-            anchor_global_projected = F.normalize(anchor_global_projected, dim=1)
-        
-        # Project dense anchors if they exist
-        anchor_dense_projected = None
-        if self.anchor_dense is not None:
-            K, H_p, W_p, D = self.anchor_dense.shape
-            # Reshape and project
-            dense_flat = self.anchor_dense.view(K, H_p * W_p, D)  # (K, H'*W', D)
-            dense_projected = self.backbone.projection(dense_flat.view(-1, D))  # (K*H'*W', D_proj)
-            anchor_dense_projected = dense_projected.view(K, H_p, W_p, -1)  # (K, H', W', D_proj)
+            anchor_dense = self.anchor_dense
+        else:
+            # LEGACY: Project raw anchors through current projection head
+            # WARNING: This can cause collapse because anchors move with projection!
+            anchor_global = self.anchor_global_raw
             
-            if self.distance_metric == 'cosine':
+            # Project through current projection head (same as samples)
+            if self.backbone.projection is not None:
+                anchor_global = self.backbone.projection(anchor_global)
+            
+            # Normalize to unit norm (same as samples in backbone.forward)
+            anchor_global = F.normalize(anchor_global, dim=1)
+            
+            anchor_dense = None
+            if self.anchor_dense_raw is not None:
+                anchor_dense = self.anchor_dense_raw
+                if self.backbone.projection is not None:
+                    K, H_p, W_p, D = anchor_dense.shape
+                    dense_flat = anchor_dense.view(K * H_p * W_p, D)
+                    dense_flat = self.backbone.projection(dense_flat)
+                    anchor_dense = dense_flat.view(K, H_p, W_p, -1)
                 # Normalize dense features
-                anchor_dense_projected = F.normalize(anchor_dense_projected, dim=-1)
+                anchor_dense = F.normalize(anchor_dense, dim=-1)
         
-        return anchor_global_projected, anchor_dense_projected
+        return anchor_global, anchor_dense
     
     def forward(self, x: torch.Tensor, return_dense: bool = False) -> Dict[str, torch.Tensor]:
         """
@@ -233,7 +509,8 @@ class AnomalyDetector(nn.Module):
             Dictionary with embeddings and distances to anchors
         """
         # Extract features (already projected if projection head exists)
-        features = self.backbone(x)
+        # Request multi-scale features if we have a pixel decoder
+        features = self.backbone(x, return_multi_scale=self.use_pixel_decoder)
         
         global_feat = features['global']  # (B, D) or (B, D_proj)
         dense_feat = features['dense']    # (B, H', W', D) or (B, H', W', D_proj)
@@ -256,8 +533,45 @@ class AnomalyDetector(nn.Module):
             'dense_feat': dense_feat
         }
         
-        # Dense distances (per-patch to anchor patches)
-        if return_dense and anchor_dense is not None:
+        # Pixel decoder path: compute pixel-level embeddings and distances
+        if self.use_pixel_decoder and self.pixel_decoder is not None:
+            multi_scale_features = features.get('multi_scale')
+            if multi_scale_features is not None:
+                # Get pixel embeddings from decoder: (B, D, H, W)
+                pixel_embeddings = self.pixel_decoder(multi_scale_features)
+                
+                # Normalize pixel embeddings for distance computation
+                if self.distance_metric == 'cosine':
+                    pixel_embeddings = F.normalize(pixel_embeddings, dim=1)
+                
+                output['pixel_embeddings'] = pixel_embeddings
+                
+                # Compute pixel-level distances to each anchor
+                B, D, H, W = pixel_embeddings.shape
+                K = self.n_anchors
+                
+                # Reshape pixel embeddings for distance computation: (B, H*W, D)
+                pixel_flat = pixel_embeddings.permute(0, 2, 3, 1).reshape(B, H * W, D)
+                
+                # Compute distances to each anchor
+                if self.distance_metric == 'cosine':
+                    # anchor_global: (K, D), pixel_flat: (B, H*W, D)
+                    # Compute cosine similarity: (B, H*W, K)
+                    pixel_anchor_sim = torch.bmm(
+                        pixel_flat, 
+                        anchor_global.t().unsqueeze(0).expand(B, -1, -1)
+                    )
+                    pixel_distances = 1.0 - pixel_anchor_sim  # (B, H*W, K)
+                else:  # euclidean
+                    # Compute L2 distance: (B, H*W, K)
+                    pixel_distances = torch.cdist(pixel_flat, anchor_global.unsqueeze(0).expand(B, -1, -1), p=2)
+                
+                # Reshape to spatial: (B, K, H, W)
+                pixel_distances = pixel_distances.permute(0, 2, 1).reshape(B, K, H, W)
+                output['pixel_distances'] = pixel_distances
+        
+        # Legacy dense distances (per-patch to anchor patches) - kept for backwards compatibility
+        elif return_dense and anchor_dense is not None:
             B, H_p, W_p, D = dense_feat.shape
             K = self.n_anchors
             
@@ -331,8 +645,27 @@ class AnomalyDetector(nn.Module):
                 'all_distances': global_distances
             }
             
-            # Pixel-level anomaly map
-            if return_maps and 'dense_distances' in outputs:
+            # Pixel-level anomaly map from decoder (preferred)
+            if return_maps and 'pixel_distances' in outputs:
+                pixel_distances = outputs['pixel_distances']  # (B, K, H, W) - true pixel-level!
+                
+                # Min distance across anchors for each pixel
+                pixel_scores, _ = pixel_distances.min(dim=1)  # (B, H, W)
+                
+                # Resize if needed (decoder already outputs at target_size, but allow override)
+                if target_size is not None and pixel_scores.shape[1:] != target_size:
+                    pixel_scores = F.interpolate(
+                        pixel_scores.unsqueeze(1),
+                        size=target_size,
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze(1)
+                
+                result['pixel_scores'] = pixel_scores
+                result['pixel_embeddings'] = outputs.get('pixel_embeddings')
+            
+            # Fallback: patch-level anomaly map (legacy, upsampled)
+            elif return_maps and 'dense_distances' in outputs:
                 dense_distances = outputs['dense_distances']  # (B, K, H', W')
                 
                 # Min distance across anchors for each patch

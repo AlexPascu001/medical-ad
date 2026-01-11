@@ -1,0 +1,65 @@
+# Pixel Decoder Configuration
+# Uses Feature Pyramid Network decoder for true pixel-level anomaly detection
+
+# Output directory
+output_dir: './experiments/bmad_pixel_decoder'
+
+# Data configuration  
+data:
+  data_root: '../data/BraTS2021_slice'
+  target_size: [240, 240]
+
+# Model configuration
+model:
+  backbone: 'vit_small_patch16_dinov3.lvd1689m'
+  freeze_backbone: true
+  projection_dim: 128
+  # Pixel decoder settings
+  use_pixel_decoder: true
+  decoder_hidden_dim: 256
+  multi_scale_indices: [2, 5, 8, 11]  # DINOv3 blocks to extract features from
+
+# Anchor configuration
+anchor:
+  strategy: 'eigenface'  # 'random', 'kmeans', 'eigenface'
+  n_anchors: 8
+  n_components: 50  # For eigenface PCA
+  max_images_for_pca: 5000
+  learnable: true  # Make anchors learnable for better adaptation
+  init_from: null
+
+# Loss configuration
+loss:
+  type: 'cam'  # Class Anchor Margin loss
+  distance_metric: 'euclidean'
+  margin: 1.0
+  alpha: 1.0  # Attractor weight
+  beta: 1.0   # Repeller weight
+  gamma: 0.1  # Min-norm weight (for learnable anchors)
+  min_norm: 0.5
+  global_weight: 1.0
+  dense_weight: 0.5  # Weight for pixel-level loss
+  use_dense: true
+
+# Training configuration
+training:
+  epochs: 50
+  batch_size: 32  # Reduced batch size due to decoder memory
+  lr: 0.0001
+  weight_decay: 1e-6
+  num_workers: 4
+  use_amp: true
+  val_interval: 1
+  log_interval: 50
+  early_stopping_patience: 15
+  fixed_pseudo_labels: true
+  dynamic_reassignment: false
+  reassignment_interval: 5
+
+# Evaluation configuration
+eval:
+  compute_pixel: true
+  bootstrap_samples: 1000
+
+# Random seed
+seed: 42

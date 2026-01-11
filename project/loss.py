@@ -153,70 +153,116 @@ class AnchorMarginLoss(nn.Module):
 
 class DenseAnchorMarginLoss(nn.Module):
     """
-    Anchor-Margin Loss for dense features (per-patch)
+    Anchor-Margin Loss for pixel-level embeddings from decoder.
     
-    Note: The repeller term doesn't apply to dense features in the paper formulation
-    (it operates on anchor-anchor distances). Here we only use the attractor term.
+    Applies the attractor loss to each pixel embedding, pulling pixels
+    toward their nearest anchor (or assigned anchor via pseudo-labels).
+    This enables self-supervised dense anomaly detection without GT masks.
     """
     
     def __init__(
         self,
         margin: float = 1.0,
         alpha: float = 1.0,
-        beta: float = 0.0,  # No repeller for dense
+        distance_metric: str = 'euclidean',
         spatial_reduction: str = 'mean'
     ):
         """
         Args:
             margin: Not used in dense attractor (kept for compatibility)
             alpha: Weight for attractor loss
-            beta: Weight for repeller loss (not used, kept for compatibility)
+            distance_metric: 'euclidean' or 'cosine' distance
             spatial_reduction: How to aggregate spatial losses ('mean', 'max')
         """
         super().__init__()
         
         self.margin = margin
         self.alpha = alpha
-        self.beta = beta
+        self.distance_metric = distance_metric
         self.spatial_reduction = spatial_reduction
     
     def forward(
         self,
-        dense_embeddings: torch.Tensor,
+        pixel_embeddings: torch.Tensor,
         anchor_embeddings: torch.Tensor,
         return_components: bool = False
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute dense anchor-margin loss (disabled: kept for reference)
+        Compute dense anchor-margin loss for pixel embeddings.
         
         Args:
-            dense_embeddings: (B, D, H', W') per-patch embeddings
+            pixel_embeddings: (B, D, H, W) pixel-level embeddings from decoder
             anchor_embeddings: (K, D) anchor embeddings
             return_components: Whether to return loss components
             
         Returns:
             Dictionary with loss values
         """
-        # Dense loss path intentionally disabled until a decoder-based pixel head exists.
-        # Returning zeros keeps the interface stable without contributing to total loss.
-        device = dense_embeddings.device
-        zero = torch.tensor(0.0, device=device)
+        B, D, H, W = pixel_embeddings.shape
+        K = anchor_embeddings.shape[0]
+        device = pixel_embeddings.device
+        
+        # Reshape pixel embeddings: (B, D, H, W) -> (B, H*W, D)
+        pixel_flat = pixel_embeddings.permute(0, 2, 3, 1).reshape(B, H * W, D)
+        
+        # Normalize if using cosine distance
+        if self.distance_metric == 'cosine':
+            pixel_flat = F.normalize(pixel_flat, p=2, dim=-1)
+            anchor_norm = F.normalize(anchor_embeddings, p=2, dim=-1)
+        else:
+            anchor_norm = anchor_embeddings
+        
+        # Compute distances from each pixel to each anchor: (B, H*W, K)
+        if self.distance_metric == 'cosine':
+            # Cosine distance = 1 - cosine similarity
+            similarities = torch.bmm(
+                pixel_flat,
+                anchor_norm.t().unsqueeze(0).expand(B, -1, -1)
+            )  # (B, H*W, K)
+            distances = 1.0 - similarities
+        else:  # euclidean
+            # L2 distance
+            distances = torch.cdist(pixel_flat, anchor_norm.unsqueeze(0).expand(B, -1, -1), p=2)  # (B, H*W, K)
+        
+        # Find minimum distance to any anchor for each pixel
+        min_distances, assigned_anchors = distances.min(dim=-1)  # (B, H*W)
+        
+        # Attractor loss: pull each pixel toward its nearest anchor
+        # L_A = 0.5 * ||e_pixel - c_nearest||^2
+        loss_attract = 0.5 * (min_distances ** 2)  # (B, H*W)
+        
+        # Spatial reduction
+        if self.spatial_reduction == 'mean':
+            loss_attract = loss_attract.mean()
+        elif self.spatial_reduction == 'max':
+            loss_attract = loss_attract.max(dim=-1)[0].mean()
+        else:
+            loss_attract = loss_attract.mean()
+        
+        total_loss = self.alpha * loss_attract
+        
         result = {
-            'loss': zero,
-            'loss_attract': 0.0,
-            'loss_repel': 0.0
+            'loss': total_loss,
+            'loss_attract': loss_attract.item() if isinstance(loss_attract, torch.Tensor) else loss_attract
         }
+        
         if return_components:
             result.update({
-                'min_distance': 0.0,
-                'spatial_max_distance': 0.0
+                'min_distance': min_distances.mean().item(),
+                'spatial_max_distance': min_distances.max().item(),
+                'assigned_anchors_spatial': assigned_anchors.reshape(B, H, W)
             })
+        
         return result
 
 
 class CombinedAnchorLoss(nn.Module):
     """
-    Combined loss for global and dense features
+    Combined loss for global and pixel-level features.
+    
+    Combines:
+    - Global loss: AnchorMarginLoss on CLS token embeddings
+    - Dense loss: DenseAnchorMarginLoss on pixel embeddings from decoder
     """
     
     def __init__(
@@ -229,9 +275,9 @@ class CombinedAnchorLoss(nn.Module):
         """
         Args:
             global_loss: Loss for global features
-            dense_loss: Loss for dense features (optional)
+            dense_loss: Loss for pixel-level features (optional)
             global_weight: Weight for global loss
-            dense_weight: Weight for dense loss
+            dense_weight: Weight for dense/pixel loss
         """
         super().__init__()
         
@@ -247,7 +293,7 @@ class CombinedAnchorLoss(nn.Module):
         Args:
             outputs: Dictionary from model forward pass with:
                 - 'global_feat': (B, D) embeddings
-                - 'dense_feat': (B, H', W', D) embeddings [optional]
+                - 'pixel_embeddings': (B, D, H, W) pixel embeddings from decoder [optional]
             anchor_embeddings: (K, D) anchor embeddings
         
         Returns:
@@ -272,7 +318,25 @@ class CombinedAnchorLoss(nn.Module):
             'assigned_anchors': global_result['assigned_anchors']
         }
         
-        # Dense loss is currently disabled (per-patch, not pixel-wise). Keep stub for future decoder.
+        # Dense/pixel loss if decoder outputs are available
+        if self.dense_loss is not None and 'pixel_embeddings' in outputs:
+            pixel_embeddings = outputs['pixel_embeddings']  # (B, D, H, W)
+            dense_result = self.dense_loss(
+                pixel_embeddings,
+                anchor_embeddings,
+                return_components=True
+            )
+            
+            dense_loss = self.dense_weight * dense_result['loss']
+            total_loss = total_loss + dense_loss
+            
+            result.update({
+                'loss_dense': dense_result['loss'],
+                'loss_dense_attract': dense_result['loss_attract'],
+                'dense_min_distance': dense_result.get('min_distance', 0.0),
+                'dense_max_distance': dense_result.get('spatial_max_distance', 0.0)
+            })
+        
         result['loss'] = total_loss
         
         return result
