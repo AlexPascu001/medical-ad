@@ -34,7 +34,9 @@ class AnchorMarginLoss(nn.Module):
         alpha: float = 1.0,
         beta: float = 1.0,
         gamma: float = 0.0,
+        delta: float = 0.0,
         min_norm: float = 0.5,
+        diversity_temperature: float = 0.1,
         distance_metric: str = 'euclidean'
     ):
         """
@@ -43,7 +45,9 @@ class AnchorMarginLoss(nn.Module):
             alpha: Weight for attractor loss (default: 1.0)
             beta: Weight for repeller loss (default: 1.0)
             gamma: Weight for min-norm loss (default: 0.0, use 0.1 for learnable anchors)
+            delta: Weight for diversity loss (default: 0.0, use 0.1 to prevent collapse)
             min_norm: Minimum norm threshold for anchors (default: 0.5)
+            diversity_temperature: Temperature for soft assignments (default: 0.1)
             distance_metric: 'euclidean' or 'cosine' distance
         """
         super().__init__()
@@ -52,7 +56,9 @@ class AnchorMarginLoss(nn.Module):
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
+        self.delta = delta
         self.min_norm = min_norm
+        self.diversity_temperature = diversity_temperature
         self.distance_metric = distance_metric
         
     def forward(
@@ -126,15 +132,34 @@ class AnchorMarginLoss(nn.Module):
             norm_violations = torch.relu(self.min_norm - anchor_norms)  # (K,)
             loss_norm = norm_violations.mean()
         
+        # === DIVERSITY TERM (prevent anchor collapse) ===
+        # Encourage balanced anchor usage via entropy regularization
+        loss_diversity = torch.tensor(0.0, device=embeddings.device, dtype=embeddings.dtype)
+        if self.delta > 0:
+            # Compute soft assignments using temperature-scaled softmax
+            soft_assignments = torch.softmax(-distances / self.diversity_temperature, dim=1)  # (B, K)
+            
+            # Average assignment probabilities across batch
+            avg_assignments = soft_assignments.mean(dim=0)  # (K,)
+            
+            # Diversity loss: negative entropy (high entropy = balanced distribution)
+            # We want to MAXIMIZE entropy, so minimize negative entropy
+            entropy = -(avg_assignments * torch.log(avg_assignments + 1e-8)).sum()
+            
+            # Normalize by max entropy: log(K)
+            max_entropy = torch.log(torch.tensor(K, dtype=torch.float32, device=embeddings.device))
+            loss_diversity = 1.0 - (entropy / max_entropy)  # 0 = perfect balance, 1 = total collapse
+        
         # === COMBINED LOSS ===
-        # L_total = λ₁ * L_attract + λ₂ * L_repel + λ₃ * L_norm
-        total_loss = self.alpha * loss_attract + self.beta * loss_repel + self.gamma * loss_norm
+        # L_total = λ₁ * L_attract + λ₂ * L_repel + λ₃ * L_norm + λ₄ * L_diversity
+        total_loss = self.alpha * loss_attract + self.beta * loss_repel + self.gamma * loss_norm + self.delta * loss_diversity
         
         result = {
             'loss': total_loss,
             'loss_attract': loss_attract.item(),
             'loss_repel': loss_repel.item(),
-            'loss_norm': loss_norm.item() if self.gamma > 0 else 0.0
+            'loss_norm': loss_norm.item() if self.gamma > 0 else 0.0,
+            'loss_diversity': loss_diversity.item() if self.delta > 0 else 0.0
         }
         
         if return_components:

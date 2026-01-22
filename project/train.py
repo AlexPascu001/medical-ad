@@ -443,10 +443,21 @@ class Trainer:
 
     def _precompute_pseudo_labels(self):
         """Compute fixed nearest-anchor assignments once before training."""
-        print("\nPrecomputing fixed pseudo-labels (nearest anchors)...")
+        print("\n" + "="*80)
+        print("COMPUTING PSEUDO-LABELS IN 384D DINOV3 SPACE (SOLUTION A)")
+        print("="*80)
+        print("Using RAW 384D DINOv3 embeddings (frozen semantic features)")
+        print("Ensures pseudo-labels based on SEMANTIC similarity, not random projection")
+        print("="*80)
+        
         self.model.eval()
         mapping = {}
 
+        # Get SEMANTIC anchors (384D) for labeling
+        # EXPERT'S APPROACH: Use frozen DINOv3 embeddings for pseudo-label computation
+        anchor_embeddings_384d = self.model.get_semantic_anchors().to(self.device)  # (K, 384)
+        print(f"\nSemantic anchor embeddings (384D): {anchor_embeddings_384d.shape}")
+        
         # Use a non-dropping, non-shuffling loader to cover all samples
         preload = DataLoader(
             self.train_loader.dataset,
@@ -457,20 +468,62 @@ class Trainer:
             drop_last=False
         )
 
+        all_min_distances = []
         with torch.no_grad():
-            for batch in tqdm(preload, desc='Pseudo-labeling'):
+            for batch in tqdm(preload, desc='Computing pseudo-labels in 384D space'):
                 images = batch['image'].to(self.device)
                 paths = batch['path']
 
-                outputs = self.model(images, return_dense=False)
-                distances = outputs['global_distances']  # (B, K)
+                # Extract RAW 384D DINOv3 features (NO projection)
+                # Access backbone directly: backbone.backbone is the DINOv2Model
+                features_384d = self.model.backbone.backbone.forward_features(images)  # (B, N_patches, 384)
+                embeddings_384d = features_384d[:, 0]  # CLS token: (B, 384)
+                
+                # Compute distances in 384D space
+                distances = torch.cdist(embeddings_384d, anchor_embeddings_384d)  # (B, K)
                 assigned = distances.argmin(dim=1).cpu().tolist()
+                min_distances = distances.min(dim=1)[0]  # (B,)
 
                 for p, a in zip(paths, assigned):
                     mapping[str(p)] = int(a)
+                
+                all_min_distances.append(min_distances.cpu())
 
         self.fixed_assignments = mapping
-        print(f"✓ Pseudo-labels computed for {len(mapping)} samples")
+        all_min_distances = torch.cat(all_min_distances, dim=0)
+        
+        # Statistics
+        label_list = list(mapping.values())
+        unique_labels = set(label_list)
+        counts = {label: label_list.count(label) for label in unique_labels}
+        
+        print(f"\n{'='*80}")
+        print("PSEUDO-LABEL STATISTICS (384D SPACE)")
+        print(f"{'='*80}")
+        print(f"Total samples: {len(mapping)}")
+        print(f"Anchors used: {len(unique_labels)} / {anchor_embeddings_384d.shape[0]}")
+        print(f"\nDistribution:")
+        for label in sorted(unique_labels):
+            count = counts[label]
+            percentage = 100.0 * count / len(mapping)
+            print(f"  Anchor {label}: {count:5d} samples ({percentage:5.2f}%)")
+        
+        print(f"\nDistance statistics:")
+        print(f"  Mean: {all_min_distances.mean():.4f}")
+        print(f"  Std:  {all_min_distances.std():.4f}")
+        print(f"  Min:  {all_min_distances.min():.4f}")
+        print(f"  Max:  {all_min_distances.max():.4f}")
+        
+        # Warning if imbalanced
+        max_count = max(counts.values())
+        min_count = min(counts.values())
+        if max_count > 3 * min_count:
+            print(f"\n⚠️  Warning: Imbalanced distribution (max={max_count}, min={min_count})")
+            print("   Consider using diversity loss if this persists during training.")
+        else:
+            print(f"\n✓ Distribution looks balanced (max={max_count}, min={min_count})")
+        
+        print(f"{'='*80}\n")
     
     def train_epoch(self) -> Dict[str, float]:
         """Train for one epoch"""
@@ -481,6 +534,7 @@ class Trainer:
             'loss_attract': 0.0,
             'loss_repel': 0.0,
             'loss_norm': 0.0,
+            'loss_diversity': 0.0,
             'loss_dense': 0.0,
             'loss_dense_attract': 0.0
         }
@@ -536,19 +590,21 @@ class Trainer:
             epoch_metrics['loss'] += loss.item()
             
             # Handle different loss types (CAM vs Contrastive)
-            # CAM loss: loss_global_attract, loss_global_repel, loss_global_norm
+            # CAM loss: loss_global_attract, loss_global_repel, loss_global_norm, loss_global_diversity
             # Contrastive: loss_global_loss_center, loss_global_loss_infonce, loss_global_loss_repel
             if 'loss_global_attract' in loss_dict:
                 # CAM loss
                 epoch_metrics['loss_attract'] += loss_dict['loss_global_attract']
                 epoch_metrics['loss_repel'] += loss_dict['loss_global_repel']
                 epoch_metrics['loss_norm'] += loss_dict.get('loss_global_norm', 0.0)
+                epoch_metrics['loss_diversity'] += loss_dict.get('loss_global_diversity', 0.0)
             else:
                 # Contrastive loss - aggregate all components
                 epoch_metrics['loss_attract'] += loss_dict.get('loss_global_loss_center', 0.0)
                 epoch_metrics['loss_attract'] += loss_dict.get('loss_global_loss_infonce', 0.0)
                 epoch_metrics['loss_repel'] += loss_dict.get('loss_global_loss_repel', 0.0)
                 epoch_metrics['loss_norm'] += 0.0  # No norm loss in contrastive
+                epoch_metrics['loss_diversity'] += 0.0  # No diversity loss in contrastive
             
             # Dense/pixel loss tracking
             if 'loss_dense' in loss_dict:

@@ -135,6 +135,240 @@ def load_config(config_path: str) -> dict:
     return config
 
 
+def prepare_anchors_in_embedding_space(
+    train_images: list,
+    preprocessor: BMADPreprocessor,
+    config: dict,
+    save_dir: Path,
+    backbone: DINOv3Backbone,
+    device: torch.device
+) -> tuple:
+    """
+    Generate anchors in 384D DINOv3 embedding space (SOLUTION A).
+    
+    This is the CORRECT approach:
+    1. Extract 384D DINOv3 embeddings for all training images
+    2. Run k-means in 384D semantic space (not random pixel space)
+    3. Select anchor images corresponding to cluster centers
+    4. Store anchors in RAW 384D space (NOT projected)
+    5. Anchors will be re-projected each forward pass (moving with projection head)
+    
+    This ensures:
+    - Pseudo-labels based on semantic similarity (frozen DINOv3)
+    - Anchors and samples always in same embedding space
+    - No mismatch between anchor positions and projection learning
+    """
+    print("\n" + "="*80)
+    print("ANCHOR GENERATION IN 384D DINOV3 EMBEDDING SPACE (SOLUTION A)")
+    print("="*80)
+    print("Strategy: Semantic clustering in frozen DINOv3 space")
+    print("  1. Extract 384D embeddings for training images")
+    print("  2. Run k-means/eigenface in 384D space")
+    print("  3. Select images closest to cluster centers")
+    print("  4. Store in RAW 384D (re-project each forward)")
+    
+    # Load training images
+    max_images = config['anchor'].get('max_images_for_pca', 5000)
+    if max_images is None:
+        max_images = len(train_images)
+        print(f"\nLoading ALL {len(train_images)} training images...")
+    else:
+        print(f"\nLoading {min(len(train_images), max_images)} training images...")
+    
+    import cv2
+    images_list = []
+    for img_path in train_images[:max_images]:
+        if img_path.endswith('.npy'):
+            img = np.load(img_path)
+        else:
+            img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            continue
+        img = preprocessor.preprocess(img)
+        images_list.append(img)
+    
+    images_np = np.array(images_list)
+    print(f"Loaded {len(images_np)} images, shape: {images_np.shape}")
+    
+    # Extract 384D DINOv3 embeddings (frozen backbone, NO projection)
+    print(f"\nExtracting 384D DINOv3 embeddings...")
+    backbone.eval()
+    embeddings_384d_list = []
+    
+    batch_size = 64
+    with torch.no_grad():
+        for i in range(0, len(images_np), batch_size):
+            batch_imgs = images_np[i:i+batch_size]
+            
+            # Convert to tensor (B, H, W) -> (B, 1, H, W) -> (B, 3, H, W)
+            batch_tensor = torch.from_numpy(batch_imgs).float().unsqueeze(1).repeat(1, 3, 1, 1)
+            batch_tensor = batch_tensor.to(device)
+            
+            # Extract RAW DINOv3 features (384D, CLS token)
+            features = backbone.backbone.forward_features(batch_tensor)
+            cls_tokens = features[:, 0]  # (B, 384)
+            
+            embeddings_384d_list.append(cls_tokens.cpu())
+    
+    embeddings_384d = torch.cat(embeddings_384d_list, dim=0)  # (N, 384)
+    print(f"✓ Extracted embeddings: {embeddings_384d.shape}")
+    
+    # Run clustering in 384D space
+    strategy_name = config['anchor']['strategy']
+    n_anchors = config['anchor']['n_anchors']
+    print(f"\nClustering in 384D space: strategy={strategy_name}, n_anchors={n_anchors}")
+    
+    if strategy_name == 'kmeans':
+        from sklearn.cluster import KMeans
+        kmeans = KMeans(n_clusters=n_anchors, random_state=config['seed'], n_init=10)
+        labels = kmeans.fit_predict(embeddings_384d.numpy())
+        centroids_384d = kmeans.cluster_centers_  # (K, 384)
+        
+        # Select images closest to each centroid
+        anchor_indices = []
+        anchor_images_list = []
+        for k in range(n_anchors):
+            mask = labels == k
+            count = mask.sum()
+            if count == 0:
+                print(f"   Anchor {k}: empty cluster, selecting global nearest")
+                dists = np.linalg.norm(embeddings_384d.numpy() - centroids_384d[k], axis=1)
+                idx = int(np.argmin(dists))
+            else:
+                cluster_embeddings = embeddings_384d[mask]
+                dists = torch.norm(cluster_embeddings - torch.from_numpy(centroids_384d[k]), dim=1)
+                local_idx = int(torch.argmin(dists))
+                idx = np.where(mask)[0][local_idx]
+            
+            anchor_indices.append(idx)
+            anchor_images_list.append(images_np[idx])
+            print(f"   Anchor {k}: {count:4d} images in cluster, selected sample {idx}")
+        
+        anchor_images = np.array(anchor_images_list)
+        anchor_embeddings_384d = embeddings_384d[anchor_indices]
+        
+    elif strategy_name == 'eigenface':
+        from sklearn.decomposition import PCA
+        
+        n_components = config['anchor'].get('n_components', 50)
+        print(f"  Running PCA: 384D -> {n_components}D...")
+        pca = PCA(n_components=n_components, random_state=config['seed'])
+        embeddings_pca = pca.fit_transform(embeddings_384d.numpy())
+        print(f"  Explained variance: {pca.explained_variance_ratio_.sum():.2%}")
+        
+        # K-means in PCA space
+        from sklearn.cluster import KMeans
+        kmeans = KMeans(n_clusters=n_anchors, random_state=config['seed'], n_init=10)
+        labels = kmeans.fit_predict(embeddings_pca)
+        
+        # Select images closest to each centroid in PCA space
+        anchor_indices = []
+        anchor_images_list = []
+        for k in range(n_anchors):
+            mask = labels == k
+            count = mask.sum()
+            if count == 0:
+                dists = np.linalg.norm(embeddings_pca - kmeans.cluster_centers_[k], axis=1)
+                idx = int(np.argmin(dists))
+            else:
+                cluster_embeddings = embeddings_pca[mask]
+                dists = np.linalg.norm(cluster_embeddings - kmeans.cluster_centers_[k], axis=1)
+                local_idx = int(np.argmin(dists))
+                idx = np.where(mask)[0][local_idx]
+            
+            anchor_indices.append(idx)
+            anchor_images_list.append(images_np[idx])
+            print(f"   Anchor {k}: {count:4d} images in cluster, selected sample {idx}")
+        
+        anchor_images = np.array(anchor_images_list)
+        anchor_embeddings_384d = embeddings_384d[anchor_indices]
+    
+    else:
+        raise ValueError(f"Strategy {strategy_name} not supported in embedding space generation")
+    
+    # EXPERT'S APPROACH: Create FIXED geometric targets in 128D projection space
+    # SOLUTION A: Skip this step - will re-project anchors each forward instead
+    reproject_anchors = config['anchor'].get('reproject_anchors', False)
+    projection_dim = config['model'].get('projection_dim', None)
+    
+    if projection_dim and not reproject_anchors:
+        print(f"\n{'='*80}")
+        print("CREATING FIXED GEOMETRIC TARGETS (Expert's Approach)")
+        print(f"{'='*80}")
+        
+        init_method = config['anchor'].get('geometric_init', 'random_orthogonal')
+        
+        if init_method == 'random_orthogonal':
+            # Option A: Random orthogonal normalized vectors
+            print(f"  Method: Random orthogonal vectors in {projection_dim}D space")
+            geometric_targets = torch.randn(n_anchors, projection_dim)
+            geometric_targets = torch.nn.functional.normalize(geometric_targets, dim=1)
+            print(f"  ✓ Generated {n_anchors} random orthogonal targets")
+            
+        elif init_method == 'project_once':
+            # Option B: Project semantic anchors ONCE through random projection head and detach
+            print(f"  Method: Project semantic anchors once through random projection head")
+            backbone.eval()
+            with torch.no_grad():
+                geometric_targets = backbone.projection(anchor_embeddings_384d.to(device))
+                geometric_targets = torch.nn.functional.normalize(geometric_targets, dim=1)
+            geometric_targets = geometric_targets.cpu().detach()
+            print(f"  ✓ Projected {n_anchors} anchors through random projection head (detached)")
+            
+        else:
+            raise ValueError(f"Unknown geometric_init method: {init_method}")
+        
+        print(f"  Shape: {geometric_targets.shape}")
+        print(f"  These targets are FIXED and will NEVER change during training")
+        print(f"  Projection head learns to map samples with Label_K → Target_K")
+    elif reproject_anchors:
+        print(f"\n{'='*80}")
+        print("SOLUTION A: Anchors will be RE-PROJECTED each forward pass")
+        print(f"{'='*80}")
+        print(f"  Semantic anchors (384D): {anchor_embeddings_384d.shape}")
+        print(f"  These will be re-projected through projection head EVERY forward pass")
+        print(f"  Anchors 'move' with projection head during training")
+        print(f"  Requires diversity loss (delta={config['loss'].get('delta', 0.0)}) to prevent collapse")
+        geometric_targets = None  # No geometric targets for Solution A
+        
+    else:
+        # No projection head - geometric targets same as semantic anchors
+        geometric_targets = anchor_embeddings_384d
+        print(f"\n  No projection head - using semantic anchors as geometric targets")
+    
+    # Save anchor data with BOTH semantic and geometric anchors
+    torch.save({
+        'anchor_images': anchor_images,
+        'anchor_semantic': anchor_embeddings_384d,  # For pseudo-label computation (384D)
+        'anchor_geometric': geometric_targets,       # For training targets (128D, FIXED)
+        'anchor_global': anchor_embeddings_384d,     # Legacy compatibility
+        'anchor_dense': None,
+        'embedding_dim': 384,
+        'projection_dim': projection_dim,
+        'is_projected': False,
+        'use_decoupled': True,
+        'generation_method': 'decoupled_semantic_geometric'
+    }, save_dir / 'anchor_embeddings.pt')
+    
+    # Visualize anchors
+    visualize_anchors(anchor_images, save_dir / 'anchor_images.png')
+    
+    print(f"\n{'='*80}")
+    if geometric_targets is not None:
+        print(f"✓ Generated {n_anchors} DECOUPLED anchors (Expert's Approach)")
+        print(f"{'='*80}")
+        print(f"  Semantic anchors (384D): {anchor_embeddings_384d.shape} [for pseudo-labels]")
+        print(f"  Geometric targets (128D): {geometric_targets.shape} [FIXED training targets]")
+        print(f"  Decoupling prevents moving target problem and collapse!")
+    else:
+        print(f"✓ Generated {n_anchors} semantic anchors (Solution A: Re-projection)")
+        print(f"{'='*80}")
+        print(f"  Semantic anchors (384D): {anchor_embeddings_384d.shape} [for pseudo-labels AND re-projection]")
+        print(f"  These will be RE-PROJECTED through projection head each forward pass")
+    
+    return anchor_images, anchor_embeddings_384d, None, geometric_targets
+
+
 def prepare_anchors(
     train_images: list,
     preprocessor: BMADPreprocessor,
@@ -182,12 +416,20 @@ def prepare_anchors(
     print(f"Loaded {len(images)} images, shape: {images.shape}")
     
     # Generate anchors with selected strategy
-    anchor_gen = AnchorGenerator(
-        strategy=config['anchor'].get('strategy', 'eigenface'),
-        n_components=config['anchor']['n_components'],
-        n_anchors=config['anchor']['n_anchors'],
-        random_state=config['seed']
-    )
+    strategy_name = config['anchor'].get('strategy', 'eigenface')
+    
+    # Build kwargs for AnchorGenerator based on strategy
+    anchor_gen_kwargs = {
+        'strategy': strategy_name,
+        'n_anchors': config['anchor']['n_anchors'],
+        'random_state': config['seed']
+    }
+    
+    # Only add n_components if the strategy uses it
+    if strategy_name in ['eigenface', 'kcenter', 'density', 'gmm', 'stratified']:
+        anchor_gen_kwargs['n_components'] = config['anchor'].get('n_components', 50)
+    
+    anchor_gen = AnchorGenerator(**anchor_gen_kwargs)
     
     anchor_images = anchor_gen.fit(images)
     
@@ -299,7 +541,9 @@ def create_model(config: dict, anchor_global: torch.Tensor, anchor_dense: torch.
     # Get target size from config
     target_size = tuple(config['data']['target_size'])
     
-    # Create detector with anchors_already_projected=True
+    # Create detector
+    # SOLUTION A: anchors_already_projected=False so anchors are re-projected each forward
+    use_embedding_space = config['anchor'].get('use_embedding_space', True)
     detector = AnomalyDetector(
         backbone=backbone,
         anchor_global_embeddings=anchor_global,
@@ -309,7 +553,7 @@ def create_model(config: dict, anchor_global: torch.Tensor, anchor_dense: torch.
         use_pixel_decoder=use_pixel_decoder,
         decoder_hidden_dim=config['model'].get('decoder_hidden_dim', 256),
         target_size=target_size,
-        anchors_already_projected=projection_dim is not None  # NEW: Tell model anchors are pre-projected
+        anchors_already_projected=False if use_embedding_space else (projection_dim is not None)
     )
     
     return detector
@@ -335,13 +579,15 @@ def create_criterion(config: dict):
         print(f"  Pixel decoder enabled: dense loss will be computed")
     
     if loss_type == 'cam':
-        # Original CAM loss
+        # Original CAM loss with diversity regularization
         global_loss = AnchorMarginLoss(
             margin=config['loss']['margin'],
             alpha=config['loss']['alpha'],
             beta=config['loss']['beta'],
             gamma=config['loss'].get('gamma', 0.0),
+            delta=config['loss'].get('delta', 0.0),
             min_norm=config['loss'].get('min_norm', 0.5),
+            diversity_temperature=config['loss'].get('diversity_temperature', 0.1),
             distance_metric=config['loss']['distance_metric']
         )
 
@@ -557,13 +803,46 @@ def main(args):
     )
     backbone = backbone.to(device)
     
-    # ===== STAGE 3: Anchor Generation (using model's backbone) =====
+    # ===== STAGE 2.5: Pre-Train Projection Head + Generate Anchors (if enabled) =====
+    from pretrain import pretrain_projection_head
+    
+    # Create cache directory for pre-trained weights
+    cache_dir = Path('./cache/pretrained_projections')
+    
+    # Pre-train and get anchors (or skip pre-training and generate anchors normally)
+    pretrain_anchors = pretrain_projection_head(
+        backbone=backbone,
+        train_paths=train_paths,
+        preprocessor=BMADPreprocessor(target_size=tuple(config['data']['target_size'])),
+        config=config,
+        device=device,
+        cache_dir=cache_dir,
+        force_retrain=False
+    )
+    
+    # ===== STAGE 3: Anchor Setup =====
     preprocessor = BMADPreprocessor(target_size=tuple(config['data']['target_size']))
     
-    # Check if we should load anchors from another experiment (for learnable anchors)
-    init_from = config['anchor'].get('init_from', None)
-    
-    if init_from is not None:
+    # Use pre-trained anchors if available, otherwise generate new ones
+    if pretrain_anchors is not None:
+        # Use anchors from pre-training (perfect alignment!)
+        anchor_images, anchor_global = pretrain_anchors
+        anchor_dense = None
+        
+        print(f"\n✓ Using anchors from pre-training: {anchor_global.shape}")
+        print(f"✓ Perfect alignment between pre-training and main training!")
+        
+        # Save to current experiment directory
+        torch.save({
+            'anchor_images': anchor_images,
+            'anchor_global': anchor_global,
+            'anchor_dense': anchor_dense,
+            'source': 'pretraining'
+        }, save_dir / 'anchor_embeddings.pt')
+        
+    elif config['anchor'].get('init_from', None) is not None:
+        # Load anchors from another experiment (for learnable anchors)
+        init_from = config['anchor']['init_from']
         print(f"\nLoading anchors from: {init_from}")
         init_anchor_path = Path(init_from) / 'anchor_embeddings.pt'
         if not init_anchor_path.exists():
@@ -593,18 +872,46 @@ def main(args):
         print("\nLoading existing anchors...")
         anchor_data = torch.load(save_dir / 'anchor_embeddings.pt', weights_only=False)
         anchor_images = anchor_data['anchor_images']
-        anchor_global = anchor_data['anchor_global']
-        anchor_dense = anchor_data['anchor_dense']
-    else:
-        # CRITICAL: Pass the MODEL's backbone so anchors use the SAME projection weights
-        anchor_images, anchor_global, anchor_dense = prepare_anchors(
-            train_images=train_paths,
-            preprocessor=preprocessor,
-            config=config,
-            save_dir=save_dir,
-            backbone_for_projection=backbone,  # Use MODEL's backbone!
-            device=device
-        )
+        anchor_global = anchor_data.get('anchor_global', None)
+        anchor_dense = anchor_data.get('anchor_dense', None)
+        
+        # Check if decoupled anchors exist
+        if 'anchor_semantic' in anchor_data and 'anchor_geometric' in anchor_data:
+            anchor_semantic = anchor_data['anchor_semantic']
+            anchor_geometric = anchor_data['anchor_geometric']
+            print(f"  \u2713 Loaded decoupled anchors:")
+            print(f"    - Semantic (384D): {anchor_semantic.shape}")
+            print(f"    - Geometric (128D): {anchor_geometric.shape}")
+        else:
+            print(f"  \u2713 Loaded legacy anchors: {anchor_global.shape}")
+        
+    if pretrain_anchors is None and not (args.skip_anchors and (save_dir / 'anchor_embeddings.pt').exists()) and config['anchor'].get('init_from', None) is None:
+        # Generate new anchors only if we didn't get them from pre-training
+        # SOLUTION A: Use 384D embedding space generation (semantic clustering)
+        use_embedding_space = config['anchor'].get('use_embedding_space', True)
+        
+        if use_embedding_space:
+            print("\n[EXPERT'S APPROACH] Using decoupled semantic/geometric anchors")
+            anchor_images, anchor_semantic, anchor_dense, anchor_geometric = prepare_anchors_in_embedding_space(
+                train_images=train_paths,
+                preprocessor=preprocessor,
+                config=config,
+                save_dir=save_dir,
+                backbone=backbone,
+                device=device
+            )
+            # For compatibility, set anchor_global to semantic anchors
+            anchor_global = anchor_semantic
+        else:
+            print("\n[LEGACY] Using pixel space anchor generation")
+            anchor_images, anchor_global, anchor_dense = prepare_anchors(
+                train_images=train_paths,
+                preprocessor=preprocessor,
+                config=config,
+                save_dir=save_dir,
+                backbone_for_projection=backbone,  # Use MODEL's backbone!
+                device=device
+            )
     
     # ===== STAGE 4: Complete Model Creation =====
     # Now create the full detector with the backbone and anchors
@@ -615,27 +922,60 @@ def main(args):
     print("MODEL CREATION")
     print("="*80)
     
-    # Anchors are already projected through THIS backbone's projection head
-    # So they're in the SAME coordinate system as samples will be
-    if projection_dim:
-        print(f"Anchors are in PROJECTED space: {anchor_global.shape}")
-        print(f"  Projected through MODEL's backbone - same weights as training!")
-        print(f"  They are FIXED targets - will NOT be re-projected")
-    else:
-        print(f"Anchors are in RAW space: {anchor_global.shape}")
+    # EXPERT'S APPROACH: Use decoupled semantic/geometric anchors
+    # SOLUTION A: Use legacy re-projection path (anchors_already_projected=False)
+    use_embedding_space = config['anchor'].get('use_embedding_space', False)
+    reproject_anchors = config['anchor'].get('reproject_anchors', False)
+    use_decoupled = use_embedding_space and not reproject_anchors  # Only use decoupled if NOT Solution A
     
-    model = AnomalyDetector(
-        backbone=backbone,
-        anchor_global_embeddings=anchor_global,
-        anchor_dense_embeddings=anchor_dense,
-        distance_metric=config['loss']['distance_metric'],
-        learnable_anchors=learnable_anchors,
-        use_pixel_decoder=use_pixel_decoder,
-        decoder_hidden_dim=config['model'].get('decoder_hidden_dim', 256),
-        target_size=target_size,
-        anchors_already_projected=projection_dim is not None
-    )
-    model = model.to(device)
+    if use_decoupled and 'anchor_geometric' in locals():
+        print(f"EXPERT'S APPROACH: Decoupled anchors")
+        print(f"  Semantic anchors (384D): {anchor_semantic.shape} [for pseudo-labels]")
+        print(f"  Geometric targets (128D): {anchor_geometric.shape} [FIXED training targets]")
+        
+        model = AnomalyDetector(
+            backbone=backbone,
+            anchor_global_embeddings=anchor_global,  # Legacy compatibility
+            anchor_dense_embeddings=anchor_dense,
+            distance_metric=config['loss']['distance_metric'],
+            learnable_anchors=learnable_anchors,
+            use_pixel_decoder=use_pixel_decoder,
+            decoder_hidden_dim=config['model'].get('decoder_hidden_dim', 256),
+            target_size=target_size,
+            anchor_semantic_embeddings=anchor_semantic,
+            anchor_geometric_targets=anchor_geometric,
+            use_decoupled_anchors=True
+        )
+        model = model.to(device)
+        
+    else:
+        # LEGACY PATHS: Define anchors_already_projected for non-decoupled approaches
+        if use_embedding_space:
+            print(f"Anchors in RAW 384D space: {anchor_global.shape}")
+            print(f"  ✓ SOLUTION A: Anchors will be RE-PROJECTED each forward pass")
+            print(f"  ✓ Anchors move with projection head (semantic clustering preserved)")
+            anchors_already_projected = False
+        elif projection_dim:
+            print(f"Anchors are in PROJECTED space: {anchor_global.shape}")
+            print(f"  Projected through MODEL's backbone - same weights as training!")
+            print(f"  They are FIXED targets - will NOT be re-projected")
+            anchors_already_projected = True
+        else:
+            print(f"Anchors are in RAW space: {anchor_global.shape}")
+            anchors_already_projected = False
+        
+        model = AnomalyDetector(
+            backbone=backbone,
+            anchor_global_embeddings=anchor_global,
+            anchor_dense_embeddings=anchor_dense,
+            distance_metric=config['loss']['distance_metric'],
+            learnable_anchors=learnable_anchors,
+            use_pixel_decoder=use_pixel_decoder,
+            decoder_hidden_dim=config['model'].get('decoder_hidden_dim', 256),
+            target_size=target_size,
+            anchors_already_projected=anchors_already_projected
+        )
+        model = model.to(device)
     
     # ===== STAGE 5: Training Setup =====
     criterion = create_criterion(config)

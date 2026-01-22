@@ -16,6 +16,7 @@ anchor:
   max_images_for_pca: 5000  # Max images to use for anchor generation (memory constraint)
   learnable: false          # Make anchors learnable parameters (requires gamma > 0 for min-norm loss)
   init_from: null           # Path to experiment dir to initialize learnable anchors from (optional)
+  use_embedding_space: true # SOLUTION A: Generate anchors in 384D DINOv3 space (not pixel space)
 
 # Model configuration
 model:
@@ -29,12 +30,25 @@ loss:
   alpha: 1.0              # Weight for attractor term (pull samples to anchors)
   beta: 1.0               # Weight for repeller term (push anchors apart)
   gamma: 0.0              # Weight for min-norm term (prevent anchor collapse, use 0.1 for learnable anchors)
+  delta: 0.1              # Weight for diversity term (prevent anchor collapse via entropy)
   min_norm: 0.5           # Minimum norm threshold for anchors (only used if gamma > 0)
+  diversity_temperature: 0.1  # Temperature for soft anchor assignments (lower = sharper)
   distance_metric: 'euclidean'  # Distance metric: 'euclidean' or 'cosine'
   use_dense: false        # Use dense features for localization
   global_weight: 1.0      # Weight for global loss
   dense_weight: 0.5       # Weight for dense loss
   spatial_reduction: 'mean'  # 'mean' or 'max' for dense loss
+
+# Pre-training configuration (warm-start projection head before anchor projection)
+pretraining:
+  enabled: false          # Enable projection head pre-training to fix temporal misalignment
+  epochs: 5               # Number of pre-training epochs (5-10 recommended)
+  lr: 0.001               # Pre-training learning rate (higher than main training)
+  batch_size: 64          # Batch size for pre-training
+  temp_anchors: 8         # Number of temporary anchors (usually same as n_anchors)
+  loss_alpha: 1.0         # Attractor loss weight (same as main training)
+  loss_beta: 0.0          # Repeller loss weight (0.0 = no repeller)
+  distance_metric: 'euclidean'  # Distance metric (same as main training)
 
 # Training configuration
 training:

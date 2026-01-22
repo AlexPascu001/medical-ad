@@ -1,0 +1,53 @@
+anchor:
+  init_from: null
+  learnable: false
+  max_images_for_pca: 5000
+  n_anchors: 8
+  strategy: kmeans
+data:
+  data_root: ./data/BraTS2021_slice
+  target_size:
+  - 240
+  - 240
+eval:
+  bootstrap_samples: 1000
+  compute_pixel: true
+loss:
+  alpha: 1.0
+  beta: 0.0
+  dense_weight: 0.0
+  distance_metric: euclidean
+  gamma: 0.0
+  global_weight: 1.0
+  margin: 1.0
+  min_norm: 0.5
+  type: cam
+  use_dense: false
+model:
+  backbone: vit_small_patch16_dinov3.lvd1689m
+  freeze_backbone: true
+  projection_dim: 128
+output_dir: experiments\bmad_pretrain_random_test\pretrain_test_fixed_1
+pretraining:
+  batch_size: 64
+  distance_metric: euclidean
+  enabled: true
+  epochs: 5
+  loss_alpha: 1.0
+  loss_beta: 0.0
+  lr: 0.001
+  temp_anchors: 8
+seed: 42
+training:
+  batch_size: 64
+  dynamic_reassignment: false
+  early_stopping_patience: 15
+  epochs: 50
+  fixed_pseudo_labels: true
+  log_interval: 50
+  lr: 0.0001
+  num_workers: 4
+  reassignment_interval: 5
+  use_amp: true
+  val_interval: 1
+  weight_decay: 1.0e-06

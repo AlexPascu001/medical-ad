@@ -208,8 +208,22 @@ class DINOv3Backbone(nn.Module):
                 nn.ReLU(),
                 nn.Linear(self.embed_dim // 2, projection_dim)
             )
+            
+            # Initialize with orthogonal weights for better semantic preservation
+            self._init_projection_head()
+            
             print(f"Added trainable projection head: {self.embed_dim} -> {self.embed_dim // 2} -> {projection_dim}")
             print(f"  Trainable parameters: {sum(p.numel() for p in self.projection.parameters() if p.requires_grad):,}")
+            print(f"  Initialized with orthogonal weights (gain=1.0)")
+    
+    def _init_projection_head(self):
+        """Initialize projection head with orthogonal weights to preserve DINOv3 semantic structure."""
+        for m in self.projection.modules():
+            if isinstance(m, nn.Linear):
+                # Orthogonal init with gain=1.0 for better initial separation
+                nn.init.orthogonal_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
     
     def _extract_multi_scale_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
@@ -360,24 +374,27 @@ class AnomalyDetector(nn.Module):
         use_pixel_decoder: bool = False,
         decoder_hidden_dim: int = 256,
         target_size: Tuple[int, int] = (240, 240),
-        anchors_already_projected: bool = False
+        anchors_already_projected: bool = False,
+        anchor_semantic_embeddings: Optional[torch.Tensor] = None,
+        anchor_geometric_targets: Optional[torch.Tensor] = None,
+        use_decoupled_anchors: bool = False
     ):
         """
+        EXPERT'S APPROACH: Decouple semantic anchors from geometric targets.
+        
         Args:
             backbone: DINOv3Backbone model
-            anchor_global_embeddings: (K, D) anchor embeddings. If anchors_already_projected=True,
-                                      these are in PROJECTED space (e.g., 128D) and will be used
-                                      as-is. Otherwise, they're in RAW space (384D) and will be
-                                      projected through backbone.projection during forward.
+            anchor_global_embeddings: (K, D) anchor embeddings (LEGACY compatibility)
             anchor_dense_embeddings: (K, H', W', D) dense anchor features
             distance_metric: 'cosine' or 'euclidean' for computing distances
             learnable_anchors: If True, make anchors trainable parameters
             use_pixel_decoder: If True, add FPN decoder for pixel-level predictions
             decoder_hidden_dim: Hidden dimension for decoder layers
             target_size: Target output size for pixel predictions (H, W)
-            anchors_already_projected: If True, anchors are already in projected space and
-                                       should NOT be re-projected. This is the correct approach
-                                       to prevent collapse with trainable projection heads.
+            anchors_already_projected: LEGACY flag (ignored if use_decoupled_anchors=True)
+            anchor_semantic_embeddings: (K, 384) SEMANTIC anchors in DINOv3 space (for pseudo-label computation)
+            anchor_geometric_targets: (K, 128) GEOMETRIC targets in projection space (FIXED training targets)
+            use_decoupled_anchors: If True, use EXPERT'S APPROACH with decoupled semantic/geometric anchors
         """
         super().__init__()
         
@@ -386,13 +403,37 @@ class AnomalyDetector(nn.Module):
         self.learnable_anchors = learnable_anchors
         self.use_pixel_decoder = use_pixel_decoder
         self.target_size = target_size
-        self.anchors_already_projected = anchors_already_projected
+        self.use_decoupled_anchors = use_decoupled_anchors
         
-        # Store anchors - behavior depends on anchors_already_projected flag
-        if anchors_already_projected:
-            # CORRECT APPROACH: Anchors are already in projected space (e.g., 128D)
-            # They are FIXED targets that the projection head learns to map samples TO
-            # This prevents collapse because anchors don't move with the projection
+        # EXPERT'S APPROACH: Decouple semantic from geometric anchors
+        if use_decoupled_anchors:
+            # Store SEMANTIC anchors (384D) - for pseudo-label computation ONLY
+            # These are FROZEN DINOv3 embeddings used to assign labels
+            self.register_buffer('anchor_semantic', anchor_semantic_embeddings)
+            
+            # Store GEOMETRIC targets (128D) - FIXED training targets
+            # These NEVER move during training - projection head learns to map samples to these
+            if learnable_anchors:
+                self.anchor_geometric = nn.Parameter(anchor_geometric_targets.clone())
+                print(f"  ✓ DECOUPLED ANCHORS (Expert's Approach):")
+                print(f"    - Semantic (384D): {anchor_semantic_embeddings.shape} [FROZEN, for pseudo-labels]")
+                print(f"    - Geometric (128D): {anchor_geometric_targets.shape} [LEARNABLE, training targets]")
+            else:
+                self.register_buffer('anchor_geometric', anchor_geometric_targets)
+                print(f"  ✓ DECOUPLED ANCHORS (Expert's Approach):")
+                print(f"    - Semantic (384D): {anchor_semantic_embeddings.shape} [FROZEN, for pseudo-labels]")
+                print(f"    - Geometric (128D): {anchor_geometric_targets.shape} [FIXED, never move]")
+            
+            # No legacy fields needed
+            self.anchor_global = None
+            self.anchor_global_raw = None
+            self.anchor_dense = None
+            self.anchor_dense_raw = None
+            self.anchors_already_projected = True  # Geometric targets are in projected space
+            
+        elif anchors_already_projected:
+            # LEGACY APPROACH: Anchors already in projected space
+            self.anchors_already_projected = anchors_already_projected
             if learnable_anchors:
                 self.anchor_global = nn.Parameter(anchor_global_embeddings.clone())
                 if anchor_dense_embeddings is not None:
@@ -409,11 +450,14 @@ class AnomalyDetector(nn.Module):
                 print(f"  ✓ Anchors are FIXED in PROJECTED space ({anchor_global_embeddings.shape[0]} × {anchor_global_embeddings.shape[1]}D)")
                 print(f"    They will NOT be re-projected - acting as fixed targets")
             
-            # No raw anchors needed
             self.anchor_global_raw = None
             self.anchor_dense_raw = None
+            self.anchor_semantic = None
+            self.anchor_geometric = None
+            
         else:
             # LEGACY: Anchors in RAW space, will be re-projected each forward pass
+            self.anchors_already_projected = anchors_already_projected
             # WARNING: This can cause collapse with trainable projection heads!
             if learnable_anchors:
                 self.anchor_global_raw = nn.Parameter(anchor_global_embeddings.clone())
@@ -457,19 +501,37 @@ class AnomalyDetector(nn.Module):
         print(f"Initialized detector with {self.n_anchors} anchors")
         print(f"Distance metric: {distance_metric}")
     
+    def get_semantic_anchors(self):
+        """
+        Get semantic anchors (384D DINOv3 space) for pseudo-label computation.
+        
+        EXPERT'S APPROACH: Returns frozen DINOv3 embeddings used for labeling.
+        LEGACY: Falls back to anchor_global_raw if available.
+        """
+        if self.use_decoupled_anchors:
+            return self.anchor_semantic
+        elif self.anchor_global_raw is not None:
+            return self.anchor_global_raw
+        else:
+            raise ValueError("No semantic anchors available. Use decoupled anchors approach.")
+    
     def _get_projected_anchors(self):
         """
         Get anchors in projected space for distance computation.
         
-        If anchors_already_projected=True: Returns stored anchors directly (they're
-        already in projected space and serve as FIXED targets).
+        EXPERT'S APPROACH: If use_decoupled_anchors=True, returns FIXED geometric
+        targets (128D) that NEVER change during training.
         
-        If anchors_already_projected=False: Projects raw anchors through current
-        projection head (LEGACY - can cause collapse with trainable projection!).
+        LEGACY: If anchors_already_projected=True, returns stored anchors directly.
+        If False, re-projects raw anchors (can cause collapse!).
         """
-        if self.anchors_already_projected:
-            # CORRECT: Anchors are already in projected space - use directly
-            # These are FIXED targets that don't change as projection trains
+        if self.use_decoupled_anchors:
+            # EXPERT'S APPROACH: Return FIXED geometric targets (128D)
+            # These NEVER move - projection head learns to map samples to these fixed points
+            anchor_global = self.anchor_geometric
+            anchor_dense = None  # Dense not yet implemented for decoupled approach
+        elif self.anchors_already_projected:
+            # LEGACY: Anchors are already in projected space - use directly
             anchor_global = self.anchor_global
             anchor_dense = self.anchor_dense
         else:

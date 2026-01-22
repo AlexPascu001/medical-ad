@@ -305,12 +305,13 @@ def evaluate_comprehensive(
                     return_maps=True, 
                     target_size=target_size
                 )
-                pixel_scores = pixel_outputs['pixel_scores'].cpu().numpy()
-                all_pixel_scores.append(pixel_scores)
-                
-                if 'mask' in batch:
-                    masks = batch['mask'].cpu().numpy()
-                    all_pixel_masks.append(masks)
+                if 'pixel_scores' in pixel_outputs:
+                    pixel_scores = pixel_outputs['pixel_scores'].cpu().numpy()
+                    all_pixel_scores.append(pixel_scores)
+                    
+                    if 'mask' in batch:
+                        masks = batch['mask'].cpu().numpy()
+                        all_pixel_masks.append(masks)
     
     image_scores = np.concatenate(all_image_scores)
     labels = np.concatenate(all_labels)
@@ -525,10 +526,10 @@ def _plot_samples(samples: list, save_path: str, title: str):
     rows = (n + cols - 1) // cols
     
     # Determine if we have pixel maps
-    has_maps = samples[0]['pixel_map'] is not None
-    has_masks = samples[0]['mask'] is not None
+    has_maps = samples[0]['pixel_map'] is not None if len(samples) > 0 else False
+    has_masks = samples[0]['mask'] is not None if len(samples) > 0 else False
     
-    n_cols = 3 if has_maps and has_masks else (2 if has_maps else 1)
+    n_cols = 1 + (1 if has_maps else 0) + (1 if has_masks else 0)
     
     fig, axes = plt.subplots(rows, cols * n_cols, figsize=(cols * n_cols * 3, rows * 3))
     
@@ -549,17 +550,20 @@ def _plot_samples(samples: list, save_path: str, title: str):
         axes[row, col_offset].set_title(f"Score: {sample['score']:.3f}")
         axes[row, col_offset].axis('off')
         
+        col_idx = col_offset + 1
+        
         # Anomaly map
         if has_maps and sample['pixel_map'] is not None:
-            axes[row, col_offset + 1].imshow(sample['pixel_map'], cmap='jet')
-            axes[row, col_offset + 1].set_title('Anomaly Map')
-            axes[row, col_offset + 1].axis('off')
+            axes[row, col_idx].imshow(sample['pixel_map'], cmap='jet')
+            axes[row, col_idx].set_title('Anomaly Map')
+            axes[row, col_idx].axis('off')
+            col_idx += 1
         
         # Ground truth mask
         if has_masks and sample['mask'] is not None:
-            axes[row, col_offset + 2].imshow(sample['mask'], cmap='gray')
-            axes[row, col_offset + 2].set_title('Ground Truth')
-            axes[row, col_offset + 2].axis('off')
+            axes[row, col_idx].imshow(sample['mask'], cmap='gray')
+            axes[row, col_idx].set_title('Ground Truth')
+            axes[row, col_idx].axis('off')
     
     # Hide unused subplots
     for row in range(rows):
