@@ -23,6 +23,7 @@ model:
   backbone: 'vit_small_patch16_dinov3.lvd1689m'  # Options: vit_small_patch16_dinov3.lvd1689m
   freeze_backbone: true       # Freeze DINOv3 weights (only train projection head)
   projection_dim: 128         # Trainable projection head dimension (set to null to disable)
+  projection_dim_recon: null    # Stage-2 reconstruction projection dim (null = same as projection_dim)
 
 # Loss configuration
 loss:
@@ -62,6 +63,55 @@ training:
   val_interval: 1         # Validate every N epochs
   early_stopping_patience: 10
   fixed_pseudo_labels: true
+
+# Stage-2 reconstruction training (optional)
+stage2:
+  enabled: false
+  epochs: 20
+  lr: 0.0001
+  weight_decay: 0.000001
+  freeze_encoder: true
+  freeze_anchors: true
+  freeze_anchor_target: true
+  recon_loss: 'mse'            # 'mse' or 'l1'
+  recon_weight: 1.0
+  consistency_loss: 'cosine'   # 'cosine' or 'l2'
+  consistency_weight: 0.1
+
+  # Dual-bottleneck: frozen stage-1 projection + trainable stage-2 projection
+  frozen_bottleneck: false      # Enable frozen copy of stage-1 projection head
+  alignment_weight: 0.1         # Weight for cosine alignment loss between frozen and trainable features
+
+  # Encoder freezing mode for stage-2
+  freeze_encoder_mode: 'full'   # 'full' (freeze all), 'partial' (unfreeze last N blocks), 'none' (train all)
+  unfreeze_last_n_blocks: 2     # Number of last transformer blocks to unfreeze (when freeze_encoder_mode='partial')
+  unfreeze_lr_multiplier: 0.1   # LR multiplier for unfrozen encoder params (relative to stage2.lr)
+
+  # Pixel-to-image anomaly score aggregation
+  pixel_aggregation:
+    method: 'top_k_percentile'  # 'mean', 'max', 'top_k_percentile', 'threshold_ratio'
+    percentile: 95              # Percentile for top_k_percentile method (e.g., 95 = top 5%)
+    threshold_n_std: 2.0        # N std deviations above mean for threshold_ratio (adaptive threshold)
+
+  # Three-signal score fusion (anchor + divergence + pixel-aggregated)
+  score_fusion:
+    enabled: false              # Enable three-signal fusion for final image_score
+    normalization: 'minmax'     # 'minmax', 'zscore', 'robust', 'rank'
+    anchor_weight: 0.4          # Weight for anchor-based score
+    divergence_weight: 0.3      # Weight for bottleneck divergence score
+    pixel_weight: 0.3           # Weight for pixel-aggregated reconstruction score
+
+  pixel_map:
+    enabled: true
+    type: 'reconstruction_l2'  # 'reconstruction_l2' or 'reconstruction_l1'
+  pixel_metrics:
+    enabled: true
+  score_combination:
+    enabled: false
+    alpha: 0.5
+    normalization: 'minmax'    # 'minmax' or 'zscore'
+  early_stopping_patience: 10
+  early_stopping_metric: 'pixel_aggregated_image_auroc'  # Best metric for early stopping (fallbacks: reconstruction_image_auroc, val_loss)
 
 # Evaluation configuration
 eval:

@@ -1,0 +1,78 @@
+# SOLUTION A: Re-project Anchors Each Forward Pass - K=512
+# Generate anchors in 384D DINOv2 space, then re-project through projection head each forward.
+# This allows anchors to "move" with the projection head during training.
+# Early stopping enabled (patience=10)
+
+seed: 42
+output_dir: './experiments/reproject_k512_early'
+
+# Data configuration
+data:
+  data_root: './data/BraTS2021_slice'
+  target_size: [240, 240]
+
+# Anchor configuration - SOLUTION A
+anchor:
+  strategy: 'kmeans'        # K-means in 384D DINOv2 space (semantic clustering)
+  n_components: 50          # Only for eigenface strategy
+  n_anchors: 512             # Number of semantic clusters
+  max_images_for_pca: null  # Use ALL training images (7500)
+  learnable: false          # Fixed semantic anchors (not trainable)
+  init_from: null
+  use_embedding_space: true # ✓ Generate anchors in 384D DINOv2 space
+  reproject_anchors: true   # ✓ CRITICAL: Re-project anchors each forward pass (Solution A)
+  # geometric_init: DO NOT SET - Solution A doesn't use geometric targets
+
+# Model configuration
+model:
+  backbone: 'vit_small_patch16_dinov3.lvd1689m'
+  freeze_backbone: true     # ✓ Keep DINOv2 frozen (semantic features stable)
+  projection_dim: 128       # ✓ Trainable projection head: 384D → 128D
+
+# Loss configuration - SOLUTION A with diversity regularization
+loss:
+  margin: 1.0
+  alpha: 1.0                # Attractor weight (pull samples to nearest anchor)
+  beta: 0.5                 # Repeller weight (push anchors apart)
+  gamma: 0.0                # Min-norm (not needed for fixed anchors)
+  delta: 0.1                # ✓ DIVERSITY LOSS: Prevent anchor collapse via entropy regularization
+  min_norm: 0.5
+  diversity_temperature: 0.1  # ✓ Temperature for soft assignments (lower = sharper)
+  distance_metric: 'euclidean'
+  use_dense: false
+  global_weight: 1.0
+  dense_weight: 0.5
+  spatial_reduction: 'mean'
+
+# Pre-training configuration (DISABLED)
+pretraining:
+  enabled: false
+  epochs: 0
+  lr: 0.001
+  batch_size: 64
+  temp_anchors: 8
+  loss_alpha: 1.0
+  loss_beta: 0.0
+  distance_metric: 'euclidean'
+
+# Training configuration
+training:
+  epochs: 100               # Extended training to test convergence
+  batch_size: 64
+  num_workers: 4
+  lr: 0.0001                # Conservative LR for projection head
+  weight_decay: 0.0001
+  use_amp: true             # Mixed precision training
+  log_interval: 50          # Log every N batches
+  val_interval: 1           # Validate every N epochs
+  early_stopping_patience: 10  # Early stopping enabled
+  fixed_pseudo_labels: true # ✓ Compute pseudo-labels in 384D space ONCE at start
+  save_checkpoints: false   # Only save best and final models (saves ~144GB total)
+
+# Evaluation configuration
+evaluation:
+  eval_every: 1
+  save_best: true
+  metric: 'pixel_auroc'
+  save_predictions: true
+  visualize_embeddings: true  # ✓ Visualize to verify no collapse

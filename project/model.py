@@ -7,7 +7,10 @@ import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import copy
 from typing import Dict, Optional, List, Tuple
+
+from pixel_aggregation import aggregate_pixel_scores_torch
 
 
 class FeaturePyramidDecoder(nn.Module):
@@ -149,6 +152,43 @@ class FeaturePyramidDecoder(nn.Module):
         return pixel_embeddings
 
 
+class ReconstructionDecoder(nn.Module):
+    """Lightweight latent-to-image decoder used in stage-2 reconstruction training."""
+
+    def __init__(self, latent_dim: int, out_channels: int = 3, target_size: Tuple[int, int] = (240, 240)):
+        super().__init__()
+        self.target_size = target_size
+
+        self.fc = nn.Sequential(
+            nn.Linear(latent_dim, 256 * 15 * 15),
+            nn.ReLU(inplace=True)
+        )
+
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, out_channels, kernel_size=3, padding=1)
+        )
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        x = self.fc(latent)
+        x = x.view(latent.shape[0], 256, 15, 15)
+        x = self.decoder(x)
+        if x.shape[2:] != self.target_size:
+            x = F.interpolate(x, size=self.target_size, mode='bilinear', align_corners=False)
+        return x
+
+
 class DINOv3Backbone(nn.Module):
     """
     DINOv3 feature extractor with global, dense, and multi-scale outputs
@@ -160,7 +200,8 @@ class DINOv3Backbone(nn.Module):
         freeze_backbone: bool = True,
         projection_dim: Optional[int] = None,
         pretrained: bool = True,
-        multi_scale_indices: Optional[List[int]] = None
+        multi_scale_indices: Optional[List[int]] = None,
+        projection_hidden_dims: Optional[List[int]] = None
     ):
         """
         Args:
@@ -169,12 +210,18 @@ class DINOv3Backbone(nn.Module):
             projection_dim: If set, add trainable projection head to this dimension
             pretrained: Load pretrained weights
             multi_scale_indices: Block indices to extract features from (e.g., [2, 5, 8, 11])
+            projection_hidden_dims: If set, build a multi-layer projection head with these output
+                                    dims (e.g. [192, 128] gives 384→192→128). Overrides projection_dim.
         """
         super().__init__()
         
+        # projection_hidden_dims overrides projection_dim
+        if projection_hidden_dims is not None:
+            projection_dim = projection_hidden_dims[-1]
         self.model_name = model_name
         self.freeze_backbone = freeze_backbone
         self.projection_dim = projection_dim
+        self.projection_hidden_dims = projection_hidden_dims
         self.multi_scale_indices = multi_scale_indices or []
 
         # Load DINOv2 model from timm
@@ -188,7 +235,15 @@ class DINOv3Backbone(nn.Module):
         # Get number of blocks for validation
         self.num_blocks = len(self.backbone.blocks)
         
-        print(f"Backbone embed_dim: {self.embed_dim}, patch_size: {self.patch_size}, num_blocks: {self.num_blocks}")
+        # Detect register tokens: timm Eva models use reg_token (1, N_reg, D)
+        if hasattr(self.backbone, 'reg_token') and self.backbone.reg_token is not None:
+            self.num_register_tokens = self.backbone.reg_token.shape[1]
+        elif hasattr(self.backbone, 'num_prefix_tokens'):
+            self.num_register_tokens = self.backbone.num_prefix_tokens - 1  # subtract CLS
+        else:
+            self.num_register_tokens = 0
+        
+        print(f"Backbone embed_dim: {self.embed_dim}, patch_size: {self.patch_size}, num_blocks: {self.num_blocks}, register_tokens: {self.num_register_tokens}")
         
         if self.multi_scale_indices:
             print(f"Multi-scale feature extraction enabled at blocks: {self.multi_scale_indices}")
@@ -202,16 +257,28 @@ class DINOv3Backbone(nn.Module):
         
         # Trainable projection head for learning better embeddings
         self.projection = None
-        if projection_dim is not None:
+        if projection_hidden_dims is not None:
+            # Configurable multi-layer projection: embed_dim -> [hidden_dims...]
+            dims = [self.embed_dim] + list(projection_hidden_dims)
+            layers = []
+            for i in range(len(dims) - 1):
+                layers.append(nn.Linear(dims[i], dims[i + 1]))
+                if i < len(dims) - 2:  # ReLU between all layers except the last
+                    layers.append(nn.ReLU())
+            self.projection = nn.Sequential(*layers)
+            self._init_projection_head()
+            dims_str = ' -> '.join(str(d) for d in dims)
+            print(f"Added trainable projection head: {dims_str}")
+            print(f"  Trainable parameters: {sum(p.numel() for p in self.projection.parameters() if p.requires_grad):,}")
+            print(f"  Initialized with orthogonal weights (gain=1.0)")
+        elif projection_dim is not None:
             self.projection = nn.Sequential(
                 nn.Linear(self.embed_dim, self.embed_dim // 2),
                 nn.ReLU(),
                 nn.Linear(self.embed_dim // 2, projection_dim)
             )
-            
             # Initialize with orthogonal weights for better semantic preservation
             self._init_projection_head()
-            
             print(f"Added trainable projection head: {self.embed_dim} -> {self.embed_dim // 2} -> {projection_dim}")
             print(f"  Trainable parameters: {sum(p.numel() for p in self.projection.parameters() if p.requires_grad):,}")
             print(f"  Initialized with orthogonal weights (gain=1.0)")
@@ -239,7 +306,7 @@ class DINOv3Backbone(nn.Module):
         B, C, H, W = x.shape
         h_patches = H // self.patch_size
         w_patches = W // self.patch_size
-        num_register_tokens = 4
+        num_register_tokens = self.num_register_tokens
         
         # Use forward_intermediates to get features from specific blocks
         # This returns the final output and a list of intermediate features
@@ -293,16 +360,15 @@ class DINOv3Backbone(nn.Module):
             multi_scale_features = None
         
         # DINOv3 returns a tensor (B, N_tokens, D) where N_tokens = 1 (cls) + N_register + N_patches
-        # DINOv3 models have 4 register tokens after the CLS token
-        # features shape: (B, N_tokens, D)
-        # Token order: [CLS, REG1, REG2, REG3, REG4, PATCH1, PATCH2, ...]
+        # Token order: [CLS, REG1, ..., REG_N, PATCH1, PATCH2, ...]
         cls_token = features[:, 0]  # (B, D)
         
-        # DINOv3 has 4 register tokens, skip them
-        num_register_tokens = 4
+        # Skip register tokens
+        num_register_tokens = self.num_register_tokens
         patch_tokens = features[:, 1 + num_register_tokens:]  # (B, N_patches, D)
         
         # Global embedding (from CLS token)
+        global_raw = cls_token
         global_feat = cls_token
         
         # Reshape patch tokens to spatial grid
@@ -336,8 +402,10 @@ class DINOv3Backbone(nn.Module):
         global_feat = F.normalize(global_feat, dim=1)
         
         result = {
+            'global_raw': global_raw,
             'global': global_feat,
-            'dense': dense_feat
+            'dense': dense_feat,
+            'patch_raw': patch_tokens,  # raw pre-projection 384D patch tokens (B, N_patches, D_backbone)
         }
         
         # Add multi-scale features if requested
@@ -500,6 +568,253 @@ class AnomalyDetector(nn.Module):
         
         print(f"Initialized detector with {self.n_anchors} anchors")
         print(f"Distance metric: {distance_metric}")
+
+        # Stage-2 reconstruction branch (initialized on demand)
+        self.reconstruction_enabled = False
+        self.stage2_freeze_anchor_target = True
+        self.stage2_projection = None
+        self.frozen_projection = None          # frozen copy of stage-1 bottleneck
+        self.stage2_fuser = None
+        self.reconstruction_decoder = None
+        self.stage2_pixel_map_enabled = True
+        self.stage2_pixel_map_type = 'reconstruction_l2'
+        self.anchor_reproject = None           # anchor_dim → recon_dim (decoupled only)
+        self._recon_dim = None
+        self._anchor_dim = None
+
+        # Dual-bottleneck flag
+        self.use_frozen_bottleneck = False
+
+        # Pixel-to-image aggregation settings
+        self.pixel_aggregation_method = 'top_k_percentile'
+        self.pixel_aggregation_percentile = 95.0
+        self.pixel_aggregation_threshold = None   # set from training stats
+
+        # Three-signal score fusion controls
+        self.score_fusion_enabled = False
+        self.score_fusion_normalization = 'minmax'
+        self.score_fusion_anchor_weight = 0.4
+        self.score_fusion_divergence_weight = 0.3
+        self.score_fusion_pixel_weight = 0.3
+
+        # Optional score-combination controls for inference/evaluation (legacy)
+        self.score_combination_enabled = False
+        self.score_combination_alpha = 0.5
+        self.score_combination_normalization = 'minmax'
+
+    def configure_score_combination(self, enabled: bool = False, alpha: float = 0.5, normalization: str = 'minmax'):
+        """Configure optional anchor+reconstruction score combination at inference/eval."""
+        self.score_combination_enabled = bool(enabled)
+        self.score_combination_alpha = float(alpha)
+        self.score_combination_normalization = normalization
+
+    def configure_score_fusion(self, enabled: bool = False, normalization: str = 'minmax',
+                               anchor_weight: float = 0.4, divergence_weight: float = 0.3,
+                               pixel_weight: float = 0.3, drop_anticorrelated: bool = True):
+        """Configure three-signal score fusion (anchor + bottleneck divergence + pixel aggregation)."""
+        self.score_fusion_enabled = bool(enabled)
+        self.score_fusion_normalization = normalization
+        self.score_fusion_anchor_weight = float(anchor_weight)
+        self.score_fusion_divergence_weight = float(divergence_weight)
+        self.score_fusion_pixel_weight = float(pixel_weight)
+        self.score_fusion_drop_anticorrelated = bool(drop_anticorrelated)
+
+    def configure_pixel_aggregation(self, method: str = 'top_k_percentile',
+                                    percentile: float = 95.0, threshold: Optional[float] = None):
+        """Configure pixel-to-image aggregation strategy."""
+        self.pixel_aggregation_method = method
+        self.pixel_aggregation_percentile = float(percentile)
+        self.pixel_aggregation_threshold = threshold
+
+    def enable_reconstruction_branch(
+        self,
+        freeze_anchor_target: bool = True,
+        out_channels: int = 3,
+        pixel_map_enabled: bool = True,
+        pixel_map_type: str = 'reconstruction_l2',
+        use_frozen_bottleneck: bool = False,
+        recon_projection_dim: int = None
+    ):
+        """
+        Enable stage-2 branch with optionally decoupled reconstruction projection.
+
+        When *recon_projection_dim* differs from the anchor projection dim, a NEW
+        wider projection head is built for reconstruction (stage-2) while the
+        frozen divergence signal stays in anchor space.  The fuser re-projects
+        anchors into recon space so concatenation is well-typed.
+        """
+        if self.reconstruction_enabled:
+            return
+
+        anchor_dim = self.backbone.projection_dim if self.backbone.projection is not None else self.backbone.embed_dim
+        recon_dim = recon_projection_dim if recon_projection_dim is not None else anchor_dim
+        self._recon_dim = recon_dim   # store for forward()
+        self._anchor_dim = anchor_dim
+
+        # --- stage-2 projection head ---
+        embed_dim = self.backbone.embed_dim
+        if recon_dim != anchor_dim or self.backbone.projection is None:
+            # Build a fresh projection head sized for the reconstruction bottleneck
+            self.stage2_projection = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim // 2),
+                nn.ReLU(),
+                nn.Linear(embed_dim // 2, recon_dim)
+            )
+            # Orthogonal init (same as backbone projection head)
+            for m in self.stage2_projection.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.orthogonal_(m.weight, gain=1.0)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+            print(f"  ✓ Stage-2 projection head (NEW): {embed_dim} → {embed_dim // 2} → {recon_dim}")
+        else:
+            # Same dim → deep-copy anchor projection as before
+            self.stage2_projection = copy.deepcopy(self.backbone.projection)
+            print(f"  ✓ Stage-2 projection head (cloned from anchor): → {recon_dim}")
+
+        # --- Frozen bottleneck (stays in anchor space for divergence signal) ---
+        self.use_frozen_bottleneck = use_frozen_bottleneck
+        if use_frozen_bottleneck:
+            if self.backbone.projection is not None:
+                self.frozen_projection = copy.deepcopy(self.backbone.projection)
+            else:
+                self.frozen_projection = nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(embed_dim, anchor_dim)
+                )
+            for p in self.frozen_projection.parameters():
+                p.requires_grad = False
+            self.frozen_projection.eval()
+            print(f"  ✓ Frozen bottleneck (stage-1 copy, {anchor_dim}D) created")
+
+        # --- Anchor re-projection layer (anchor_dim → recon_dim) ---
+        if recon_dim != anchor_dim:
+            self.anchor_reproject = nn.Linear(anchor_dim, recon_dim)
+            nn.init.orthogonal_(self.anchor_reproject.weight, gain=1.0)
+            nn.init.zeros_(self.anchor_reproject.bias)
+            print(f"  ✓ Anchor re-projection: {anchor_dim} → {recon_dim}")
+        else:
+            self.anchor_reproject = None
+
+        # --- Fuser and decoder operate in recon_dim space ---
+        self.stage2_fuser = nn.Sequential(
+            nn.Linear(2 * recon_dim, recon_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(recon_dim, recon_dim)
+        )
+
+        self.reconstruction_decoder = ReconstructionDecoder(
+            latent_dim=recon_dim,
+            out_channels=out_channels,
+            target_size=self.target_size
+        )
+
+        model_device = next(self.backbone.parameters()).device
+        if self.stage2_projection is not None:
+            self.stage2_projection = self.stage2_projection.to(model_device)
+        if self.frozen_projection is not None:
+            self.frozen_projection = self.frozen_projection.to(model_device)
+        if self.stage2_fuser is not None:
+            self.stage2_fuser = self.stage2_fuser.to(model_device)
+        if self.reconstruction_decoder is not None:
+            self.reconstruction_decoder = self.reconstruction_decoder.to(model_device)
+        if self.anchor_reproject is not None:
+            self.anchor_reproject = self.anchor_reproject.to(model_device)
+
+        self.reconstruction_enabled = True
+        self.stage2_freeze_anchor_target = freeze_anchor_target
+        self.stage2_pixel_map_enabled = pixel_map_enabled
+        self.stage2_pixel_map_type = pixel_map_type
+        print("  ✓ Stage-2 reconstruction branch enabled")
+
+    def prepare_stage2_training(self, freeze_encoder: bool = True,
+                               freeze_anchor_parameters: bool = True,
+                               freeze_encoder_mode: str = 'full',
+                               unfreeze_last_n_blocks: int = 2,
+                               unfreeze_lr_multiplier: float = 0.1):
+        """Freeze stage-1 modules and leave stage-2 branch trainable.
+
+        Args:
+            freeze_encoder: Legacy flag – freeze the entire backbone.
+            freeze_anchor_parameters: Freeze anchor-related parameters.
+            freeze_encoder_mode: 'full' (freeze all), 'partial' (unfreeze last N
+                blocks), 'none' (no freezing).  Overrides *freeze_encoder* when
+                set to something other than 'full'.
+            unfreeze_last_n_blocks: How many trailing transformer blocks to
+                unfreeze when *freeze_encoder_mode='partial'*.
+            unfreeze_lr_multiplier: Stored but enforced externally when building
+                the optimizer param groups.
+        """
+        if not self.reconstruction_enabled:
+            raise RuntimeError("Call enable_reconstruction_branch() before prepare_stage2_training().")
+
+        self._unfreeze_lr_multiplier = unfreeze_lr_multiplier
+
+        # --- encoder freezing ---
+        if freeze_encoder_mode == 'partial':
+            # Freeze everything first
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+            # Unfreeze last N transformer blocks + layer-norm
+            total_blocks = len(self.backbone.backbone.blocks)
+            for idx in range(total_blocks - unfreeze_last_n_blocks, total_blocks):
+                for p in self.backbone.backbone.blocks[idx].parameters():
+                    p.requires_grad = True
+            if hasattr(self.backbone.backbone, 'norm'):
+                for p in self.backbone.backbone.norm.parameters():
+                    p.requires_grad = True
+            print(f"  Partial freeze: last {unfreeze_last_n_blocks}/{total_blocks} blocks unfrozen (LR ×{unfreeze_lr_multiplier})")
+        elif freeze_encoder_mode == 'none':
+            # Don't freeze anything
+            print("  Encoder fully trainable in stage-2 (no freeze)")
+        else:  # 'full' or legacy
+            if freeze_encoder:
+                for p in self.backbone.parameters():
+                    p.requires_grad = False
+
+        if freeze_anchor_parameters:
+            for name, p in self.named_parameters():
+                if 'anchor_' in name:
+                    p.requires_grad = False
+
+        # Ensure frozen_projection stays frozen
+        if self.frozen_projection is not None:
+            for p in self.frozen_projection.parameters():
+                p.requires_grad = False
+            self.frozen_projection.eval()
+
+        for module in [self.stage2_projection, self.stage2_fuser, self.reconstruction_decoder]:
+            if module is not None:
+                module.train()
+                for p in module.parameters():
+                    p.requires_grad = True
+
+    def get_stage2_trainable_parameters(self):
+        """Return stage-2 trainable parameters only (excludes frozen_projection)."""
+        params = []
+        for module in [self.stage2_projection, self.stage2_fuser, self.reconstruction_decoder, self.anchor_reproject]:
+            if module is not None:
+                params.extend([p for p in module.parameters() if p.requires_grad])
+        return params
+
+    def get_stage2_param_groups(self, base_lr: float, weight_decay: float = 1e-6):
+        """Return parameter groups with per-group LR for stage-2 optimizer.
+
+        Unfrozen backbone blocks (partial freeze) get ``base_lr * multiplier``.
+        Stage-2 heads get ``base_lr``.
+        """
+        groups = []
+        # Stage-2 heads
+        head_params = self.get_stage2_trainable_parameters()
+        if head_params:
+            groups.append({'params': head_params, 'lr': base_lr, 'weight_decay': weight_decay})
+        # Partially unfrozen backbone blocks
+        backbone_params = [p for p in self.backbone.parameters() if p.requires_grad]
+        mult = getattr(self, '_unfreeze_lr_multiplier', 0.1)
+        if backbone_params:
+            groups.append({'params': backbone_params, 'lr': base_lr * mult, 'weight_decay': weight_decay})
+        return groups
     
     def get_semantic_anchors(self):
         """
@@ -572,6 +887,7 @@ class AnomalyDetector(nn.Module):
         """
         # Extract features (already projected if projection head exists)
         # Request multi-scale features if we have a pixel decoder
+        B, C, H, W = x.shape
         features = self.backbone(x, return_multi_scale=self.use_pixel_decoder)
         
         global_feat = features['global']  # (B, D) or (B, D_proj)
@@ -594,6 +910,86 @@ class AnomalyDetector(nn.Module):
             'global_distances': global_distances,
             'dense_feat': dense_feat
         }
+
+        if self.reconstruction_enabled and self.stage2_projection is not None:
+            global_raw = features['global_raw']
+            stage2_feat = self.stage2_projection(global_raw)  # (B, recon_dim)
+            stage2_feat = F.normalize(stage2_feat, dim=1)
+
+            decoupled = getattr(self, '_recon_dim', None) is not None and self._recon_dim != self._anchor_dim
+
+            # Frozen bottleneck → divergence signal (always in anchor space)
+            frozen_feat = None
+            bottleneck_divergence = None
+            if self.use_frozen_bottleneck and self.frozen_projection is not None:
+                with torch.no_grad():
+                    frozen_feat = self.frozen_projection(global_raw)  # (B, anchor_dim)
+                    frozen_feat = F.normalize(frozen_feat, dim=1)
+                if decoupled:
+                    # Divergence in anchor space: frozen vs current backbone projection
+                    bottleneck_divergence = 1.0 - F.cosine_similarity(frozen_feat, global_feat, dim=1)
+                else:
+                    bottleneck_divergence = 1.0 - F.cosine_similarity(frozen_feat, stage2_feat, dim=1)
+
+            # Per-patch divergence map
+            patch_divergence_map = None
+            if self.use_frozen_bottleneck and self.frozen_projection is not None and 'patch_raw' in features:
+                pr = features['patch_raw']  # (B, N_patches, D_backbone)
+                B_p, N_p, D_p = pr.shape
+                with torch.no_grad():
+                    fp = self.frozen_projection(pr.reshape(B_p * N_p, D_p))
+                    fp = F.normalize(fp, dim=1).view(B_p, N_p, -1)  # (B, N, anchor_dim)
+                if decoupled:
+                    # Compare frozen vs backbone projection (both anchor space)
+                    if self.backbone.projection is not None:
+                        with torch.no_grad():
+                            sp = self.backbone.projection(pr.reshape(B_p * N_p, D_p))
+                            sp = F.normalize(sp, dim=1).view(B_p, N_p, -1)
+                    else:
+                        sp = F.normalize(pr, dim=2)
+                else:
+                    sp = self.stage2_projection(pr.reshape(B_p * N_p, D_p))
+                    sp = F.normalize(sp, dim=1).view(B_p, N_p, -1)
+                per_patch_div = 1.0 - (fp * sp).sum(dim=-1)  # (B, N_patches)
+                h_p = H // self.backbone.patch_size
+                w_p = W // self.backbone.patch_size
+                patch_divergence_map = F.interpolate(
+                    per_patch_div.view(B_p, 1, h_p, w_p),
+                    size=(H, W), mode='bilinear', align_corners=False
+                ).squeeze(1)  # (B, H, W)
+
+            assigned_anchor_idx = global_distances.argmin(dim=1)
+            assigned_anchor_embeddings = anchor_global[assigned_anchor_idx]  # (B, anchor_dim)
+            if self.stage2_freeze_anchor_target:
+                assigned_anchor_embeddings = assigned_anchor_embeddings.detach()
+
+            # Re-project anchors to recon_dim if decoupled
+            if self.anchor_reproject is not None:
+                assigned_anchor_embeddings = self.anchor_reproject(assigned_anchor_embeddings)
+
+            recon_latent = self.stage2_fuser(torch.cat([assigned_anchor_embeddings, stage2_feat], dim=1))
+            reconstruction = self.reconstruction_decoder(recon_latent)
+            reconstruction_error = (reconstruction - x).pow(2).mean(dim=(1, 2, 3))
+
+            reconstruction_pixel_map = None
+            if self.stage2_pixel_map_enabled:
+                if self.stage2_pixel_map_type == 'reconstruction_l1':
+                    reconstruction_pixel_map = (reconstruction - x).abs().mean(dim=1)
+                else:
+                    reconstruction_pixel_map = (reconstruction - x).pow(2).mean(dim=1)
+
+            output.update({
+                'stage2_feat': stage2_feat,
+                'frozen_feat': frozen_feat,
+                'bottleneck_divergence': bottleneck_divergence,
+                'patch_divergence_map': patch_divergence_map,
+                'recon_latent': recon_latent,
+                'assigned_anchor_idx': assigned_anchor_idx,
+                'assigned_anchor_embeddings': assigned_anchor_embeddings,
+                'reconstruction': reconstruction,
+                'reconstruction_error': reconstruction_error,
+                'reconstruction_pixel_map': reconstruction_pixel_map
+            })
         
         # Pixel decoder path: compute pixel-level embeddings and distances
         if self.use_pixel_decoder and self.pixel_decoder is not None:
@@ -703,9 +1099,60 @@ class AnomalyDetector(nn.Module):
             
             result = {
                 'image_scores': image_scores,
+                'anchor_scores': image_scores,
                 'assigned_anchors': assigned_anchors,
                 'all_distances': global_distances
             }
+
+            if 'reconstruction_error' in outputs:
+                result['reconstruction_scores'] = outputs['reconstruction_error']
+                result['reconstruction'] = outputs.get('reconstruction')
+
+            # Bottleneck divergence (CLS-level, single scalar per image)
+            if outputs.get('bottleneck_divergence') is not None:
+                result['bottleneck_divergence'] = outputs['bottleneck_divergence']
+
+            # Per-patch divergence map → aggregated image-level score
+            # Spatially resolved (15×15 patches → upsampled), then top-k aggregated
+            if outputs.get('patch_divergence_map') is not None:
+                patch_div_map = outputs['patch_divergence_map']  # (B, H, W)
+                if target_size is not None and patch_div_map.shape[1:] != target_size:
+                    patch_div_map = F.interpolate(
+                        patch_div_map.unsqueeze(1), size=target_size, mode='bilinear', align_corners=False
+                    ).squeeze(1)
+                if return_maps:
+                    result['patch_divergence_map'] = patch_div_map
+                patch_div_aggregated = aggregate_pixel_scores_torch(
+                    patch_div_map,
+                    method=self.pixel_aggregation_method,
+                    percentile=self.pixel_aggregation_percentile,
+                    threshold=self.pixel_aggregation_threshold,
+                )
+                result['patch_divergence_aggregated_score'] = patch_div_aggregated
+
+            # Stage-2 reconstruction pixel map (preferred for stage-2 pixel metrics)
+            if outputs.get('reconstruction_pixel_map') is not None:
+                reconstruction_pixel_scores = outputs['reconstruction_pixel_map']  # (B, H, W)
+                if target_size is not None and reconstruction_pixel_scores.shape[1:] != target_size:
+                    reconstruction_pixel_scores = F.interpolate(
+                        reconstruction_pixel_scores.unsqueeze(1),
+                        size=target_size,
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze(1)
+
+                if return_maps:
+                    result['reconstruction_pixel_scores'] = reconstruction_pixel_scores
+                    result['pixel_scores'] = reconstruction_pixel_scores
+
+                # Pixel-to-image aggregation — always computed (not gated by return_maps)
+                pixel_aggregated = aggregate_pixel_scores_torch(
+                    reconstruction_pixel_scores,
+                    method=self.pixel_aggregation_method,
+                    percentile=self.pixel_aggregation_percentile,
+                    threshold=self.pixel_aggregation_threshold,
+                )
+                result['pixel_aggregated_score'] = pixel_aggregated
             
             # Pixel-level anomaly map from decoder (preferred)
             if return_maps and 'pixel_distances' in outputs:
@@ -723,7 +1170,9 @@ class AnomalyDetector(nn.Module):
                         align_corners=False
                     ).squeeze(1)
                 
-                result['pixel_scores'] = pixel_scores
+                result['anchor_pixel_scores'] = pixel_scores
+                if 'pixel_scores' not in result:
+                    result['pixel_scores'] = pixel_scores
                 result['pixel_embeddings'] = outputs.get('pixel_embeddings')
             
             # Fallback: patch-level anomaly map (legacy, upsampled)
@@ -742,6 +1191,13 @@ class AnomalyDetector(nn.Module):
                         align_corners=False
                     ).squeeze(1)  # (B, H, W)
                 
-                result['pixel_scores'] = pixel_scores
+                result['anchor_pixel_scores'] = pixel_scores
+                if 'pixel_scores' not in result:
+                    result['pixel_scores'] = pixel_scores
+
+            # Optional raw combination output (final AUROC combination should be dataset-level in eval)
+            if self.score_combination_enabled and ('anchor_scores' in result) and ('reconstruction_scores' in result):
+                alpha = self.score_combination_alpha
+                result['combined_scores_raw'] = (1.0 - alpha) * result['anchor_scores'] + alpha * result['reconstruction_scores']
             
             return result

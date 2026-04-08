@@ -1,0 +1,137 @@
+﻿python.exe : D:\Documents\FMI\Disertatie\medical-ad\venv\Lib\site-packages\albumentations\core\validation.py:114: UserWarning: ShiftScaleRotate is a special case of Affine transform. Please use Affine transform instead.
+At line:1 char:32
++ ... NG="utf-8"; & .\venv\Scripts\python.exe project/main.py --config proj ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (D:\Documents\FM...nsform instead.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  original_init(self, **validated_kwargs)
+D:\Documents\FMI\Disertatie\medical-ad\project\data.py:82: UserWarning: Argument(s) 'value' are not valid for transform ShiftScaleRotate
+  A.ShiftScaleRotate(
+================================================================================
+BMAD BRAIN MRI ANOMALY DETECTION
+================================================================================
+Output directory: experiments\dual_bottleneck_k1
+Config: project/configs/two_stage_dual_bottleneck_k1.yaml
+Anchor strategy: kmeans
+Number of anchors: 1
+Device: cuda
+
+================================================================================
+DATA PREPARATION
+================================================================================
+Loaded dataset from data\BraTS2021_slice:
+  Train: 7500 normal images
+  Val: 83 images (39 normal, 44 anomaly)
+  Test: 3715 images (640 normal, 3075 anomaly)
+Train batches: 117
+Val batches: 2
+Test batches: 59
+
+================================================================================
+CREATING BACKBONE
+================================================================================
+Loading vit_small_patch16_dinov3.lvd1689m...
+Backbone embed_dim: 384, patch_size: 16, num_blocks: 12
+Added trainable projection head: 384 -> 192 -> 128
+  Trainable parameters: 98,624
+  Initialized with orthogonal weights (gain=1.0)
+
+Pre-training disabled (pretraining.enabled=False)
+
+[EXPERT'S APPROACH] Using decoupled semantic/geometric anchors
+
+================================================================================
+ANCHOR GENERATION IN 384D DINOV3 EMBEDDING SPACE (SOLUTION A)
+================================================================================
+Strategy: Semantic clustering in frozen DINOv3 space
+  1. Extract 384D embeddings for training images
+  2. Run k-means/eigenface in 384D space
+  3. Select images closest to cluster centers
+  4. Store in RAW 384D (re-project each forward)
+
+Loading ALL 7500 training images...
+Loaded 7500 images, shape: (7500, 240, 240)
+
+Extracting 384D DINOv3 embeddings...
+Γ£ô Extracted embeddings: torch.Size([7500, 384])
+
+Clustering in 384D space: strategy=kmeans, n_anchors=1
+   Anchor 0: 7500 images in cluster, selected sample 1227
+
+================================================================================
+SOLUTION A: Anchors will be RE-PROJECTED each forward pass
+================================================================================
+  Semantic anchors (384D): torch.Size([1, 384])
+  These will be re-projected through projection head EVERY forward pass
+  Anchors 'move' with projection head during training
+  Requires diversity loss (delta=0.1) to prevent collapse
+Saved anchor visualization to experiments\dual_bottleneck_k1\anchor_images.png
+
+================================================================================
+Γ£ô Generated 1 semantic anchors (Solution A: Re-projection)
+================================================================================
+  Semantic anchors (384D): torch.Size([1, 384]) [for pseudo-labels AND re-projection]
+  These will be RE-PROJECTED through projection head each forward pass
+
+================================================================================
+MODEL CREATION
+================================================================================
+Anchors in RAW 384D space: torch.Size([1, 384])
+  Γ£ô SOLUTION A: Anchors will be RE-PROJECTED each forward pass
+  Γ£ô Anchors move with projection head (semantic clustering preserved)
+  ΓÜá Anchors are FIXED in RAW space (1 ├ù 384D)
+    WARNING: Will be re-projected each forward - may cause issues!
+Initialized detector with 1 anchors
+Distance metric: euclidean
+
+Creating loss function: cam
+  Γ£ô Loss type: cam
+
+================================================================================
+TRAINING
+================================================================================
+Skipping training (--eval-only flag)
+
+================================================================================
+FINAL EVALUATION
+================================================================================
+  Γ£ô Frozen bottleneck (stage-1 copy) created
+  Γ£ô Stage-2 reconstruction branch enabled
+  Stage-2 reconstruction branch enabled for eval-only loading
+Loaded best model from epoch 8
+Computing metrics...
+
+Evaluating:   0%|          | 0/59 [00:00<?, ?it/s]
+Evaluating:   2%|ΓûÅ         | 1/59 [00:20<20:04, 20.78s/it]
+Evaluating:   5%|Γûî         | 3/59 [00:20<05:04,  5.44s/it]
+Evaluating:   8%|Γûè         | 5/59 [00:21<02:25,  2.69s/it]
+Evaluating:  12%|ΓûêΓûÅ        | 7/59 [00:21<01:22,  1.58s/it]
+Evaluating:  15%|ΓûêΓûî        | 9/59 [00:21<00:51,  1.03s/it]
+Evaluating:  19%|ΓûêΓûè        | 11/59 [00:21<00:33,  1.42it/s]
+Evaluating:  22%|ΓûêΓûêΓûÅ       | 13/59 [00:22<00:25,  1.83it/s]
+Evaluating:  25%|ΓûêΓûêΓûî       | 15/59 [00:22<00:17,  2.46it/s]
+Evaluating:  29%|ΓûêΓûêΓûë       | 17/59 [00:22<00:14,  2.91it/s]
+Evaluating:  32%|ΓûêΓûêΓûêΓûÅ      | 19/59 [00:23<00:10,  3.64it/s]
+Evaluating:  36%|ΓûêΓûêΓûêΓûî      | 21/59 [00:23<00:10,  3.66it/s]
+Evaluating:  39%|ΓûêΓûêΓûêΓûë      | 23/59 [00:23<00:08,  4.39it/s]
+Evaluating:  42%|ΓûêΓûêΓûêΓûêΓûÅ     | 25/59 [00:24<00:08,  4.09it/s]
+Evaluating:  46%|ΓûêΓûêΓûêΓûêΓûî     | 27/59 [00:24<00:06,  4.80it/s]
+Evaluating:  49%|ΓûêΓûêΓûêΓûêΓûë     | 29/59 [00:25<00:06,  4.30it/s]
+Evaluating:  53%|ΓûêΓûêΓûêΓûêΓûêΓûÄ    | 31/59 [00:25<00:05,  4.97it/s]
+Evaluating:  54%|ΓûêΓûêΓûêΓûêΓûêΓûì    | 32/59 [00:25<00:05,  5.40it/s]
+Evaluating:  56%|ΓûêΓûêΓûêΓûêΓûêΓûî    | 33/59 [00:26<00:06,  4.24it/s]
+Evaluating:  59%|ΓûêΓûêΓûêΓûêΓûêΓûë    | 35/59 [00:26<00:04,  5.16it/s]
+Evaluating:  63%|ΓûêΓûêΓûêΓûêΓûêΓûêΓûÄ   | 37/59 [00:26<00:04,  4.44it/s]
+Evaluating:  66%|ΓûêΓûêΓûêΓûêΓûêΓûêΓûî   | 39/59 [00:27<00:03,  5.08it/s]
+Evaluating:  69%|ΓûêΓûêΓûêΓûêΓûêΓûêΓûë   | 41/59 [00:27<00:04,  4.47it/s]
+Evaluating:  73%|ΓûêΓûêΓûêΓûêΓûêΓûêΓûêΓûÄ  | 43/59 [00:27<00:03,  5.09it/s]
+Evaluating:  76%|ΓûêΓûêΓûêΓûêΓûêΓûêΓûêΓûï  | 45/59 [00:28<00:03,  4.50it/s]
+Evaluating:  80%|ΓûêΓûêΓûêΓûêΓûêΓûêΓûêΓûë  | 47/59 [00:28<00:02,  5.09it/s]
+Evaluating:  83%|ΓûêΓûêΓûêΓûêΓûêΓûêΓûêΓûêΓûÄ | 49/59 [00:29<00:02,  4.56it/s]
+Evaluating:  86%|ΓûêΓûêΓûêΓûêΓûêΓûêΓûêΓûêΓûï | 51/59 [00:29<00:01,  4.96it/s]
+Evaluating:  90%|ΓûêΓûêΓûêΓûêΓûêΓûêΓûêΓûêΓûë | 53/59 [00:30<00:01,  4.62it/s]
+Evaluating:  93%|ΓûêΓûêΓûêΓûêΓûêΓûêΓûêΓûêΓûêΓûÄ| 55/59 [00:30<00:00,  5.14it/s]
+Evaluating:  97%|ΓûêΓûêΓûêΓûêΓûêΓûêΓûêΓûêΓûêΓûï| 57/59 [00:30<00:00,  4.67it/s]
+Evaluating: 100%|ΓûêΓûêΓûêΓûêΓûêΓûêΓûêΓûêΓûêΓûê| 59/59 [00:31<00:00,  6.00it/s]
+Evaluating: 100%|ΓûêΓûêΓûêΓûêΓûêΓûêΓûêΓûêΓûêΓûê| 59/59 [00:32<00:00,  1.84it/s]

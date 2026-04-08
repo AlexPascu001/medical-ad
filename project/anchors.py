@@ -20,6 +20,33 @@ from pathlib import Path
 from abc import ABC, abstractmethod
 
 
+def _grayscale_batch_to_tensor(images_np: np.ndarray, device: torch.device,
+                               apply_imagenet_norm: bool = False) -> torch.Tensor:
+    """Convert a batch of preprocessed grayscale images to 3-channel tensors.
+
+    Args:
+        images_np: (B, H, W) float32 array (already preprocessed by BMADPreprocessor).
+        device: Target torch device.
+        apply_imagenet_norm: If True, apply ImageNet normalization (use when
+            preprocessor outputs [0,1] via min-max scaling).
+
+    Returns:
+        (B, 3, H, W) tensor ready for DINOv3 backbone.
+    """
+    import albumentations as A
+    from albumentations.pytorch import ToTensorV2
+    ops = []
+    if apply_imagenet_norm:
+        ops.append(A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
+    ops.append(ToTensorV2())
+    _tf = A.Compose(ops)
+    tensors = []
+    for img in images_np:
+        img3 = np.stack([img, img, img], axis=-1)  # (H,W) -> (H,W,3)
+        tensors.append(_tf(image=img3)['image'])
+    return torch.stack(tensors).to(device)
+
+
 class AnchorStrategy(ABC):
     """Base class for anchor generation strategies"""
     
@@ -1022,12 +1049,8 @@ class EmbeddingDiverseAnchorStrategy(AnchorStrategy):
             for i in range(0, N, self.batch_size):
                 batch_imgs = images[i:i+self.batch_size]
                 
-                # Preprocess: convert to RGB tensor
-                batch_tensor = torch.from_numpy(batch_imgs).float()
-                if batch_tensor.dim() == 3:
-                    batch_tensor = batch_tensor.unsqueeze(1)
-                batch_tensor = batch_tensor.repeat(1, 3, 1, 1)  # Grayscale to RGB
-                batch_tensor = batch_tensor.to(device)
+                # Preprocess: convert to 3-channel tensor
+                batch_tensor = _grayscale_batch_to_tensor(batch_imgs, device)
                 
                 # Get embeddings
                 emb = model(batch_tensor)  # (B, D)
@@ -1271,7 +1294,8 @@ def compute_anchor_embeddings(
     backbone_model: torch.nn.Module,
     device: torch.device,
     batch_size: int = 8,
-    return_projected: bool = False
+    return_projected: bool = False,
+    apply_imagenet_norm: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Compute DINOv3 embeddings for anchor images.
@@ -1303,12 +1327,8 @@ def compute_anchor_embeddings(
         for i in range(0, K, batch_size):
             batch = anchor_images[i:i+batch_size]
             
-            # Convert to tensor and add channel/batch dims
-            batch_tensor = torch.from_numpy(batch).float().unsqueeze(1)  # (B, 1, H, W)
-            
-            # Repeat to 3 channels for DINOv3
-            batch_tensor = batch_tensor.repeat(1, 3, 1, 1)  # (B, 3, H, W)
-            batch_tensor = batch_tensor.to(device)
+            # Convert to 3-channel tensor for DINOv3
+            batch_tensor = _grayscale_batch_to_tensor(batch, device, apply_imagenet_norm=apply_imagenet_norm)
             
             if return_projected:
                 # Use backbone's forward() which applies projection + normalization
@@ -1322,7 +1342,7 @@ def compute_anchor_embeddings(
                 cls_token = features[:, 0]  # (B, 384) - TRUE raw CLS token
                 
                 # Get dense features
-                num_register_tokens = 4
+                num_register_tokens = backbone_model.num_register_tokens
                 patch_tokens = features[:, 1 + num_register_tokens:]
                 H, W = batch_tensor.shape[2:]
                 h_patches = H // backbone_model.patch_size

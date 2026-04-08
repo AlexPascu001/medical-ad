@@ -1,0 +1,83 @@
+# ViT-Base DINOv3 experiment: K=1024, stage 1 + stage 2, trainable backbone
+# Compare against: regfix_k1024 (vit_small, 0.7877 test AUROC)
+
+seed: 42
+output_dir: './experiments/vitbase_k1024'
+
+data:
+  data_root: './data/BraTS2021_slice'
+  target_size: [240, 240]
+  normalization: 'zscore_only'
+
+anchor:
+  strategy: 'kmeans'
+  n_components: 50
+  n_anchors: 1024
+  max_images_for_pca: null
+  learnable: false
+  init_from: null
+  use_embedding_space: true
+  reproject_anchors: true
+
+model:
+  backbone: 'vit_base_patch16_dinov3.lvd1689m'
+  freeze_backbone: false
+  projection_dim: 128
+
+loss:
+  margin: 1.0
+  alpha: 1.0
+  beta: 0.5
+  gamma: 0.0
+  delta: 0.1
+  min_norm: 0.5
+  diversity_temperature: 0.1
+  distance_metric: 'euclidean'
+  use_dense: false
+  global_weight: 1.0
+  dense_weight: 0.5
+  spatial_reduction: 'mean'
+
+pretraining:
+  enabled: false
+
+training:
+  epochs: 100
+  batch_size: 64
+  num_workers: 4
+  lr: 0.0001
+  weight_decay: 0.0001
+  use_amp: true
+  log_interval: 50
+  val_interval: 1
+  early_stopping_patience: 10
+  fixed_pseudo_labels: true
+  save_checkpoints: false
+
+stage2:
+  enabled: true
+  epochs: 20
+  lr: 0.0001
+  weight_decay: 0.0001
+  freeze_encoder: true
+  freeze_anchors: true
+  freeze_anchor_target: true
+  recon_loss: 'mse'
+  recon_weight: 1.0
+  consistency_loss: 'cosine'
+  consistency_weight: 0.1
+  pixel_map:
+    enabled: true
+    type: 'reconstruction_l2'
+  pixel_metrics:
+    enabled: true
+  score_combination:
+    enabled: false
+    alpha: 0.5
+    normalization: 'minmax'
+  early_stopping_patience: 10
+  early_stopping_metric: 'reconstruction_image_auroc'
+
+eval:
+  compute_pixel: true
+  bootstrap_samples: 1000

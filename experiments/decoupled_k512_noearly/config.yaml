@@ -1,0 +1,60 @@
+anchor:
+  geometric_init: random_orthogonal
+  init_from: null
+  learnable: false
+  max_images_for_pca: null
+  n_anchors: 512
+  n_components: 50
+  strategy: kmeans
+  use_embedding_space: true
+data:
+  data_root: ./data/BraTS2021_slice
+  target_size:
+  - 240
+  - 240
+evaluation:
+  eval_every: 1
+  metric: pixel_auroc
+  save_best: true
+  save_predictions: true
+  visualize_embeddings: true
+loss:
+  alpha: 1.0
+  beta: 0.5
+  delta: 0.1
+  dense_weight: 0.5
+  distance_metric: euclidean
+  diversity_temperature: 0.1
+  gamma: 0.0
+  global_weight: 1.0
+  margin: 1.0
+  min_norm: 0.5
+  spatial_reduction: mean
+  use_dense: false
+model:
+  backbone: vit_small_patch16_dinov3.lvd1689m
+  freeze_backbone: true
+  projection_dim: 128
+output_dir: experiments\decoupled_k512_noearly
+pretraining:
+  batch_size: 64
+  distance_metric: euclidean
+  enabled: false
+  epochs: 0
+  loss_alpha: 1.0
+  loss_beta: 0.0
+  lr: 0.001
+  temp_anchors: 8
+seed: 42
+training:
+  batch_size: 64
+  early_stopping_patience: 1000
+  epochs: 100
+  fixed_pseudo_labels: true
+  log_interval: 50
+  lr: 0.0001
+  num_workers: 4
+  save_checkpoints: false
+  use_amp: true
+  val_interval: 1
+  weight_decay: 0.0001

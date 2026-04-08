@@ -1,0 +1,14 @@
+﻿
+D:\Documents\FMI\Disertatie\medical-ad\venv\Lib\site-packages\albumentations\core\validation.py:114: UserWarning: ShiftScaleRotate is a special case of Affine transform. Please use Affine transform instead.
+D:\Documents\FMI\Disertatie\medical-ad\project\data.py:82: UserWarning: Argument(s) 'value' are not valid for transform ShiftScaleRotate
+  Train: 7500 normal images
+  Val: 83 images (39 normal, 44 anomaly)
+  Test: 3715 images (640 normal, 3075 anomaly)
+  1. Extract 384D embeddings for training images
+  3. Select images closest to cluster centers
+Loading ALL 7500 training images...
+Loaded 7500 images, shape: (7500, 240, 240)
+   Anchor 0: 7500 images in cluster, selected sample 1227
+Saved anchor visualization to experiments\dual_bottleneck_k1\anchor_images.png
+    WARNING: Will be re-projected each forward - may cause issues!
+Computing metrics...

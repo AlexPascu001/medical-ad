@@ -1,0 +1,115 @@
+# Two-Stage with Dual Bottleneck + Three-Signal Fusion
+# Best performing base: reproject k=1 with trainable backbone
+# New features: frozen bottleneck divergence, pixel aggregation, score fusion
+
+seed: 42
+output_dir: './experiments/dual_bottleneck_k1'
+
+data:
+  data_root: './data/BraTS2021_slice'
+  target_size: [240, 240]
+
+anchor:
+  strategy: 'kmeans'
+  n_components: 50
+  n_anchors: 1
+  max_images_for_pca: null
+  learnable: false
+  init_from: null
+  use_embedding_space: true
+  reproject_anchors: true
+
+model:
+  backbone: 'vit_small_patch16_dinov3.lvd1689m'
+  freeze_backbone: false
+  projection_hidden_dims: [192, 128]
+
+loss:
+  margin: 1.0
+  alpha: 1.0
+  beta: 0.5
+  gamma: 0.0
+  delta: 0.1
+  min_norm: 0.5
+  diversity_temperature: 0.1
+  distance_metric: 'euclidean'
+  use_dense: false
+  global_weight: 1.0
+  dense_weight: 0.5
+  spatial_reduction: 'mean'
+
+pretraining:
+  enabled: false
+  epochs: 0
+  lr: 0.001
+  batch_size: 64
+  temp_anchors: 1
+  loss_alpha: 1.0
+  loss_beta: 0.0
+  distance_metric: 'euclidean'
+
+training:
+  epochs: 100
+  batch_size: 64
+  num_workers: 4
+  lr: 0.0001
+  weight_decay: 0.0001
+  use_amp: true
+  log_interval: 50
+  val_interval: 1
+  early_stopping_patience: 10
+  fixed_pseudo_labels: true
+  save_checkpoints: false
+
+stage2:
+  enabled: true
+  epochs: 30
+  lr: 0.0001
+  weight_decay: 0.0001
+  freeze_encoder: true
+  freeze_anchors: true
+  freeze_anchor_target: true
+  recon_loss: 'mse'
+  recon_weight: 1.0
+  consistency_loss: 'cosine'
+  consistency_weight: 0.1
+
+  # === NEW: Dual-bottleneck ===
+  frozen_bottleneck: true
+  alignment_weight: 0.1
+
+  # === NEW: Configurable encoder freezing ===
+  freeze_encoder_mode: 'full'    # Try 'partial' to unfreeze last 2 blocks
+  unfreeze_last_n_blocks: 2
+  unfreeze_lr_multiplier: 0.1
+
+  # === NEW: Pixel aggregation ===
+  pixel_aggregation:
+    method: 'self_normalized'
+    percentile: 95
+    threshold_n_std: 2.0
+
+  # === NEW: Three-signal score fusion ===
+  score_fusion:
+    enabled: true
+    normalization: 'minmax'
+    anchor_weight: 0.333
+    divergence_weight: 0.333
+    pixel_weight: 0.333
+    drop_anticorrelated: false
+
+  pixel_map:
+    enabled: true
+    type: 'reconstruction_l2'
+  pixel_metrics:
+    enabled: true
+  score_combination:
+    enabled: false
+    alpha: 0.5
+    normalization: 'minmax'
+  early_stopping_patience: 15
+  early_stopping_metric: 'pixel_aggregated_image_auroc'
+
+eval:
+  compute_pixel: true
+  bootstrap_samples: 1000

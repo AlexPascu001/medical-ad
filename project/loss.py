@@ -107,21 +107,27 @@ class AnchorMarginLoss(nn.Module):
         # === REPELLER TERM ===
         # L_R(C) = (1/(K(K-1))) * Σⱼ≠ₖ max(0, m - ||c_j - c_k||_2)
         # Push different anchors apart by at least margin m
+        # Skip if K=1 (no pairs to push apart)
         
-        # Compute all pairwise anchor distances: (K, K)
-        if self.distance_metric == 'euclidean':
-            anchor_distances = torch.cdist(anchors_for_repeller, anchors_for_repeller, p=2)
+        loss_repel = torch.tensor(0.0, device=embeddings.device, dtype=embeddings.dtype)
+        if K > 1:
+            # Compute all pairwise anchor distances: (K, K)
+            if self.distance_metric == 'euclidean':
+                anchor_distances = torch.cdist(anchors_for_repeller, anchors_for_repeller, p=2)
+            else:
+                anchor_sims = anchors_for_repeller @ anchors_for_repeller.T
+                anchor_distances = 1.0 - anchor_sims
+            
+            # Create mask to exclude diagonal (self-distances)
+            mask = ~torch.eye(K, dtype=torch.bool, device=anchor_distances.device)
+            
+            # Paper hinge: 0.5 * (max(0, 2m - ||c_j - c_k||))^2
+            violations = torch.relu(2 * self.margin - anchor_distances)
+            violations_masked = violations[mask]
+            loss_repel = 0.5 * (violations_masked ** 2).mean()
         else:
-            anchor_sims = anchors_for_repeller @ anchors_for_repeller.T
-            anchor_distances = 1.0 - anchor_sims
-        
-        # Create mask to exclude diagonal (self-distances)
-        mask = ~torch.eye(K, dtype=torch.bool, device=anchor_distances.device)
-        
-        # Paper hinge: 0.5 * (max(0, 2m - ||c_j - c_k||))^2
-        violations = torch.relu(2 * self.margin - anchor_distances)
-        violations_masked = violations[mask]
-        loss_repel = 0.5 * (violations_masked ** 2).mean()
+            anchor_distances = None
+            mask = None
         
         # === MIN-NORM TERM (for learnable anchors) ===
         # L_N(C) = (1/K) * Σₖ max(0, δ - ||c_k||_2)
@@ -134,8 +140,9 @@ class AnchorMarginLoss(nn.Module):
         
         # === DIVERSITY TERM (prevent anchor collapse) ===
         # Encourage balanced anchor usage via entropy regularization
+        # Skip if K=1 (nothing to balance)
         loss_diversity = torch.tensor(0.0, device=embeddings.device, dtype=embeddings.dtype)
-        if self.delta > 0:
+        if self.delta > 0 and K > 1:
             # Compute soft assignments using temperature-scaled softmax
             soft_assignments = torch.softmax(-distances / self.diversity_temperature, dim=1)  # (B, K)
             
@@ -168,10 +175,15 @@ class AnchorMarginLoss(nn.Module):
                 'min_distance': min_distances.mean().item(),
                 'max_distance': distances.max().item(),
                 'mean_distance': distances.mean().item(),
-                'assigned_anchors': assigned_anchors,
-                'anchor_min_separation': anchor_distances[mask].min().item(),
-                'anchor_mean_separation': anchor_distances[mask].mean().item()
+                'assigned_anchors': assigned_anchors
             })
+            
+            # Only compute anchor separation stats if K > 1
+            if K > 1 and anchor_distances is not None and mask is not None:
+                result.update({
+                    'anchor_min_separation': anchor_distances[mask].min().item(),
+                    'anchor_mean_separation': anchor_distances[mask].mean().item()
+                })
         
         return result
 

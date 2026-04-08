@@ -4,6 +4,7 @@ Training Loop for Anomaly Detector
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 from pathlib import Path
@@ -16,6 +17,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
+from sklearn.metrics import roc_auc_score, average_precision_score
 
 from model import AnomalyDetector
 from loss import CombinedAnchorLoss
@@ -28,7 +30,7 @@ class Trainer:
     def __init__(
         self,
         model: AnomalyDetector,
-        criterion: CombinedAnchorLoss,
+        criterion: Optional[CombinedAnchorLoss],
         optimizer: torch.optim.Optimizer,
         train_loader: DataLoader,
         val_loader: DataLoader,
@@ -39,7 +41,10 @@ class Trainer:
         val_interval: int = 1,
         fixed_pseudo_labels: bool = False,
         dynamic_reassignment: bool = False,
-        reassignment_interval: int = 5
+        reassignment_interval: int = 5,
+        save_checkpoints: bool = True,
+        stage2_mode: bool = False,
+        stage2_config: Optional[Dict] = None
     ):
         """
         Args:
@@ -56,6 +61,7 @@ class Trainer:
             fixed_pseudo_labels: If True, compute pseudo-labels once before training
             dynamic_reassignment: If True, recompute pseudo-labels every reassignment_interval epochs
             reassignment_interval: Epochs between pseudo-label recomputation (only if dynamic_reassignment=True)
+            save_checkpoints: If True, save periodic checkpoints; if False, only save best and final
         """
         self.model = model
         self.criterion = criterion
@@ -71,6 +77,9 @@ class Trainer:
         
         self.log_interval = log_interval
         self.val_interval = val_interval
+        self.save_checkpoints = save_checkpoints
+        self.stage2_mode = stage2_mode
+        self.stage2_config = stage2_config or {}
         
         self.epoch = 0
         self.global_step = 0
@@ -114,12 +123,73 @@ class Trainer:
         # Precompute pseudo-labels if enabled in config
         self.fixed_pseudo = getattr(self, 'fixed_pseudo', False)
 
+        # Pixel-stats tracker for stage-2 reconstruction threshold
+        self.pixel_stats_tracker = None
+
+    def _compute_stage2_losses(self, outputs: Dict[str, torch.Tensor], images: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Compute reconstruction + alignment losses for stage-2 training.
+
+        Loss components:
+          1. **Reconstruction loss** (MSE or L1) – faithfully reconstruct normal data.
+          2. **Alignment loss** – keep the trainable stage-2 bottleneck close to the
+             frozen stage-1 bottleneck on *normal* training data.  This replaces the
+             old consistency-to-anchor loss with a more informative regulariser.
+             If no frozen bottleneck is available, falls back to the legacy
+             consistency loss (cosine / L2 to assigned anchor embedding).
+        """
+        if 'reconstruction' not in outputs:
+            raise RuntimeError("Stage-2 training requires model outputs to include 'reconstruction'.")
+
+        recon_weight = float(self.stage2_config.get('recon_weight', 1.0))
+        alignment_weight = float(self.stage2_config.get('alignment_weight',
+                                    self.stage2_config.get('consistency_weight', 0.1)))
+        recon_type = self.stage2_config.get('recon_loss', 'mse')
+
+        reconstruction = outputs['reconstruction']
+        recon_target = images
+
+        if recon_type == 'l1':
+            recon_loss = F.l1_loss(reconstruction, recon_target)
+        else:
+            recon_loss = F.mse_loss(reconstruction, recon_target)
+
+        # ----- alignment / consistency loss -----
+        stage2_feat = outputs['stage2_feat']
+        frozen_feat = outputs.get('frozen_feat')
+
+        if frozen_feat is not None:
+            # Dual-bottleneck alignment: penalise divergence from frozen projection
+            alignment_loss = 1.0 - torch.cosine_similarity(stage2_feat, frozen_feat.detach(), dim=1).mean()
+        else:
+            # Legacy fallback: consistency to assigned anchor embedding
+            consistency_type = self.stage2_config.get('consistency_loss', 'cosine')
+            anchor_target = outputs['assigned_anchor_embeddings']
+            if consistency_type == 'l2':
+                alignment_loss = F.mse_loss(stage2_feat, anchor_target)
+            else:
+                alignment_loss = 1.0 - torch.cosine_similarity(stage2_feat, anchor_target, dim=1).mean()
+
+        total_loss = recon_weight * recon_loss + alignment_weight * alignment_loss
+
+        return {
+            'loss': total_loss,
+            'loss_recon': recon_loss,
+            'loss_consistency': alignment_loss,   # keep key name for history compat
+            'loss_alignment': alignment_loss,
+        }
+
     def _prepare_tsne_samples(self, normal_count: int = 500, anomaly_count: int = 100):
         """Collect a fixed pool of samples for visualization (CPU tensors)."""
         # No longer used - we visualize ALL training samples instead
         return None
 
-    def _visualize_training_samples(self, epoch: int, max_samples: int = 2000, max_lines_per_anchor: int = 150):
+    def _visualize_training_samples(
+        self,
+        epoch: int,
+        max_samples: int = 2000,
+        max_lines_per_anchor: int = 150,
+        save_name: Optional[str] = None
+    ):
         """
         Visualize ALL training samples with lines to their assigned anchors.
         Uses both t-SNE and PCA projections.
@@ -183,7 +253,14 @@ class Trainer:
         # Combine for dimensionality reduction
         all_points = np.vstack([emb_np, anc_np])
         
-        colors = plt.cm.tab10(np.linspace(0, 1, n_anchors))
+        colors = plt.cm.tab10(np.linspace(0, 1, min(n_anchors, 10)))
+
+        # Adaptive visualization for large number of anchors
+        large_anchor_mode = n_anchors > 64
+        top_anchor_k = min(24, n_anchors)
+        anchor_counts = np.bincount(assign_np, minlength=n_anchors)
+        top_anchor_ids = np.argsort(anchor_counts)[::-1][:top_anchor_k]
+        top_anchor_set = set(top_anchor_ids.tolist())
         
         fig, axes = plt.subplots(1, 2, figsize=(16, 7))
         
@@ -196,36 +273,64 @@ class Trainer:
         sample_coords = coords_2d[:n_samples]
         anchor_coords = coords_2d[n_samples:]
         
-        # Draw lines from samples to their assigned anchors
-        for k in range(n_anchors):
-            mask = assign_np == k
-            indices = np.where(mask)[0]
-            if len(indices) > max_lines_per_anchor:
-                indices = np.random.choice(indices, max_lines_per_anchor, replace=False)
-            for idx in indices:
-                ax.plot(
-                    [sample_coords[idx, 0], anchor_coords[k, 0]],
-                    [sample_coords[idx, 1], anchor_coords[k, 1]],
-                    c=colors[k], alpha=0.15, linewidth=0.5, zorder=1
-                )
-        
-        # Plot samples colored by assignment
-        for k in range(n_anchors):
-            mask = assign_np == k
-            count = mask.sum()
-            if count > 0:
-                ax.scatter(sample_coords[mask, 0], sample_coords[mask, 1], 
-                          c=[colors[k]], s=15, alpha=0.6, label=f'Anchor {k} (n={count})', zorder=2)
-        
-        # Plot anchors (big stars)
-        for k in range(n_anchors):
-            ax.scatter(anchor_coords[k, 0], anchor_coords[k, 1],
-                      c=[colors[k]], s=500, marker='*', edgecolors='black', linewidths=2, zorder=10)
-            ax.annotate(f'A{k}', (anchor_coords[k, 0], anchor_coords[k, 1]),
-                       fontsize=12, fontweight='bold', ha='center', va='center', zorder=11)
+        if large_anchor_mode:
+            # Samples in neutral color to reduce clutter
+            ax.scatter(sample_coords[:, 0], sample_coords[:, 1], c='steelblue', s=10, alpha=0.35, label=f'Samples (N={n_samples})', zorder=2)
+
+            # Plot all anchors as small gray points
+            ax.scatter(anchor_coords[:, 0], anchor_coords[:, 1], c='black', s=10, alpha=0.35, marker='o', label=f'All anchors (K={n_anchors})', zorder=3)
+
+            # Highlight top-used anchors only
+            for rank, k in enumerate(top_anchor_ids):
+                color = colors[rank % len(colors)]
+                ax.scatter(anchor_coords[k, 0], anchor_coords[k, 1], c=[color], s=220, marker='*', edgecolors='black', linewidths=1.0, zorder=8)
+                if rank < 12:
+                    ax.annotate(f'A{k}', (anchor_coords[k, 0], anchor_coords[k, 1]), fontsize=9, fontweight='bold', ha='center', va='center', zorder=9)
+
+            # Draw assignment lines only for top-used anchors (sparsified)
+            for rank, k in enumerate(top_anchor_ids):
+                color = colors[rank % len(colors)]
+                mask = assign_np == k
+                indices = np.where(mask)[0]
+                if len(indices) > max_lines_per_anchor:
+                    indices = np.random.choice(indices, max_lines_per_anchor, replace=False)
+                for idx in indices:
+                    ax.plot(
+                        [sample_coords[idx, 0], anchor_coords[k, 0]],
+                        [sample_coords[idx, 1], anchor_coords[k, 1]],
+                        c=color, alpha=0.10, linewidth=0.4, zorder=1
+                    )
+        else:
+            # Draw lines from samples to their assigned anchors
+            for k in range(n_anchors):
+                mask = assign_np == k
+                indices = np.where(mask)[0]
+                if len(indices) > max_lines_per_anchor:
+                    indices = np.random.choice(indices, max_lines_per_anchor, replace=False)
+                for idx in indices:
+                    ax.plot(
+                        [sample_coords[idx, 0], anchor_coords[k, 0]],
+                        [sample_coords[idx, 1], anchor_coords[k, 1]],
+                        c=colors[k % len(colors)], alpha=0.15, linewidth=0.5, zorder=1
+                    )
+
+            # Plot samples colored by assignment
+            for k in range(n_anchors):
+                mask = assign_np == k
+                count = mask.sum()
+                if count > 0:
+                    ax.scatter(sample_coords[mask, 0], sample_coords[mask, 1], c=[colors[k % len(colors)]], s=15, alpha=0.6, label=f'Anchor {k} (n={count})', zorder=2)
+
+            # Plot anchors (big stars)
+            for k in range(n_anchors):
+                ax.scatter(anchor_coords[k, 0], anchor_coords[k, 1], c=[colors[k % len(colors)]], s=500, marker='*', edgecolors='black', linewidths=2, zorder=10)
+                ax.annotate(f'A{k}', (anchor_coords[k, 0], anchor_coords[k, 1]), fontsize=12, fontweight='bold', ha='center', va='center', zorder=11)
         
         ax.set_title(f't-SNE (N={n_samples})', fontsize=13, fontweight='bold')
-        ax.legend(fontsize=8, loc='upper right')
+        if large_anchor_mode:
+            ax.legend(fontsize=9, loc='upper right')
+        else:
+            ax.legend(fontsize=8, loc='upper right')
         ax.grid(True, alpha=0.3)
         
         # === Plot 2: PCA ===
@@ -236,33 +341,53 @@ class Trainer:
         sample_pca = coords_pca[:n_samples]
         anchor_pca = coords_pca[n_samples:]
         
-        # Draw lines
-        for k in range(n_anchors):
-            mask = assign_np == k
-            indices = np.where(mask)[0]
-            if len(indices) > max_lines_per_anchor:
-                indices = np.random.choice(indices, max_lines_per_anchor, replace=False)
-            for idx in indices:
-                ax.plot(
-                    [sample_pca[idx, 0], anchor_pca[k, 0]],
-                    [sample_pca[idx, 1], anchor_pca[k, 1]],
-                    c=colors[k], alpha=0.15, linewidth=0.5, zorder=1
-                )
-        
-        # Plot samples
-        for k in range(n_anchors):
-            mask = assign_np == k
-            count = mask.sum()
-            if count > 0:
-                ax.scatter(sample_pca[mask, 0], sample_pca[mask, 1],
-                          c=[colors[k]], s=15, alpha=0.6, label=f'Anchor {k} (n={count})', zorder=2)
-        
-        # Plot anchors
-        for k in range(n_anchors):
-            ax.scatter(anchor_pca[k, 0], anchor_pca[k, 1],
-                      c=[colors[k]], s=500, marker='*', edgecolors='black', linewidths=2, zorder=10)
-            ax.annotate(f'A{k}', (anchor_pca[k, 0], anchor_pca[k, 1]),
-                       fontsize=12, fontweight='bold', ha='center', va='center', zorder=11)
+        if large_anchor_mode:
+            ax.scatter(sample_pca[:, 0], sample_pca[:, 1], c='steelblue', s=10, alpha=0.35, label=f'Samples (N={n_samples})', zorder=2)
+            ax.scatter(anchor_pca[:, 0], anchor_pca[:, 1], c='black', s=10, alpha=0.35, marker='o', label=f'All anchors (K={n_anchors})', zorder=3)
+
+            for rank, k in enumerate(top_anchor_ids):
+                color = colors[rank % len(colors)]
+                ax.scatter(anchor_pca[k, 0], anchor_pca[k, 1], c=[color], s=220, marker='*', edgecolors='black', linewidths=1.0, zorder=8)
+                if rank < 12:
+                    ax.annotate(f'A{k}', (anchor_pca[k, 0], anchor_pca[k, 1]), fontsize=9, fontweight='bold', ha='center', va='center', zorder=9)
+
+            for rank, k in enumerate(top_anchor_ids):
+                color = colors[rank % len(colors)]
+                mask = assign_np == k
+                indices = np.where(mask)[0]
+                if len(indices) > max_lines_per_anchor:
+                    indices = np.random.choice(indices, max_lines_per_anchor, replace=False)
+                for idx in indices:
+                    ax.plot(
+                        [sample_pca[idx, 0], anchor_pca[k, 0]],
+                        [sample_pca[idx, 1], anchor_pca[k, 1]],
+                        c=color, alpha=0.10, linewidth=0.4, zorder=1
+                    )
+        else:
+            # Draw lines
+            for k in range(n_anchors):
+                mask = assign_np == k
+                indices = np.where(mask)[0]
+                if len(indices) > max_lines_per_anchor:
+                    indices = np.random.choice(indices, max_lines_per_anchor, replace=False)
+                for idx in indices:
+                    ax.plot(
+                        [sample_pca[idx, 0], anchor_pca[k, 0]],
+                        [sample_pca[idx, 1], anchor_pca[k, 1]],
+                        c=colors[k % len(colors)], alpha=0.15, linewidth=0.5, zorder=1
+                    )
+
+            # Plot samples
+            for k in range(n_anchors):
+                mask = assign_np == k
+                count = mask.sum()
+                if count > 0:
+                    ax.scatter(sample_pca[mask, 0], sample_pca[mask, 1], c=[colors[k % len(colors)]], s=15, alpha=0.6, label=f'Anchor {k} (n={count})', zorder=2)
+
+            # Plot anchors
+            for k in range(n_anchors):
+                ax.scatter(anchor_pca[k, 0], anchor_pca[k, 1], c=[colors[k % len(colors)]], s=500, marker='*', edgecolors='black', linewidths=2, zorder=10)
+                ax.annotate(f'A{k}', (anchor_pca[k, 0], anchor_pca[k, 1]), fontsize=12, fontweight='bold', ha='center', va='center', zorder=11)
         
         # Mark origin
         ax.axhline(y=0, color='red', linestyle='--', alpha=0.3)
@@ -270,15 +395,20 @@ class Trainer:
         ax.scatter([0], [0], c='red', s=100, marker='x', zorder=5, label='Origin')
         
         ax.set_title(f'PCA (N={n_samples})', fontsize=13, fontweight='bold')
-        ax.legend(fontsize=8, loc='upper right')
+        if large_anchor_mode:
+            ax.legend(fontsize=9, loc='upper right')
+        else:
+            ax.legend(fontsize=8, loc='upper right')
         ax.grid(True, alpha=0.3)
         
-        plt.suptitle(f'Training Samples - Epoch {epoch}', fontsize=14, fontweight='bold')
+        title_suffix = save_name if save_name is not None else f'Epoch {epoch}'
+        plt.suptitle(f'Training Samples - {title_suffix}', fontsize=14, fontweight='bold')
         plt.tight_layout()
-        plt.savefig(save_dir / f'train_epoch_{epoch:03d}.png', dpi=150, bbox_inches='tight')
+        output_name = save_name if save_name is not None else f'train_epoch_{epoch:03d}'
+        plt.savefig(save_dir / f'{output_name}.png', dpi=150, bbox_inches='tight')
         plt.close()
-        
-        print(f"    Saved: {save_dir / f'train_epoch_{epoch:03d}.png'}")
+
+        print(f"    Saved: {save_dir / f'{output_name}.png'}")
 
     def _visualize_test_samples(self, test_loader: DataLoader, save_name: str = 'test_final'):
         """
@@ -299,6 +429,7 @@ class Trainer:
         all_embeddings = []
         all_labels = []  # 0=normal, 1=anomaly
         all_distances = []  # Distance to nearest anchor
+        all_assignments = []
         
         with torch.no_grad():
             anchor_global, _ = self.model._get_projected_anchors()
@@ -311,14 +442,17 @@ class Trainer:
                 embeddings = outputs['global_feat']
                 distances = outputs['global_distances']
                 min_dist = distances.min(dim=1)[0]  # Distance to nearest anchor
+                assigned = distances.argmin(dim=1)
                 
                 all_embeddings.append(embeddings.cpu())
                 all_labels.append(labels)
                 all_distances.append(min_dist.cpu())
+                all_assignments.append(assigned.cpu())
         
         all_embeddings = torch.cat(all_embeddings, dim=0)
         all_labels = torch.cat(all_labels, dim=0)
         all_distances = torch.cat(all_distances, dim=0)
+        all_assignments = torch.cat(all_assignments, dim=0)
         anchors = anchor_global.cpu()
         
         n_samples = all_embeddings.shape[0]
@@ -330,6 +464,12 @@ class Trainer:
         anc_np = anchors.numpy()
         labels_np = all_labels.numpy()
         distances_np = all_distances.numpy()
+        assignments_np = all_assignments.numpy()
+
+        large_anchor_mode = n_anchors > 64
+        top_anchor_k = min(24, n_anchors)
+        anchor_counts = np.bincount(assignments_np, minlength=n_anchors)
+        top_anchor_ids = np.argsort(anchor_counts)[::-1][:top_anchor_k]
         
         # Combine for dimensionality reduction
         all_points = np.vstack([emb_np, anc_np])
@@ -339,7 +479,7 @@ class Trainer:
         # Colors for normal/anomaly
         normal_color = 'steelblue'
         anomaly_color = 'crimson'
-        anchor_colors = plt.cm.tab10(np.linspace(0, 1, n_anchors))
+        anchor_colors = plt.cm.tab10(np.linspace(0, 1, min(n_anchors, 10)))
         
         # === Plot 1: t-SNE ===
         ax = axes[0]
@@ -360,12 +500,18 @@ class Trainer:
         ax.scatter(sample_coords[anomaly_mask, 0], sample_coords[anomaly_mask, 1], 
                   c=anomaly_color, s=15, alpha=0.5, label=f'Anomaly (n={n_anomaly})', zorder=3)
         
-        # Plot anchors (big stars)
-        for k in range(n_anchors):
-            ax.scatter(anchor_coords[k, 0], anchor_coords[k, 1],
-                      c=[anchor_colors[k]], s=500, marker='*', edgecolors='black', linewidths=2, zorder=10)
-            ax.annotate(f'A{k}', (anchor_coords[k, 0], anchor_coords[k, 1]),
-                       fontsize=12, fontweight='bold', ha='center', va='center', zorder=11)
+        if large_anchor_mode:
+            ax.scatter(anchor_coords[:, 0], anchor_coords[:, 1], c='black', s=10, alpha=0.35, marker='o', label=f'All anchors (K={n_anchors})', zorder=4)
+            for rank, k in enumerate(top_anchor_ids):
+                color = anchor_colors[rank % len(anchor_colors)]
+                ax.scatter(anchor_coords[k, 0], anchor_coords[k, 1], c=[color], s=220, marker='*', edgecolors='black', linewidths=1.0, zorder=10)
+                if rank < 12:
+                    ax.annotate(f'A{k}', (anchor_coords[k, 0], anchor_coords[k, 1]), fontsize=9, fontweight='bold', ha='center', va='center', zorder=11)
+        else:
+            # Plot anchors (big stars)
+            for k in range(n_anchors):
+                ax.scatter(anchor_coords[k, 0], anchor_coords[k, 1], c=[anchor_colors[k % len(anchor_colors)]], s=500, marker='*', edgecolors='black', linewidths=2, zorder=10)
+                ax.annotate(f'A{k}', (anchor_coords[k, 0], anchor_coords[k, 1]), fontsize=12, fontweight='bold', ha='center', va='center', zorder=11)
         
         ax.set_title(f't-SNE (N={n_samples})', fontsize=13, fontweight='bold')
         ax.legend(fontsize=10, loc='upper right')
@@ -387,12 +533,18 @@ class Trainer:
         ax.scatter(sample_pca[anomaly_mask, 0], sample_pca[anomaly_mask, 1], 
                   c=anomaly_color, s=15, alpha=0.5, label=f'Anomaly (n={n_anomaly})', zorder=3)
         
-        # Plot anchors
-        for k in range(n_anchors):
-            ax.scatter(anchor_pca[k, 0], anchor_pca[k, 1],
-                      c=[anchor_colors[k]], s=500, marker='*', edgecolors='black', linewidths=2, zorder=10)
-            ax.annotate(f'A{k}', (anchor_pca[k, 0], anchor_pca[k, 1]),
-                       fontsize=12, fontweight='bold', ha='center', va='center', zorder=11)
+        if large_anchor_mode:
+            ax.scatter(anchor_pca[:, 0], anchor_pca[:, 1], c='black', s=10, alpha=0.35, marker='o', label=f'All anchors (K={n_anchors})', zorder=4)
+            for rank, k in enumerate(top_anchor_ids):
+                color = anchor_colors[rank % len(anchor_colors)]
+                ax.scatter(anchor_pca[k, 0], anchor_pca[k, 1], c=[color], s=220, marker='*', edgecolors='black', linewidths=1.0, zorder=10)
+                if rank < 12:
+                    ax.annotate(f'A{k}', (anchor_pca[k, 0], anchor_pca[k, 1]), fontsize=9, fontweight='bold', ha='center', va='center', zorder=11)
+        else:
+            # Plot anchors
+            for k in range(n_anchors):
+                ax.scatter(anchor_pca[k, 0], anchor_pca[k, 1], c=[anchor_colors[k % len(anchor_colors)]], s=500, marker='*', edgecolors='black', linewidths=2, zorder=10)
+                ax.annotate(f'A{k}', (anchor_pca[k, 0], anchor_pca[k, 1]), fontsize=12, fontweight='bold', ha='center', va='center', zorder=11)
         
         # Mark origin
         ax.axhline(y=0, color='gray', linestyle='--', alpha=0.3)
@@ -715,6 +867,198 @@ class Trainer:
         val_metrics = {**val_loss_metrics, **auroc_metrics}
         
         return val_metrics
+
+    def train_epoch_stage2(self) -> Dict[str, float]:
+        """Train one epoch for stage-2 reconstruction branch."""
+        self.model.train()
+        # Ensure frozen projection stays in eval mode
+        if hasattr(self.model, 'frozen_projection') and self.model.frozen_projection is not None:
+            self.model.frozen_projection.eval()
+
+        epoch_metrics = {
+            'loss': 0.0,
+            'loss_recon': 0.0,
+            'loss_consistency': 0.0,
+            'pixel_residual_mean': 0.0,
+            'pixel_residual_max': 0.0,
+            'bottleneck_divergence_mean': 0.0,
+        }
+
+        # Lazy-init pixel stats tracker
+        if self.pixel_stats_tracker is None:
+            from pixel_aggregation import PixelStatsTracker
+            self.pixel_stats_tracker = PixelStatsTracker()
+
+        pbar = tqdm(self.train_loader, desc=f'Stage2 Epoch {self.epoch}')
+        for batch_idx, batch in enumerate(pbar):
+            images = batch['image'].to(self.device)
+            self.optimizer.zero_grad()
+
+            if self.use_amp:
+                with autocast('cuda'):
+                    outputs = self.model(images, return_dense=False)
+                    loss_dict = self._compute_stage2_losses(outputs, images)
+                    loss = loss_dict['loss']
+
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                outputs = self.model(images, return_dense=False)
+                loss_dict = self._compute_stage2_losses(outputs, images)
+                loss = loss_dict['loss']
+                loss.backward()
+                self.optimizer.step()
+
+            epoch_metrics['loss'] += float(loss_dict['loss'].item())
+            epoch_metrics['loss_recon'] += float(loss_dict['loss_recon'].item())
+            epoch_metrics['loss_consistency'] += float(loss_dict['loss_consistency'].item())
+
+            if outputs.get('reconstruction_pixel_map') is not None:
+                pmap = outputs['reconstruction_pixel_map']
+                epoch_metrics['pixel_residual_mean'] += float(pmap.mean().item())
+                epoch_metrics['pixel_residual_max'] += float(pmap.max().item())
+                self.pixel_stats_tracker.update(pmap)
+
+            if outputs.get('bottleneck_divergence') is not None:
+                epoch_metrics['bottleneck_divergence_mean'] += float(outputs['bottleneck_divergence'].mean().item())
+
+            if batch_idx % self.log_interval == 0:
+                postfix = {
+                    'loss': f"{loss_dict['loss'].item():.4f}",
+                    'recon': f"{loss_dict['loss_recon'].item():.4f}",
+                    'align': f"{loss_dict['loss_consistency'].item():.4f}",
+                }
+                if outputs.get('reconstruction_pixel_map') is not None:
+                    postfix['pix_mean'] = f"{outputs['reconstruction_pixel_map'].mean().item():.4f}"
+                if outputs.get('bottleneck_divergence') is not None:
+                    postfix['div'] = f"{outputs['bottleneck_divergence'].mean().item():.4f}"
+                pbar.set_postfix(postfix)
+
+            self.global_step += 1
+
+        num_batches = len(self.train_loader)
+        for key in epoch_metrics:
+            epoch_metrics[key] /= num_batches
+        return epoch_metrics
+
+    def validate_stage2(self) -> Dict[str, float]:
+        """Validate stage-2 with reconstruction losses, divergence, and separate AUROCs."""
+        self.model.eval()
+        val_loss = {'loss': 0.0, 'loss_recon': 0.0, 'loss_consistency': 0.0}
+
+        all_labels = []
+        all_anchor_scores = []
+        all_recon_scores = []
+        all_divergence_scores = []
+        all_pixel_aggregated = []
+        all_recon_pixel_scores = []
+        all_pixel_masks = []
+
+        with torch.no_grad():
+            for batch in self.val_loader:
+                images = batch['image'].to(self.device)
+                labels = batch['label'].cpu().numpy()
+
+                outputs = self.model(images, return_dense=False)
+                loss_dict = self._compute_stage2_losses(outputs, images)
+
+                val_loss['loss'] += float(loss_dict['loss'].item())
+                val_loss['loss_recon'] += float(loss_dict['loss_recon'].item())
+                val_loss['loss_consistency'] += float(loss_dict['loss_consistency'].item())
+
+                scores = self.model.compute_anomaly_scores(images, return_maps=True, target_size=images.shape[-2:])
+                all_labels.append(labels)
+                all_anchor_scores.append(scores['anchor_scores'].cpu().numpy())
+                if 'reconstruction_scores' in scores:
+                    all_recon_scores.append(scores['reconstruction_scores'].cpu().numpy())
+                if 'bottleneck_divergence' in scores:
+                    all_divergence_scores.append(scores['bottleneck_divergence'].cpu().numpy())
+                if 'pixel_aggregated_score' in scores:
+                    all_pixel_aggregated.append(scores['pixel_aggregated_score'].cpu().numpy())
+                if 'reconstruction_pixel_scores' in scores:
+                    all_recon_pixel_scores.append(scores['reconstruction_pixel_scores'].cpu().numpy())
+                if 'mask' in batch:
+                    all_pixel_masks.append(batch['mask'].cpu().numpy())
+
+        num_batches = len(self.val_loader)
+        for key in val_loss:
+            val_loss[key] /= num_batches
+
+        labels = np.concatenate(all_labels)
+        anchor_scores = np.concatenate(all_anchor_scores)
+
+        metrics = {
+            **val_loss,
+            'anchor_image_auroc': roc_auc_score(labels, anchor_scores)
+        }
+
+        if len(all_recon_scores) > 0:
+            recon_scores = np.concatenate(all_recon_scores)
+            metrics['reconstruction_image_auroc'] = roc_auc_score(labels, recon_scores)
+            metrics['reconstruction_image_aupr'] = average_precision_score(labels, recon_scores)
+
+        if len(all_divergence_scores) > 0:
+            div_scores = np.concatenate(all_divergence_scores)
+            try:
+                metrics['divergence_image_auroc'] = roc_auc_score(labels, div_scores)
+            except ValueError:
+                pass  # single class
+
+        if len(all_pixel_aggregated) > 0:
+            pix_agg = np.concatenate(all_pixel_aggregated)
+            try:
+                metrics['pixel_aggregated_image_auroc'] = roc_auc_score(labels, pix_agg)
+            except ValueError:
+                pass
+
+        # Three-signal combined AUROC for early stopping
+        if len(all_divergence_scores) > 0 and len(all_pixel_aggregated) > 0:
+            from pixel_aggregation import aggregate_pixel_scores_numpy
+            div_scores = np.concatenate(all_divergence_scores)
+            pix_agg = np.concatenate(all_pixel_aggregated)
+            # minmax normalise each
+            def _mm(arr):
+                lo, hi = arr.min(), arr.max()
+                return (arr - lo) / max(hi - lo, 1e-12)
+            w = self.model.score_fusion_anchor_weight if hasattr(self.model, 'score_fusion_anchor_weight') else 0.4
+            wd = self.model.score_fusion_divergence_weight if hasattr(self.model, 'score_fusion_divergence_weight') else 0.3
+            wp = self.model.score_fusion_pixel_weight if hasattr(self.model, 'score_fusion_pixel_weight') else 0.3
+            combined = w * _mm(anchor_scores) + wd * _mm(div_scores) + wp * _mm(pix_agg)
+            try:
+                metrics['combined_image_auroc'] = roc_auc_score(labels, combined)
+            except ValueError:
+                pass
+
+        pixel_metrics_enabled = self.stage2_config.get('pixel_metrics', {}).get('enabled', True)
+        if pixel_metrics_enabled and len(all_recon_pixel_scores) > 0 and len(all_pixel_masks) > 0:
+            try:
+                recon_pixel_scores = np.concatenate(all_recon_pixel_scores)
+                pixel_masks = np.concatenate(all_pixel_masks)
+
+                if recon_pixel_scores.shape[1:] != pixel_masks.shape[1:]:
+                    from scipy.ndimage import zoom
+                    scale_h = pixel_masks.shape[1] / recon_pixel_scores.shape[1]
+                    scale_w = pixel_masks.shape[2] / recon_pixel_scores.shape[2]
+                    recon_pixel_scores = np.array([
+                        zoom(recon_pixel_scores[i], (scale_h, scale_w), order=1)
+                        for i in range(recon_pixel_scores.shape[0])
+                    ])
+
+                if recon_pixel_scores.shape[0] != pixel_masks.shape[0]:
+                    min_samples = min(recon_pixel_scores.shape[0], pixel_masks.shape[0])
+                    recon_pixel_scores = recon_pixel_scores[:min_samples]
+                    pixel_masks = pixel_masks[:min_samples]
+
+                scores_flat = recon_pixel_scores.flatten()
+                masks_flat = pixel_masks.flatten()
+                if masks_flat.sum() > 0:
+                    metrics['reconstruction_pixel_auroc'] = roc_auc_score(masks_flat, scores_flat)
+                    metrics['reconstruction_pixel_aupr'] = average_precision_score(masks_flat, scores_flat)
+            except Exception as e:
+                print(f"Warning: stage-2 reconstruction pixel metric computation failed: {e}")
+
+        return metrics
     
     def train(
         self,
@@ -839,8 +1183,8 @@ class Trainer:
                     self._save_tsne(epoch=epoch+1, final=True)
                     break
             
-            # Save regular checkpoint
-            if (epoch + 1) % 5 == 0:
+            # Save regular checkpoint (only if enabled)
+            if self.save_checkpoints and (epoch + 1) % 5 == 0:
                 self.save_checkpoint(f'checkpoint_epoch_{epoch+1}.pth')
                 self._save_tsne(epoch=epoch+1)
             
@@ -859,8 +1203,118 @@ class Trainer:
         self.plot_training_curves()
         self._save_tsne(epoch=self.epoch + 1, final=True)
         
+        # Create training summary
+        self._create_training_summary(num_epochs, early_stopping_patience)
+        
         print(f"\nTraining complete!")
         print(f"Best validation AUROC: {self.best_val_auroc:.4f}")
+
+    def train_stage2(
+        self,
+        num_epochs: int,
+        scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+        early_stopping_patience: int = 10
+    ):
+        """Stage-2 training loop (reconstruction branch)."""
+        print(f"Starting stage-2 reconstruction training for {num_epochs} epochs")
+        print(f"Device: {self.device}")
+        print(f"Stage-2 trainable parameters: {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}")
+        if self.model.use_frozen_bottleneck:
+            print(f"  Dual-bottleneck enabled (frozen → alignment loss)")
+
+        best_stage2_metric = -1e9
+        patience_counter = 0
+
+        for epoch in range(num_epochs):
+            self.epoch = epoch
+            start_time = time.time()
+
+            train_metrics = self.train_epoch_stage2()
+            val_metrics = self.validate_stage2() if (epoch + 1) % self.val_interval == 0 else {}
+
+            self.history.setdefault('stage2_train_loss', []).append(train_metrics['loss'])
+            self.history.setdefault('stage2_train_recon', []).append(train_metrics['loss_recon'])
+            self.history.setdefault('stage2_train_consistency', []).append(train_metrics['loss_consistency'])
+            if train_metrics.get('bottleneck_divergence_mean', 0) > 0:
+                self.history.setdefault('stage2_train_divergence', []).append(train_metrics['bottleneck_divergence_mean'])
+
+            print(f"\nStage-2 Epoch {epoch} Summary:")
+            print(f"  Train Loss: {train_metrics['loss']:.4f}")
+            print(f"    Reconstruction: {train_metrics['loss_recon']:.4f}")
+            print(f"    Alignment: {train_metrics['loss_consistency']:.4f}")
+            print(f"    Pixel Residual Mean/Max: {train_metrics['pixel_residual_mean']:.4f} / {train_metrics['pixel_residual_max']:.4f}")
+            if train_metrics.get('bottleneck_divergence_mean', 0) > 0:
+                print(f"    Bottleneck Divergence: {train_metrics['bottleneck_divergence_mean']:.4f}")
+
+            if val_metrics:
+                self.history.setdefault('stage2_val_loss', []).append(val_metrics['loss'])
+                self.history.setdefault('stage2_val_recon', []).append(val_metrics['loss_recon'])
+                self.history.setdefault('stage2_val_consistency', []).append(val_metrics['loss_consistency'])
+                self.history.setdefault('stage2_val_anchor_auroc', []).append(val_metrics['anchor_image_auroc'])
+
+                print(f"  Val Loss: {val_metrics['loss']:.4f}")
+                print(f"  Val Anchor AUROC: {val_metrics['anchor_image_auroc']:.4f}")
+                if 'reconstruction_image_auroc' in val_metrics:
+                    self.history.setdefault('stage2_val_recon_auroc', []).append(val_metrics['reconstruction_image_auroc'])
+                    print(f"  Val Reconstruction AUROC: {val_metrics['reconstruction_image_auroc']:.4f}")
+                if 'divergence_image_auroc' in val_metrics:
+                    self.history.setdefault('stage2_val_divergence_auroc', []).append(val_metrics['divergence_image_auroc'])
+                    print(f"  Val Divergence AUROC: {val_metrics['divergence_image_auroc']:.4f}")
+                if 'pixel_aggregated_image_auroc' in val_metrics:
+                    self.history.setdefault('stage2_val_pixel_agg_auroc', []).append(val_metrics['pixel_aggregated_image_auroc'])
+                    print(f"  Val Pixel-Aggregated AUROC: {val_metrics['pixel_aggregated_image_auroc']:.4f}")
+                if 'fused_image_auroc' in val_metrics:
+                    self.history.setdefault('stage2_val_fused_auroc', []).append(val_metrics['fused_image_auroc'])
+                    print(f"  Val Fused AUROC: {val_metrics['fused_image_auroc']:.4f}")
+                if 'combined_image_auroc' in val_metrics:
+                    self.history.setdefault('stage2_val_combined_auroc', []).append(val_metrics['combined_image_auroc'])
+                    print(f"  Val Combined (3-signal) AUROC: {val_metrics['combined_image_auroc']:.4f}")
+                if 'reconstruction_pixel_auroc' in val_metrics:
+                    self.history.setdefault('stage2_val_recon_pixel_auroc', []).append(val_metrics['reconstruction_pixel_auroc'])
+                    print(f"  Val Reconstruction Pixel AUROC: {val_metrics['reconstruction_pixel_auroc']:.4f}")
+
+                monitor_name = self.stage2_config.get('early_stopping_metric', 'pixel_aggregated_image_auroc')
+                if monitor_name not in val_metrics:
+                    # Fallback chain: pixel_agg → combined → recon → anchor
+                    for fallback in ['pixel_aggregated_image_auroc', 'combined_image_auroc', 'reconstruction_image_auroc', 'anchor_image_auroc']:
+                        if fallback in val_metrics:
+                            monitor_name = fallback
+                            break
+                current_metric = float(val_metrics.get(monitor_name, 0.0))
+
+                if current_metric > best_stage2_metric:
+                    best_stage2_metric = current_metric
+                    patience_counter = 0
+                    self.save_checkpoint('best_stage2_model.pth', val_metrics)
+                    print(f"  ✓ New best stage-2 metric ({monitor_name}): {best_stage2_metric:.4f}")
+                else:
+                    patience_counter += 1
+
+                if patience_counter >= early_stopping_patience:
+                    print(f"\nEarly stopping stage-2 after {epoch + 1} epochs")
+                    break
+
+            if scheduler is not None:
+                scheduler.step()
+
+            print(f"  Time: {time.time() - start_time:.1f}s")
+            print("-" * 80)
+
+        # Save pixel stats for threshold_ratio aggregation
+        if self.pixel_stats_tracker is not None:
+            pixel_stats_path = self.save_dir / 'pixel_stats.json'
+            import json as _json
+            with open(pixel_stats_path, 'w') as f:
+                stats = self.pixel_stats_tracker.state_dict()
+                stats['threshold_3std'] = self.pixel_stats_tracker.threshold(3.0)
+                stats['mean'] = self.pixel_stats_tracker.mean
+                stats['std'] = self.pixel_stats_tracker.std
+                _json.dump(stats, f, indent=2)
+            print(f"Saved pixel stats: mean={self.pixel_stats_tracker.mean:.6f}, std={self.pixel_stats_tracker.std:.6f}, threshold(3σ)={self.pixel_stats_tracker.threshold(3.0):.6f}")
+
+        self.save_checkpoint('final_stage2_model.pth')
+        self.save_history()
+        print("\nStage-2 training complete!")
     
     def save_checkpoint(self, filename: str, metrics: Optional[Dict] = None):
         """Save model checkpoint"""
@@ -926,6 +1380,60 @@ class Trainer:
         with open(history_path, 'w', encoding='utf-8') as f:
             json.dump(history_serializable, f, indent=2)
         print(f"Saved training history: {history_path}")
+    
+    def _create_training_summary(self, total_epochs: int, early_stopping_patience: int):
+        """Create a summary JSON file with training information and best model details"""
+        import json
+        
+        # Find best epoch based on validation AUROC
+        best_epoch = -1
+        best_auroc = 0.0
+        if len(self.history['val_image_auroc']) > 0:
+            val_aurocs = np.array(self.history['val_image_auroc'])
+            best_epoch = int(np.argmax(val_aurocs))
+            best_auroc = float(val_aurocs[best_epoch])
+        
+        # Determine if early stopping occurred
+        actual_epochs = len(self.history['epochs'])
+        early_stopped = actual_epochs < total_epochs
+        
+        summary = {
+            'training_completed': True,
+            'total_epochs_configured': total_epochs,
+            'actual_epochs_trained': actual_epochs,
+            'early_stopping_enabled': early_stopping_patience < 1000,
+            'early_stopping_patience': early_stopping_patience,
+            'early_stopped': early_stopped,
+            'best_model': {
+                'epoch': best_epoch + 1,  # 1-indexed for readability
+                'image_auroc': best_auroc,
+                'saved_as': 'best_model.pth',
+                'description': f'Best model achieved at epoch {best_epoch + 1} with image AUROC {best_auroc:.4f}'
+            },
+            'final_model': {
+                'epoch': actual_epochs,
+                'saved_as': 'final_model.pth',
+                'description': f'Final model after {actual_epochs} epochs'
+            },
+            'checkpoints_saved': self.save_checkpoints,
+            'model_files': ['best_model.pth', 'final_model.pth']
+        }
+        
+        # Add checkpoint files if they were saved
+        if self.save_checkpoints:
+            checkpoint_epochs = [e + 1 for e in range(actual_epochs) if (e + 1) % 5 == 0]
+            summary['model_files'].extend([f'checkpoint_epoch_{e}.pth' for e in checkpoint_epochs])
+        
+        summary_path = self.save_dir / 'training_summary.json'
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=2)
+        
+        print(f"\\nTraining Summary:")
+        print(f"  Best model: Epoch {best_epoch + 1}, AUROC {best_auroc:.4f}")
+        print(f"  Final model: Epoch {actual_epochs}")
+        if early_stopped:
+            print(f"  Early stopping triggered after {actual_epochs} epochs")
+        print(f"  Saved summary: {summary_path}")
     
     def plot_training_curves(self):
         """Plot and save training curves - simplified version"""

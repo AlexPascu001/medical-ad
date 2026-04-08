@@ -2,6 +2,14 @@ venv/
 output/
 data/
 *.pth
-!best_model.pth
+*.pth.*
+# !best_model.pth
+# !best_stage2_model.pth
+*.pt
+*.pkl
 *.png
 *.json
+*.log
+*.ps1
+__pycache__/
+*.pyc

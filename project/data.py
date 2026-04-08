@@ -16,8 +16,9 @@ from albumentations.pytorch import ToTensorV2
 class BMADPreprocessor:
     """Handles intensity normalization and preprocessing for FLAIR slices"""
     
-    def __init__(self, target_size: Tuple[int, int] = (240, 240)):
+    def __init__(self, target_size: Tuple[int, int] = (240, 240), normalize_mode: str = 'zscore_only'):
         self.target_size = target_size
+        self.normalize_mode = normalize_mode
         
     def clip_percentiles(self, img: np.ndarray, lower: float = 0.5, upper: float = 99.5) -> np.ndarray:
         """Clip intensity to percentile range to remove outliers"""
@@ -33,12 +34,23 @@ class BMADPreprocessor:
             return np.zeros_like(img)
         return (img - mean) / std
     
+    def scale_to_01(self, img: np.ndarray) -> np.ndarray:
+        """Min-max scale to [0, 1] range (for use before ImageNet normalization)"""
+        mn = img.min()
+        mx = img.max()
+        if mx - mn < 1e-8:
+            return np.zeros_like(img)
+        return (img - mn) / (mx - mn)
+    
     def preprocess(self, img: np.ndarray) -> np.ndarray:
         """Full preprocessing pipeline"""
         # Clip outliers
         img = self.clip_percentiles(img)
-        # Normalize
-        img = self.normalize_slice(img)
+        # Normalize (mode-dependent)
+        if self.normalize_mode == 'minmax_imagenet':
+            img = self.scale_to_01(img)
+        else:  # zscore_only (default / backward-compatible)
+            img = self.normalize_slice(img)
         # Resize
         if img.shape[:2] != self.target_size:
             img = cv2.resize(img, self.target_size, interpolation=cv2.INTER_LINEAR)
@@ -55,7 +67,8 @@ class BMADDataset(Dataset):
         mask_paths: Optional[List[str]] = None,
         preprocessor: Optional[BMADPreprocessor] = None,
         augment: bool = False,
-        is_training: bool = True
+        is_training: bool = True,
+        normalize_mode: str = 'zscore_only'
     ):
         """
         Args:
@@ -65,32 +78,37 @@ class BMADDataset(Dataset):
             preprocessor: BMADPreprocessor instance
             augment: Whether to apply data augmentation
             is_training: Training mode flag
+            normalize_mode: 'zscore_only' (z-score, no ImageNet norm) or
+                            'minmax_imagenet' (min-max [0,1] + ImageNet norm)
         """
         self.image_paths = image_paths
         self.labels = labels if labels is not None else [0] * len(image_paths)
         self.mask_paths = mask_paths
-        self.preprocessor = preprocessor or BMADPreprocessor()
+        self.preprocessor = preprocessor or BMADPreprocessor(normalize_mode=normalize_mode)
         self.is_training = is_training
         
-        # Setup augmentations
-        # Conservative augmentations for brain MRI (top-down slices with fixed position)
-        # Allowed: horizontal flip, small rotations (±5-15°), slight translations, small zoom (±10%)
-        # Prohibited: vertical flip, extreme rotations, cutout/erase, large shearing, color augmentations
+        # Build transform list
+        augment_ops = []
         if augment and is_training:
-            self.transform = A.Compose([
-                A.HorizontalFlip(p=0.5),  # Brain anatomy is symmetric
+            augment_ops = [
+                A.HorizontalFlip(p=0.5),
                 A.ShiftScaleRotate(
-                    shift_limit=0.05,      # Small translations (±5%)
-                    scale_limit=0.1,       # Zoom ±10%
-                    rotate_limit=10,       # Rotation ±10° (conservative)
+                    shift_limit=0.05,
+                    scale_limit=0.1,
+                    rotate_limit=10,
                     border_mode=cv2.BORDER_CONSTANT,
                     value=0,
                     p=0.5
                 ),
-                ToTensorV2()
-            ])
-        else:
-            self.transform = A.Compose([ToTensorV2()])
+            ]
+
+        # Only apply ImageNet normalization when preprocessor outputs [0,1] range
+        if normalize_mode == 'minmax_imagenet':
+            final_ops = [A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), ToTensorV2()]
+        else:  # zscore_only — data already z-score normalized, just convert to tensor
+            final_ops = [ToTensorV2()]
+
+        self.transform = A.Compose(augment_ops + final_ops)
     
     def __len__(self) -> int:
         return len(self.image_paths)
@@ -103,6 +121,10 @@ class BMADDataset(Dataset):
         
         # Preprocess
         img = self.preprocessor.preprocess(img)
+        
+        # Convert grayscale to 3-channel BEFORE transforms so that
+        # A.Normalize applies per-channel ImageNet stats correctly.
+        img = np.stack([img, img, img], axis=-1)  # (H, W) -> (H, W, 3)
         
         # Load mask if available
         mask = None
@@ -117,7 +139,7 @@ class BMADDataset(Dataset):
                         mask = cv2.resize(mask, self.preprocessor.target_size, interpolation=cv2.INTER_NEAREST)
                     mask = (mask > 0).astype(np.float32)
         
-        # Apply transforms
+        # Apply transforms (includes ImageNet normalization + ToTensorV2)
         if mask is not None:
             transformed = self.transform(image=img, mask=mask)
             img = transformed['image']
@@ -125,14 +147,6 @@ class BMADDataset(Dataset):
         else:
             transformed = self.transform(image=img)
             img = transformed['image']
-        
-        # Ensure channel dimension and convert to 3 channels for DINOv3
-        if img.ndim == 2:
-            img = img.unsqueeze(0)  # Add channel dim
-        
-        # Convert grayscale (1 channel) to RGB (3 channels) by repeating
-        if img.shape[0] == 1:
-            img = img.repeat(3, 1, 1)  # (1, H, W) -> (3, H, W)
         
         output = {
             'image': img,
@@ -160,7 +174,8 @@ def create_dataloaders(
     test_mask_paths: Optional[List[str]] = None,
     batch_size: int = 64,
     num_workers: int = 4,
-    target_size: Tuple[int, int] = (256, 256)
+    target_size: Tuple[int, int] = (256, 256),
+    normalize_mode: str = 'zscore_only'
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Create train/val/test dataloaders with proper preprocessing
@@ -176,11 +191,12 @@ def create_dataloaders(
         batch_size: Batch size
         num_workers: Number of dataloader workers
         target_size: Target image size (H, W)
+        normalize_mode: 'zscore_only' or 'minmax_imagenet'
     
     Returns:
         train_loader, val_loader, test_loader
     """
-    preprocessor = BMADPreprocessor(target_size=target_size)
+    preprocessor = BMADPreprocessor(target_size=target_size, normalize_mode=normalize_mode)
     
     # Training dataset (normal only, with augmentation)
     train_dataset = BMADDataset(
@@ -188,7 +204,8 @@ def create_dataloaders(
         labels=None,  # All normal
         preprocessor=preprocessor,
         augment=True,
-        is_training=True
+        is_training=True,
+        normalize_mode=normalize_mode
     )
     
     # Validation dataset
@@ -198,7 +215,8 @@ def create_dataloaders(
         mask_paths=val_mask_paths,
         preprocessor=preprocessor,
         augment=False,
-        is_training=False
+        is_training=False,
+        normalize_mode=normalize_mode
     )
     
     # Test dataset
@@ -208,7 +226,8 @@ def create_dataloaders(
         mask_paths=test_mask_paths,
         preprocessor=preprocessor,
         augment=False,
-        is_training=False
+        is_training=False,
+        normalize_mode=normalize_mode
     )
     
     # Create dataloaders

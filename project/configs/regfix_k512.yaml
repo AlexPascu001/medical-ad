@@ -1,0 +1,55 @@
+# Register-fix comparison: K=512, stage 1 only, trainable backbone
+# Compare against: experiments/reproject_k512_early_trainable_backbone (old: 0.7942 test AUROC)
+
+seed: 42
+output_dir: './experiments/regfix_k512'
+
+data:
+  data_root: './data/BraTS2021_slice'
+  target_size: [240, 240]
+  normalization: 'zscore_only'
+
+anchor:
+  strategy: 'kmeans'
+  n_components: 50
+  n_anchors: 512
+  max_images_for_pca: null
+  learnable: false
+  init_from: null
+  use_embedding_space: true
+  reproject_anchors: true
+
+model:
+  backbone: 'vit_small_patch16_dinov3.lvd1689m'
+  freeze_backbone: false
+  projection_dim: 128
+
+loss:
+  margin: 1.0
+  alpha: 1.0
+  beta: 0.5
+  gamma: 0.0
+  delta: 0.1
+  min_norm: 0.5
+  diversity_temperature: 0.1
+  distance_metric: 'euclidean'
+  use_dense: false
+  global_weight: 1.0
+  dense_weight: 0.5
+  spatial_reduction: 'mean'
+
+pretraining:
+  enabled: false
+
+training:
+  epochs: 100
+  batch_size: 64
+  num_workers: 4
+  lr: 0.0001
+  weight_decay: 0.0001
+  use_amp: true
+  log_interval: 50
+  val_interval: 1
+  early_stopping_patience: 10
+  fixed_pseudo_labels: true
+  save_checkpoints: false

@@ -7,6 +7,7 @@ import warnings
 import yaml
 import torch
 import numpy as np
+import copy
 from pathlib import Path
 import random
 
@@ -132,7 +133,91 @@ def load_config(config_path: str) -> dict:
     """Load configuration from YAML file"""
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
+
+    stage2_defaults = {
+        'enabled': False,
+        'epochs': 20,
+        'lr': 0.0001,
+        'weight_decay': 0.000001,
+        'freeze_encoder': True,
+        'freeze_anchors': True,
+        'freeze_anchor_target': True,
+        'recon_loss': 'mse',
+        'recon_weight': 1.0,
+        'consistency_loss': 'cosine',
+        'consistency_weight': 0.1,
+        'frozen_bottleneck': False,
+        'alignment_weight': 0.1,
+        'freeze_encoder_mode': 'full',
+        'unfreeze_last_n_blocks': 2,
+        'unfreeze_lr_multiplier': 0.1,
+        'early_stopping_patience': 10,
+        'early_stopping_metric': 'pixel_aggregated_image_auroc',
+        'pixel_map': {
+            'enabled': True,
+            'type': 'reconstruction_l2'
+        },
+        'pixel_metrics': {
+            'enabled': True
+        },
+        'score_combination': {
+            'enabled': False,
+            'alpha': 0.5,
+            'normalization': 'minmax'
+        },
+        'pixel_aggregation': {
+            'method': 'top_k_percentile',
+            'percentile': 95,
+            'threshold_n_std': 2.0
+        },
+        'score_fusion': {
+            'enabled': False,
+            'normalization': 'minmax',
+            'anchor_weight': 0.4,
+            'divergence_weight': 0.3,
+            'pixel_weight': 0.3
+        }
+    }
+
+    if 'stage2' not in config:
+        config['stage2'] = stage2_defaults
+    else:
+        stage2_cfg = config['stage2']
+        for key, value in stage2_defaults.items():
+            if isinstance(value, dict):
+                stage2_cfg.setdefault(key, {})
+                for sub_key, sub_value in value.items():
+                    stage2_cfg[key].setdefault(sub_key, sub_value)
+            else:
+                stage2_cfg.setdefault(key, value)
+
     return config
+
+
+def _validate_anchors(anchor_embeddings: torch.Tensor, margin: float = 1.0) -> None:
+    """Validate anchor quality: separation, duplicates, coverage."""
+    import warnings
+    K = anchor_embeddings.shape[0]
+    if K < 2:
+        return
+
+    dists = torch.cdist(anchor_embeddings.float(), anchor_embeddings.float(), p=2)
+    # Mask diagonal
+    off_diag = dists + torch.eye(K) * 1e12
+    min_sep = off_diag.min().item()
+    mean_sep = off_diag[off_diag < 1e11].mean().item()
+
+    print(f"\n  Anchor quality check (K={K}):")
+    print(f"    Min pairwise distance : {min_sep:.4f}")
+    print(f"    Mean pairwise distance: {mean_sep:.4f}")
+    print(f"    Margin (2m target)    : {2 * margin:.4f}")
+
+    if min_sep < 1e-4:
+        warnings.warn(f"DUPLICATE ANCHORS detected: min distance = {min_sep:.6f}. "
+                       "Two or more anchors are nearly identical.")
+    elif min_sep < margin:
+        warnings.warn(f"Low anchor separation: {min_sep:.4f} < margin {margin:.4f}. "
+                       "Repeller loss will need to push these apart.")
 
 
 def prepare_anchors_in_embedding_space(
@@ -144,13 +229,13 @@ def prepare_anchors_in_embedding_space(
     device: torch.device
 ) -> tuple:
     """
-    Generate anchors in 384D DINOv3 embedding space (SOLUTION A).
+    Generate anchors in DINOv3 embedding space (SOLUTION A).
     
     This is the CORRECT approach:
-    1. Extract 384D DINOv3 embeddings for all training images
-    2. Run k-means in 384D semantic space (not random pixel space)
+    1. Extract DINOv3 embeddings for all training images
+    2. Run k-means in semantic space (not random pixel space)
     3. Select anchor images corresponding to cluster centers
-    4. Store anchors in RAW 384D space (NOT projected)
+    4. Store anchors in RAW embedding space (NOT projected)
     5. Anchors will be re-projected each forward pass (moving with projection head)
     
     This ensures:
@@ -158,14 +243,15 @@ def prepare_anchors_in_embedding_space(
     - Anchors and samples always in same embedding space
     - No mismatch between anchor positions and projection learning
     """
+    embed_dim = backbone.embed_dim
     print("\n" + "="*80)
-    print("ANCHOR GENERATION IN 384D DINOV3 EMBEDDING SPACE (SOLUTION A)")
+    print(f"ANCHOR GENERATION IN {embed_dim}D DINOV3 EMBEDDING SPACE (SOLUTION A)")
     print("="*80)
     print("Strategy: Semantic clustering in frozen DINOv3 space")
-    print("  1. Extract 384D embeddings for training images")
-    print("  2. Run k-means/eigenface in 384D space")
+    print(f"  1. Extract {embed_dim}D embeddings for training images")
+    print(f"  2. Run k-means/eigenface in {embed_dim}D space")
     print("  3. Select images closest to cluster centers")
-    print("  4. Store in RAW 384D (re-project each forward)")
+    print(f"  4. Store in RAW {embed_dim}D (re-project each forward)")
     
     # Load training images
     max_images = config['anchor'].get('max_images_for_pca', 5000)
@@ -190,8 +276,8 @@ def prepare_anchors_in_embedding_space(
     images_np = np.array(images_list)
     print(f"Loaded {len(images_np)} images, shape: {images_np.shape}")
     
-    # Extract 384D DINOv3 embeddings (frozen backbone, NO projection)
-    print(f"\nExtracting 384D DINOv3 embeddings...")
+    # Extract DINOv3 embeddings (frozen backbone, NO projection)
+    print(f"\nExtracting {embed_dim}D DINOv3 embeddings...")
     backbone.eval()
     embeddings_384d_list = []
     
@@ -200,29 +286,31 @@ def prepare_anchors_in_embedding_space(
         for i in range(0, len(images_np), batch_size):
             batch_imgs = images_np[i:i+batch_size]
             
-            # Convert to tensor (B, H, W) -> (B, 1, H, W) -> (B, 3, H, W)
-            batch_tensor = torch.from_numpy(batch_imgs).float().unsqueeze(1).repeat(1, 3, 1, 1)
-            batch_tensor = batch_tensor.to(device)
+            # Convert to 3-channel tensor (must match BMADDataset preprocessing)
+            from anchors import _grayscale_batch_to_tensor
+            _norm_mode = config['data'].get('normalization', 'zscore_only')
+            batch_tensor = _grayscale_batch_to_tensor(batch_imgs, device,
+                                                       apply_imagenet_norm=(_norm_mode == 'minmax_imagenet'))
             
-            # Extract RAW DINOv3 features (384D, CLS token)
+            # Extract RAW DINOv3 features (CLS token)
             features = backbone.backbone.forward_features(batch_tensor)
-            cls_tokens = features[:, 0]  # (B, 384)
+            cls_tokens = features[:, 0]  # (B, embed_dim)
             
             embeddings_384d_list.append(cls_tokens.cpu())
     
-    embeddings_384d = torch.cat(embeddings_384d_list, dim=0)  # (N, 384)
+    embeddings_384d = torch.cat(embeddings_384d_list, dim=0)  # (N, embed_dim)
     print(f"✓ Extracted embeddings: {embeddings_384d.shape}")
     
-    # Run clustering in 384D space
+    # Run clustering in embedding space
     strategy_name = config['anchor']['strategy']
     n_anchors = config['anchor']['n_anchors']
-    print(f"\nClustering in 384D space: strategy={strategy_name}, n_anchors={n_anchors}")
+    print(f"\nClustering in {embed_dim}D space: strategy={strategy_name}, n_anchors={n_anchors}")
     
     if strategy_name == 'kmeans':
         from sklearn.cluster import KMeans
         kmeans = KMeans(n_clusters=n_anchors, random_state=config['seed'], n_init=10)
         labels = kmeans.fit_predict(embeddings_384d.numpy())
-        centroids_384d = kmeans.cluster_centers_  # (K, 384)
+        centroids_384d = kmeans.cluster_centers_  # (K, embed_dim)
         
         # Select images closest to each centroid
         anchor_indices = []
@@ -251,7 +339,7 @@ def prepare_anchors_in_embedding_space(
         from sklearn.decomposition import PCA
         
         n_components = config['anchor'].get('n_components', 50)
-        print(f"  Running PCA: 384D -> {n_components}D...")
+        print(f"  Running PCA: {embed_dim}D -> {n_components}D...")
         pca = PCA(n_components=n_components, random_state=config['seed'])
         embeddings_pca = pca.fit_transform(embeddings_384d.numpy())
         print(f"  Explained variance: {pca.explained_variance_ratio_.sum():.2%}")
@@ -289,7 +377,12 @@ def prepare_anchors_in_embedding_space(
     # EXPERT'S APPROACH: Create FIXED geometric targets in 128D projection space
     # SOLUTION A: Skip this step - will re-project anchors each forward instead
     reproject_anchors = config['anchor'].get('reproject_anchors', False)
-    projection_dim = config['model'].get('projection_dim', None)
+
+    # --- Anchor Quality Validation ---
+    _validate_anchors(anchor_embeddings_384d, margin=config['loss'].get('margin', 1.0))
+
+    projection_hidden_dims = config['model'].get('projection_hidden_dims', None)
+    projection_dim = projection_hidden_dims[-1] if projection_hidden_dims is not None else config['model'].get('projection_dim', None)
     
     if projection_dim and not reproject_anchors:
         print(f"\n{'='*80}")
@@ -325,7 +418,7 @@ def prepare_anchors_in_embedding_space(
         print(f"\n{'='*80}")
         print("SOLUTION A: Anchors will be RE-PROJECTED each forward pass")
         print(f"{'='*80}")
-        print(f"  Semantic anchors (384D): {anchor_embeddings_384d.shape}")
+        print(f"  Semantic anchors ({embed_dim}D): {anchor_embeddings_384d.shape}")
         print(f"  These will be re-projected through projection head EVERY forward pass")
         print(f"  Anchors 'move' with projection head during training")
         print(f"  Requires diversity loss (delta={config['loss'].get('delta', 0.0)}) to prevent collapse")
@@ -339,11 +432,11 @@ def prepare_anchors_in_embedding_space(
     # Save anchor data with BOTH semantic and geometric anchors
     torch.save({
         'anchor_images': anchor_images,
-        'anchor_semantic': anchor_embeddings_384d,  # For pseudo-label computation (384D)
-        'anchor_geometric': geometric_targets,       # For training targets (128D, FIXED)
+        'anchor_semantic': anchor_embeddings_384d,  # For pseudo-label computation (embed_dim D)
+        'anchor_geometric': geometric_targets,       # For training targets (projection_dim D, FIXED)
         'anchor_global': anchor_embeddings_384d,     # Legacy compatibility
         'anchor_dense': None,
-        'embedding_dim': 384,
+        'embedding_dim': embed_dim,
         'projection_dim': projection_dim,
         'is_projected': False,
         'use_decoupled': True,
@@ -357,13 +450,13 @@ def prepare_anchors_in_embedding_space(
     if geometric_targets is not None:
         print(f"✓ Generated {n_anchors} DECOUPLED anchors (Expert's Approach)")
         print(f"{'='*80}")
-        print(f"  Semantic anchors (384D): {anchor_embeddings_384d.shape} [for pseudo-labels]")
-        print(f"  Geometric targets (128D): {geometric_targets.shape} [FIXED training targets]")
+        print(f"  Semantic anchors ({embed_dim}D): {anchor_embeddings_384d.shape} [for pseudo-labels]")
+        print(f"  Geometric targets ({projection_dim}D): {geometric_targets.shape} [FIXED training targets]")
         print(f"  Decoupling prevents moving target problem and collapse!")
     else:
         print(f"✓ Generated {n_anchors} semantic anchors (Solution A: Re-projection)")
         print(f"{'='*80}")
-        print(f"  Semantic anchors (384D): {anchor_embeddings_384d.shape} [for pseudo-labels AND re-projection]")
+        print(f"  Semantic anchors ({embed_dim}D): {anchor_embeddings_384d.shape} [for pseudo-labels AND re-projection]")
         print(f"  These will be RE-PROJECTED through projection head each forward pass")
     
     return anchor_images, anchor_embeddings_384d, None, geometric_targets
@@ -445,8 +538,9 @@ def prepare_anchors(
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    projection_dim = config['model'].get('projection_dim', None)
-    
+    projection_hidden_dims = config['model'].get('projection_hidden_dims', None)
+    projection_dim = projection_hidden_dims[-1] if projection_hidden_dims is not None else config['model'].get('projection_dim', None)
+
     if backbone_for_projection is not None:
         # Use the PROVIDED backbone (same one the model will use)
         # This ensures anchors and samples use the SAME projection weights
@@ -460,7 +554,8 @@ def prepare_anchors(
             model_name=config['model']['backbone'],
             freeze_backbone=True,
             projection_dim=projection_dim,
-            pretrained=True
+            pretrained=True,
+            projection_hidden_dims=projection_hidden_dims
         )
         backbone = backbone.to(device)
         use_model_backbone = False
@@ -474,7 +569,8 @@ def prepare_anchors(
         backbone_model=backbone,
         device=device,
         batch_size=8,
-        return_projected=has_projection  # Get projected embeddings if projection exists
+        return_projected=has_projection,
+        apply_imagenet_norm=(config['data'].get('normalization', 'zscore_only') == 'minmax_imagenet')
     )
     
     # Save embeddings
@@ -496,7 +592,7 @@ def prepare_anchors(
         else:
             print(f"  ⚠ Projected through TEMPORARY backbone - weights differ from model!")
     else:
-        print(f"  Anchors are in RAW space (384D) - no projection head")
+        print(f"  Anchors are in RAW space ({backbone.embed_dim}D) - no projection head")
     print(f"  Dense embeddings: {anchor_dense.shape}")
     
     return anchor_images, anchor_global, anchor_dense
@@ -511,14 +607,17 @@ def create_model(config: dict, anchor_global: torch.Tensor, anchor_dense: torch.
     # Check if pixel decoder is requested
     use_pixel_decoder = config['model'].get('use_pixel_decoder', False)
     multi_scale_indices = config['model'].get('multi_scale_indices', [2, 5, 8, 11])
+    projection_hidden_dims = config['model'].get('projection_hidden_dims', None)
+    projection_dim = projection_hidden_dims[-1] if projection_hidden_dims is not None else config['model'].get('projection_dim', None)
     
     # Create backbone with multi-scale support if pixel decoder is enabled
     backbone = DINOv3Backbone(
         model_name=config['model']['backbone'],
         freeze_backbone=config['model']['freeze_backbone'],
-        projection_dim=config['model'].get('projection_dim', None),
+        projection_dim=projection_dim,
         pretrained=True,
-        multi_scale_indices=multi_scale_indices if use_pixel_decoder else None
+        multi_scale_indices=multi_scale_indices if use_pixel_decoder else None,
+        projection_hidden_dims=projection_hidden_dims
     )
     
     # Check if anchors should be learnable
@@ -529,7 +628,6 @@ def create_model(config: dict, anchor_global: torch.Tensor, anchor_dense: torch.
     # The model will use them as FIXED targets - NOT re-project them.
     # This prevents collapse: the projection head learns to map samples TO
     # these fixed anchor locations, rather than collapsing everything together.
-    projection_dim = config['model'].get('projection_dim', None)
     if projection_dim:
         print(f"\nAnchors are in PROJECTED space: {anchor_global.shape}")
         print(f"  They are FIXED targets - will NOT be re-projected during training")
@@ -726,8 +824,15 @@ def main(args):
     else:
         save_dir = Path(config['output_dir'])
 
-    # Avoid overwrite by uniquifying when directory exists
-    save_dir = make_unique_dir(save_dir)
+    # Avoid overwrite by uniquifying when directory exists, except eval-only mode
+    # where we intentionally reuse an existing experiment directory.
+    if args.eval_only:
+        if not save_dir.exists():
+            raise FileNotFoundError(
+                f"Eval-only mode expects an existing output directory, but not found: {save_dir}"
+            )
+    else:
+        save_dir = make_unique_dir(save_dir)
     config['output_dir'] = str(save_dir)
     
     # Create output directory
@@ -756,6 +861,7 @@ def main(args):
     
     # Load dataset paths from BraTS2021_slice structure
     data_root = config['data'].get('data_root', './data/BraTS2021_slice')
+    normalize_mode = config['data'].get('normalization', 'zscore_only')
     
     train_paths, val_paths, val_labels, val_mask_paths, test_paths, test_labels, test_mask_paths = load_dataset_paths(data_root)
     
@@ -776,7 +882,8 @@ def main(args):
         test_mask_paths=test_mask_paths,
         batch_size=config['training']['batch_size'],
         num_workers=config['training']['num_workers'],
-        target_size=tuple(config['data']['target_size'])
+        target_size=tuple(config['data']['target_size']),
+        normalize_mode=normalize_mode
     )
     
     print(f"Train batches: {len(train_loader)}")
@@ -792,14 +899,16 @@ def main(args):
     
     use_pixel_decoder = config['model'].get('use_pixel_decoder', False)
     multi_scale_indices = config['model'].get('multi_scale_indices', [2, 5, 8, 11])
-    projection_dim = config['model'].get('projection_dim', None)
+    projection_hidden_dims = config['model'].get('projection_hidden_dims', None)
+    projection_dim = projection_hidden_dims[-1] if projection_hidden_dims is not None else config['model'].get('projection_dim', None)
     
     backbone = DINOv3Backbone(
         model_name=config['model']['backbone'],
         freeze_backbone=config['model']['freeze_backbone'],
         projection_dim=projection_dim,
         pretrained=True,
-        multi_scale_indices=multi_scale_indices if use_pixel_decoder else None
+        multi_scale_indices=multi_scale_indices if use_pixel_decoder else None,
+        projection_hidden_dims=projection_hidden_dims
     )
     backbone = backbone.to(device)
     
@@ -813,7 +922,7 @@ def main(args):
     pretrain_anchors = pretrain_projection_head(
         backbone=backbone,
         train_paths=train_paths,
-        preprocessor=BMADPreprocessor(target_size=tuple(config['data']['target_size'])),
+        preprocessor=BMADPreprocessor(target_size=tuple(config['data']['target_size']), normalize_mode=normalize_mode),
         config=config,
         device=device,
         cache_dir=cache_dir,
@@ -821,7 +930,7 @@ def main(args):
     )
     
     # ===== STAGE 3: Anchor Setup =====
-    preprocessor = BMADPreprocessor(target_size=tuple(config['data']['target_size']))
+    preprocessor = BMADPreprocessor(target_size=tuple(config['data']['target_size']), normalize_mode=normalize_mode)
     
     # Use pre-trained anchors if available, otherwise generate new ones
     if pretrain_anchors is not None:
@@ -880,14 +989,14 @@ def main(args):
             anchor_semantic = anchor_data['anchor_semantic']
             anchor_geometric = anchor_data['anchor_geometric']
             print(f"  \u2713 Loaded decoupled anchors:")
-            print(f"    - Semantic (384D): {anchor_semantic.shape}")
-            print(f"    - Geometric (128D): {anchor_geometric.shape}")
+            print(f"    - Semantic ({anchor_semantic.shape[1]}D): {anchor_semantic.shape}")
+            print(f"    - Geometric ({anchor_geometric.shape[1]}D): {anchor_geometric.shape}")
         else:
             print(f"  \u2713 Loaded legacy anchors: {anchor_global.shape}")
         
     if pretrain_anchors is None and not (args.skip_anchors and (save_dir / 'anchor_embeddings.pt').exists()) and config['anchor'].get('init_from', None) is None:
         # Generate new anchors only if we didn't get them from pre-training
-        # SOLUTION A: Use 384D embedding space generation (semantic clustering)
+        # SOLUTION A: Use embedding space generation (semantic clustering)
         use_embedding_space = config['anchor'].get('use_embedding_space', True)
         
         if use_embedding_space:
@@ -930,8 +1039,8 @@ def main(args):
     
     if use_decoupled and 'anchor_geometric' in locals():
         print(f"EXPERT'S APPROACH: Decoupled anchors")
-        print(f"  Semantic anchors (384D): {anchor_semantic.shape} [for pseudo-labels]")
-        print(f"  Geometric targets (128D): {anchor_geometric.shape} [FIXED training targets]")
+        print(f"  Semantic anchors ({anchor_semantic.shape[1]}D): {anchor_semantic.shape} [for pseudo-labels]")
+        print(f"  Geometric targets ({anchor_geometric.shape[1]}D): {anchor_geometric.shape} [FIXED training targets]")
         
         model = AnomalyDetector(
             backbone=backbone,
@@ -951,7 +1060,7 @@ def main(args):
     else:
         # LEGACY PATHS: Define anchors_already_projected for non-decoupled approaches
         if use_embedding_space:
-            print(f"Anchors in RAW 384D space: {anchor_global.shape}")
+            print(f"Anchors in RAW {backbone.embed_dim}D space: {anchor_global.shape}")
             print(f"  ✓ SOLUTION A: Anchors will be RE-PROJECTED each forward pass")
             print(f"  ✓ Anchors move with projection head (semantic clustering preserved)")
             anchors_already_projected = False
@@ -1008,6 +1117,8 @@ def main(args):
     print("TRAINING")
     print("="*80)
     
+    trainer = None
+
     if optimizer is not None and not args.eval_only:
         trainer = Trainer(
             model=model,
@@ -1022,7 +1133,8 @@ def main(args):
             val_interval=config['training']['val_interval'],
             fixed_pseudo_labels=config['training'].get('fixed_pseudo_labels', False),
             dynamic_reassignment=config['training'].get('dynamic_reassignment', False),
-            reassignment_interval=config['training'].get('reassignment_interval', 5)
+            reassignment_interval=config['training'].get('reassignment_interval', 5),
+            save_checkpoints=config['training'].get('save_checkpoints', True)
         )
         
         trainer.train(
@@ -1030,6 +1142,156 @@ def main(args):
             scheduler=scheduler,
             early_stopping_patience=config['training']['early_stopping_patience']
         )
+
+        if config.get('stage2', {}).get('enabled', False):
+            # ---- Intermediate evaluation: report stage 1 performance ----
+            print("\n" + "="*80)
+            print("STAGE 1 EVALUATION (before stage 2)")
+            print("="*80)
+
+            best_model_path = save_dir / 'best_model.pth'
+            if best_model_path.exists():
+                checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
+                model.load_state_dict(checkpoint['model_state_dict'])
+                print("Loaded best stage-1 checkpoint for intermediate evaluation")
+
+            stage1_eval_dir = save_dir / 'evaluation_stage1'
+            stage1_eval_dir.mkdir(exist_ok=True)
+            stage1_results = evaluate_comprehensive(
+                model=model,
+                dataloader=test_loader,
+                device=device,
+                save_dir=stage1_eval_dir,
+                compute_pixel=False,
+                target_size=tuple(config['data']['target_size'])
+            )
+            print(f"Stage 1 Image AUROC: {stage1_results['image_auroc']:.4f}")
+
+            # ---- Stage 2 training ----
+            print("\n" + "="*80)
+            print("STAGE 2: RECONSTRUCTION TRAINING")
+            print("="*80)
+
+            # Reload best stage-1 checkpoint for stage-2 initialization
+            if best_model_path.exists():
+                checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
+                model.load_state_dict(checkpoint['model_state_dict'])
+                print("Loaded best stage-1 checkpoint for stage-2 initialization")
+
+            stage2_cfg = config['stage2']
+            pixel_map_cfg = stage2_cfg.get('pixel_map', {})
+            score_comb_cfg = stage2_cfg.get('score_combination', {})
+            use_frozen_bottleneck = stage2_cfg.get('frozen_bottleneck', False)
+            recon_proj_dim = config.get('model', {}).get('projection_dim_recon', None)
+
+            model.enable_reconstruction_branch(
+                freeze_anchor_target=stage2_cfg.get('freeze_anchor_target', True),
+                out_channels=3,
+                pixel_map_enabled=pixel_map_cfg.get('enabled', True),
+                pixel_map_type=pixel_map_cfg.get('type', 'reconstruction_l2'),
+                use_frozen_bottleneck=use_frozen_bottleneck,
+                recon_projection_dim=recon_proj_dim
+            )
+            model.configure_score_combination(
+                enabled=score_comb_cfg.get('enabled', False),
+                alpha=score_comb_cfg.get('alpha', 0.5),
+                normalization=score_comb_cfg.get('normalization', 'minmax')
+            )
+
+            # Configure pixel aggregation
+            pix_agg_cfg = stage2_cfg.get('pixel_aggregation', {})
+            agg_method = pix_agg_cfg.get('method', 'top_k_percentile')
+            agg_threshold = pix_agg_cfg.get('threshold_n_std', 2.0) if agg_method == 'threshold_ratio' else None
+            model.configure_pixel_aggregation(
+                method=agg_method,
+                percentile=pix_agg_cfg.get('percentile', 95),
+                threshold=agg_threshold
+            )
+
+            # Configure three-signal score fusion
+            fusion_cfg = stage2_cfg.get('score_fusion', {})
+            model.configure_score_fusion(
+                enabled=fusion_cfg.get('enabled', False),
+                normalization=fusion_cfg.get('normalization', 'minmax'),
+                anchor_weight=fusion_cfg.get('anchor_weight', 0.4),
+                divergence_weight=fusion_cfg.get('divergence_weight', 0.3),
+                pixel_weight=fusion_cfg.get('pixel_weight', 0.3),
+                drop_anticorrelated=fusion_cfg.get('drop_anticorrelated', True)
+            )
+
+            # Prepare stage-2 training with configurable encoder freezing
+            freeze_encoder_mode = stage2_cfg.get('freeze_encoder_mode', 'full')
+            # Backward compat: if old freeze_encoder=true is set, treat as 'full'
+            if stage2_cfg.get('freeze_encoder', True) and freeze_encoder_mode == 'full':
+                freeze_encoder_mode = 'full'
+            elif not stage2_cfg.get('freeze_encoder', True):
+                freeze_encoder_mode = 'none'
+
+            model.prepare_stage2_training(
+                freeze_encoder=True,  # always pass True; mode handles the rest
+                freeze_anchor_parameters=stage2_cfg.get('freeze_anchors', True),
+                freeze_encoder_mode=freeze_encoder_mode,
+                unfreeze_last_n_blocks=stage2_cfg.get('unfreeze_last_n_blocks', 2),
+                unfreeze_lr_multiplier=stage2_cfg.get('unfreeze_lr_multiplier', 0.1)
+            )
+
+            # Build optimizer with param groups (different LR for unfrozen encoder)
+            stage2_base_lr = stage2_cfg.get('lr', config['training']['lr'])
+            stage2_wd = stage2_cfg.get('weight_decay', config['training']['weight_decay'])
+            stage2_param_groups = model.get_stage2_param_groups(
+                base_lr=stage2_base_lr,
+                weight_decay=stage2_wd
+            )
+
+            if len(stage2_param_groups) == 0 or all(len(g['params']) == 0 for g in stage2_param_groups):
+                raise RuntimeError("Stage-2 enabled but no stage-2 trainable parameters were found.")
+
+            stage2_optimizer = torch.optim.AdamW(
+                stage2_param_groups
+            )
+
+            stage2_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                stage2_optimizer,
+                T_max=stage2_cfg.get('epochs', 20),
+                eta_min=stage2_cfg.get('lr', config['training']['lr']) * 0.01
+            )
+
+            stage2_trainer = Trainer(
+                model=model,
+                criterion=None,
+                optimizer=stage2_optimizer,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                device=device,
+                save_dir=save_dir,
+                use_amp=config['training']['use_amp'],
+                log_interval=config['training']['log_interval'],
+                val_interval=config['training']['val_interval'],
+                fixed_pseudo_labels=False,
+                dynamic_reassignment=False,
+                reassignment_interval=stage2_cfg.get('reassignment_interval', 5),
+                save_checkpoints=config['training'].get('save_checkpoints', True),
+                stage2_mode=True,
+                stage2_config=stage2_cfg
+            )
+
+            # Preserve stage-1 history and append stage-2 metrics on top
+            if trainer is not None:
+                stage2_trainer.history = copy.deepcopy(trainer.history)
+
+            stage2_trainer.train_stage2(
+                num_epochs=stage2_cfg.get('epochs', 20),
+                scheduler=stage2_scheduler,
+                early_stopping_patience=stage2_cfg.get('early_stopping_patience', 10)
+            )
+
+            # Prefer best stage-2 model for final evaluation when available
+            best_stage2_path = save_dir / 'best_stage2_model.pth'
+            if best_stage2_path.exists():
+                checkpoint = torch.load(best_stage2_path, map_location=device, weights_only=False)
+                model.load_state_dict(checkpoint['model_state_dict'])
+                print("Loaded best stage-2 checkpoint for final evaluation")
+            trainer = stage2_trainer
     else:
         if optimizer is None:
             print("Skipping training (no trainable parameters)")
@@ -1047,8 +1309,52 @@ def main(args):
     print("FINAL EVALUATION")
     print("="*80)
     
+    # When eval-only and stage-2 is configured, enable reconstruction branch
+    # before loading the checkpoint (the checkpoint has stage-2 keys)
+    stage2_enabled = config.get('stage2', {}).get('enabled', False)
+    best_stage2_path = save_dir / 'best_stage2_model.pth'
+    if args.eval_only and stage2_enabled and best_stage2_path.exists():
+        s2_cfg = config['stage2']
+        pm_cfg = s2_cfg.get('pixel_map', {})
+        if not model.reconstruction_enabled:
+            recon_proj_dim = config.get('model', {}).get('projection_dim_recon', None)
+            model.enable_reconstruction_branch(
+                freeze_anchor_target=s2_cfg.get('freeze_anchor_target', True),
+                out_channels=3,
+                pixel_map_enabled=pm_cfg.get('enabled', True),
+                pixel_map_type=pm_cfg.get('type', 'reconstruction_l2'),
+                use_frozen_bottleneck=s2_cfg.get('frozen_bottleneck', False),
+                recon_projection_dim=recon_proj_dim
+            )
+        pix_agg_cfg = s2_cfg.get('pixel_aggregation', {})
+        agg_method = pix_agg_cfg.get('method', 'top_k_percentile')
+        agg_threshold = pix_agg_cfg.get('threshold_n_std', 2.0) if agg_method == 'threshold_ratio' else None
+        model.configure_pixel_aggregation(
+            method=agg_method,
+            percentile=pix_agg_cfg.get('percentile', 95),
+            threshold=agg_threshold
+        )
+        fusion_cfg = s2_cfg.get('score_fusion', {})
+        model.configure_score_fusion(
+            enabled=fusion_cfg.get('enabled', False),
+            normalization=fusion_cfg.get('normalization', 'minmax'),
+            anchor_weight=fusion_cfg.get('anchor_weight', 0.4),
+            divergence_weight=fusion_cfg.get('divergence_weight', 0.3),
+            pixel_weight=fusion_cfg.get('pixel_weight', 0.3)
+        )
+        sc_cfg = s2_cfg.get('score_combination', {})
+        model.configure_score_combination(
+            enabled=sc_cfg.get('enabled', False),
+            alpha=sc_cfg.get('alpha', 0.5),
+            normalization=sc_cfg.get('normalization', 'minmax')
+        )
+        print("  Stage-2 reconstruction branch enabled for eval-only loading")
+
     # Load best model
-    best_model_path = save_dir / 'best_model.pth'
+    if getattr(args, 'checkpoint', None):
+        best_model_path = Path(args.checkpoint)
+    else:
+        best_model_path = best_stage2_path if (stage2_enabled and best_stage2_path.exists()) else save_dir / 'best_model.pth'
     if best_model_path.exists():
         checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -1088,10 +1394,18 @@ def main(args):
         device=device,
         save_dir=eval_dir
     )
-    
-    # Generate test sample visualization (normal vs anomaly)
-    print("\nGenerating test sample visualization...")
-    trainer._visualize_test_samples(test_loader=test_loader, save_name='test_final')
+
+    # Generate train/test visualization snapshots using best_model.pth explicitly
+    print("\nGenerating best-model visualizations...")
+    if trainer is not None:
+        best_stage1_path = save_dir / 'best_model.pth'
+        if best_stage1_path.exists():
+            ckpt_stage1 = torch.load(best_stage1_path, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt_stage1['model_state_dict'], strict=False)
+            print("Loaded best_model.pth for visualization snapshots")
+
+        trainer._visualize_training_samples(epoch=0, save_name='train_best_model')
+        trainer._visualize_test_samples(test_loader=test_loader, save_name='test_best_model')
     
     print("\n" + "="*80)
     print("TRAINING COMPLETE")
@@ -1114,6 +1428,8 @@ if __name__ == '__main__':
                         help='Auto-generate experiment name from anchor config (strategy_k<n_anchors>)')
     parser.add_argument('--exp-name', type=str, default=None,
                         help='Explicit experiment name subfolder (overrides auto-name)')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='Override checkpoint path for eval-only mode (absolute or relative path)')
     
     args = parser.parse_args()
     main(args)
