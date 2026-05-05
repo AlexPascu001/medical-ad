@@ -1,5 +1,9 @@
 """
 Visualize anchors and images in embedding space using t-SNE
+
+DEPRECATED: Use visualize_pipeline.py instead, which provides a unified
+pipeline visualization covering all 10 diagnostic steps.
+    python visualize_pipeline.py --experiment <experiment_dir>
 """
 
 import torch

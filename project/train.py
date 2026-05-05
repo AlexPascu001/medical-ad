@@ -10,7 +10,7 @@ from torch.amp import autocast, GradScaler
 from pathlib import Path
 import time
 import json
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
@@ -19,9 +19,83 @@ from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 from sklearn.metrics import roc_auc_score, average_precision_score
 
+from data import BMADDataset
 from model import AnomalyDetector
 from loss import CombinedAnchorLoss
 from eval import evaluate_model
+
+
+def _get_model_anchor_mode(model: AnomalyDetector) -> str:
+    """Return the model anchor mode for checkpoint compatibility checks."""
+    return str(getattr(model, 'anchor_mode', 'global')).lower()
+
+
+def _validate_checkpoint_anchor_mode(checkpoint: Dict, expected_anchor_mode: str, checkpoint_path: str) -> None:
+    """Reject checkpoints saved from a different anchor mode."""
+    checkpoint_anchor_mode = str(checkpoint.get('anchor_mode', 'global')).lower()
+    if checkpoint_anchor_mode != expected_anchor_mode:
+        raise ValueError(
+            f"Checkpoint anchor_mode mismatch for {checkpoint_path}: "
+            f"expected '{expected_anchor_mode}', found '{checkpoint_anchor_mode}'."
+        )
+
+
+def _build_non_augmented_dataset(dataset) -> DataLoader:
+    """Create a deterministic, augmentation-free dataset view for pseudo-label precomputation."""
+    if not isinstance(dataset, BMADDataset):
+        return dataset
+
+    normalize_mode = getattr(dataset.preprocessor, 'normalize_mode', 'zscore_only')
+    return BMADDataset(
+        image_paths=list(dataset.image_paths),
+        labels=list(dataset.labels) if dataset.labels is not None else None,
+        mask_paths=list(dataset.mask_paths) if dataset.mask_paths is not None else None,
+        preprocessor=dataset.preprocessor,
+        augment=False,
+        is_training=False,
+        normalize_mode=normalize_mode,
+        augment_mode='none'
+    )
+
+
+def _compute_capacitated_assignments(distances: torch.Tensor, max_per_anchor: int) -> torch.Tensor:
+    """Assign each sample to an anchor while respecting a hard maximum occupancy."""
+    if max_per_anchor <= 0:
+        raise ValueError("max_per_anchor must be positive for capacitated assignment.")
+
+    num_samples, num_anchors = distances.shape
+    total_capacity = max_per_anchor * num_anchors
+    if total_capacity < num_samples:
+        raise ValueError(
+            f"Capacity infeasible: {num_anchors} anchors * {max_per_anchor} < {num_samples} samples."
+        )
+
+    ranked_anchors = torch.argsort(distances, dim=1).cpu().numpy()
+    if num_anchors > 1:
+        top2 = torch.topk(-distances, k=2, dim=1).values.neg().cpu().numpy()
+        priority = top2[:, 1] - top2[:, 0]
+    else:
+        priority = np.full(num_samples, np.inf, dtype=np.float32)
+
+    sample_order = np.argsort(-priority, kind='mergesort')
+    remaining_capacity = np.full(num_anchors, max_per_anchor, dtype=np.int64)
+    assignments = np.full(num_samples, -1, dtype=np.int64)
+
+    for sample_idx in sample_order.tolist():
+        for anchor_idx in ranked_anchors[sample_idx].tolist():
+            if remaining_capacity[anchor_idx] > 0:
+                assignments[sample_idx] = anchor_idx
+                remaining_capacity[anchor_idx] -= 1
+                break
+
+        if assignments[sample_idx] < 0:
+            fallback_anchor = int(np.argmax(remaining_capacity))
+            if remaining_capacity[fallback_anchor] <= 0:
+                raise RuntimeError("No remaining anchor capacity while computing fixed pseudo-labels.")
+            assignments[sample_idx] = fallback_anchor
+            remaining_capacity[fallback_anchor] -= 1
+
+    return torch.from_numpy(assignments).long()
 
 
 class Trainer:
@@ -40,6 +114,8 @@ class Trainer:
         log_interval: int = 50,
         val_interval: int = 1,
         fixed_pseudo_labels: bool = False,
+        pseudo_label_assignment: str = 'nearest',
+        capacity_multiplier: float = 2.0,
         dynamic_reassignment: bool = False,
         reassignment_interval: int = 5,
         save_checkpoints: bool = True,
@@ -59,6 +135,8 @@ class Trainer:
             log_interval: Logging frequency (batches)
             val_interval: Validation frequency (epochs)
             fixed_pseudo_labels: If True, compute pseudo-labels once before training
+            pseudo_label_assignment: Strategy for initial fixed pseudo-labeling ('nearest' or 'capacitated')
+            capacity_multiplier: Hard-cap multiplier for capacitated pseudo-labeling
             dynamic_reassignment: If True, recompute pseudo-labels every reassignment_interval epochs
             reassignment_interval: Epochs between pseudo-label recomputation (only if dynamic_reassignment=True)
             save_checkpoints: If True, save periodic checkpoints; if False, only save best and final
@@ -89,10 +167,17 @@ class Trainer:
         self.tsne_samples = self._prepare_tsne_samples(normal_count=500, anomaly_count=100)
         self.fixed_assignments = None
         self.fixed_pseudo = fixed_pseudo_labels
+        self.pseudo_label_assignment = pseudo_label_assignment
+        self.capacity_multiplier = float(capacity_multiplier)
         
         # Dynamic label reassignment for learnable anchors
         self.dynamic_reassignment = dynamic_reassignment
         self.reassignment_interval = reassignment_interval
+
+        if self.fixed_pseudo and self.dynamic_reassignment and self.pseudo_label_assignment != 'nearest':
+            raise ValueError(
+                "dynamic_reassignment is only supported with training.pseudo_label_assignment='nearest'."
+            )
         
         # Enhanced history tracking
         self.history = {
@@ -111,6 +196,23 @@ class Trainer:
             'val_loss_dense': [],
             'val_image_auroc': [],
             'val_pixel_auroc': [],
+            'val_cluster_all_effective_anchors_used': [],
+            'val_cluster_all_assignment_entropy': [],
+            'val_cluster_all_assignment_entropy_normalized': [],
+            'val_cluster_all_largest_anchor_share': [],
+            'val_cluster_all_max_min_nonzero_ratio': [],
+            'val_cluster_all_assignment_counts': [],
+            'val_cluster_normal_effective_anchors_used': [],
+            'val_cluster_normal_assignment_entropy': [],
+            'val_cluster_normal_assignment_entropy_normalized': [],
+            'val_cluster_normal_largest_anchor_share': [],
+            'val_cluster_normal_max_min_nonzero_ratio': [],
+            'val_cluster_normal_assignment_counts': [],
+            'val_cluster_normal_mean_nearest_distance': [],
+            'val_cluster_normal_mean_second_nearest_distance': [],
+            'val_cluster_normal_mean_margin_d2_minus_d1': [],
+            'val_cluster_normal_mean_ratio_d1_over_d2': [],
+            'val_cluster_anomaly_assignment_counts': [],
             
             # Per-epoch statistics
             'epochs': [],
@@ -156,8 +258,24 @@ class Trainer:
         # ----- alignment / consistency loss -----
         stage2_feat = outputs['stage2_feat']
         frozen_feat = outputs.get('frozen_feat')
+        alignment_target = self.stage2_config.get('alignment_target', 'sample')
 
-        if frozen_feat is not None:
+        if alignment_target == 'anchor':
+            fixed_assignments = outputs.get('fixed_assignments')
+            if fixed_assignments is None:
+                raise RuntimeError("Stage-2 anchor alignment requires fixed pseudo-label assignments.")
+            if getattr(self.model, '_recon_dim', None) != getattr(self.model, '_anchor_dim', None):
+                raise NotImplementedError(
+                    "stage2.alignment_target='anchor' currently supports only recon_dim == anchor_dim."
+                )
+
+            projected_anchor_targets, _ = self.model._get_projected_anchors()
+            anchor_target = projected_anchor_targets[fixed_assignments].detach()
+            if self.stage2_config.get('consistency_loss', 'cosine') == 'l2':
+                alignment_loss = F.mse_loss(stage2_feat, anchor_target)
+            else:
+                alignment_loss = 1.0 - torch.cosine_similarity(stage2_feat, anchor_target, dim=1).mean()
+        elif frozen_feat is not None:
             # Dual-bottleneck alignment: penalise divergence from frozen projection
             alignment_loss = 1.0 - torch.cosine_similarity(stage2_feat, frozen_feat.detach(), dim=1).mean()
         else:
@@ -595,24 +713,27 @@ class Trainer:
 
     def _precompute_pseudo_labels(self):
         """Compute fixed nearest-anchor assignments once before training."""
+        is_patch_mode = _get_model_anchor_mode(self.model) == 'patch'
         print("\n" + "="*80)
-        print("COMPUTING PSEUDO-LABELS IN 384D DINOV3 SPACE (SOLUTION A)")
-        print("="*80)
-        print("Using RAW 384D DINOv3 embeddings (frozen semantic features)")
-        print("Ensures pseudo-labels based on SEMANTIC similarity, not random projection")
+        if is_patch_mode:
+            print("COMPUTING FIXED PATCH PSEUDO-LABELS")
+            print("="*80)
+            print("Using patch-to-anchor assignment distances on unaugmented images")
+            print("Ensures fixed labels follow patch-anchor scoring semantics")
+        else:
+            print("COMPUTING PSEUDO-LABELS IN 384D DINOV3 SPACE (SOLUTION A)")
+            print("="*80)
+            print("Using RAW 384D DINOv3 embeddings (frozen semantic features)")
+            print("Ensures pseudo-labels based on SEMANTIC similarity, not random projection")
         print("="*80)
         
         self.model.eval()
         mapping = {}
-
-        # Get SEMANTIC anchors (384D) for labeling
-        # EXPERT'S APPROACH: Use frozen DINOv3 embeddings for pseudo-label computation
-        anchor_embeddings_384d = self.model.get_semantic_anchors().to(self.device)  # (K, 384)
-        print(f"\nSemantic anchor embeddings (384D): {anchor_embeddings_384d.shape}")
         
         # Use a non-dropping, non-shuffling loader to cover all samples
+        preload_dataset = _build_non_augmented_dataset(self.train_loader.dataset)
         preload = DataLoader(
-            self.train_loader.dataset,
+            preload_dataset,
             batch_size=self.train_loader.batch_size,
             shuffle=False,
             num_workers=self.train_loader.num_workers,
@@ -620,29 +741,46 @@ class Trainer:
             drop_last=False
         )
 
-        all_min_distances = []
+        all_paths = []
+        all_distances = []
         with torch.no_grad():
-            for batch in tqdm(preload, desc='Computing pseudo-labels in 384D space'):
+            progress_desc = 'Computing patch pseudo-labels' if is_patch_mode else 'Computing pseudo-labels in 384D space'
+            for batch in tqdm(preload, desc=progress_desc):
                 images = batch['image'].to(self.device)
                 paths = batch['path']
 
-                # Extract RAW 384D DINOv3 features (NO projection)
-                # Access backbone directly: backbone.backbone is the DINOv2Model
-                features_384d = self.model.backbone.backbone.forward_features(images)  # (B, N_patches, 384)
-                embeddings_384d = features_384d[:, 0]  # CLS token: (B, 384)
-                
-                # Compute distances in 384D space
-                distances = torch.cdist(embeddings_384d, anchor_embeddings_384d)  # (B, K)
-                assigned = distances.argmin(dim=1).cpu().tolist()
-                min_distances = distances.min(dim=1)[0]  # (B,)
+                if is_patch_mode and hasattr(self.model, 'compute_label_distances'):
+                    batch_distances = self.model.compute_label_distances(images).cpu()
+                else:
+                    anchor_embeddings_384d = self.model.get_semantic_anchors().to(self.device)  # (K, 384)
+                    features_384d = self.model.backbone.backbone.forward_features(images)
+                    embeddings_384d = features_384d[:, 0]
+                    batch_distances = torch.cdist(embeddings_384d, anchor_embeddings_384d).cpu()
 
-                for p, a in zip(paths, assigned):
-                    mapping[str(p)] = int(a)
-                
-                all_min_distances.append(min_distances.cpu())
+                all_distances.append(batch_distances)
+                all_paths.extend([str(path) for path in paths])
+
+        distances = torch.cat(all_distances, dim=0)
+        print(f"\nAssignment distance matrix: {tuple(distances.shape)}")
+
+        if self.pseudo_label_assignment == 'capacitated':
+            n_samples = int(distances.shape[0])
+            n_anchors = int(distances.shape[1])
+            max_per_anchor = int(np.ceil(self.capacity_multiplier * n_samples / max(n_anchors, 1)))
+            print(
+                f"Applying capacity-constrained pseudo-labeling: "
+                f"max_per_anchor={max_per_anchor} (multiplier={self.capacity_multiplier:.3f})"
+            )
+            assigned_tensor = _compute_capacitated_assignments(distances, max_per_anchor=max_per_anchor)
+            min_distances = distances[torch.arange(n_samples), assigned_tensor]
+        else:
+            min_distances, assigned_tensor = distances.min(dim=1)
+
+        for path, assignment in zip(all_paths, assigned_tensor.tolist()):
+            mapping[path] = int(assignment)
 
         self.fixed_assignments = mapping
-        all_min_distances = torch.cat(all_min_distances, dim=0)
+        all_min_distances = min_distances
         
         # Statistics
         label_list = list(mapping.values())
@@ -653,7 +791,8 @@ class Trainer:
         print("PSEUDO-LABEL STATISTICS (384D SPACE)")
         print(f"{'='*80}")
         print(f"Total samples: {len(mapping)}")
-        print(f"Anchors used: {len(unique_labels)} / {anchor_embeddings_384d.shape[0]}")
+        print(f"Anchors used: {len(unique_labels)} / {distances.shape[1]}")
+        print(f"Assignment mode: {self.pseudo_label_assignment}")
         print(f"\nDistribution:")
         for label in sorted(unique_labels):
             count = counts[label]
@@ -669,6 +808,13 @@ class Trainer:
         # Warning if imbalanced
         max_count = max(counts.values())
         min_count = min(counts.values())
+        if self.pseudo_label_assignment == 'capacitated':
+            n_samples = len(mapping)
+            max_allowed = int(np.ceil(self.capacity_multiplier * n_samples / max(distances.shape[1], 1)))
+            print(f"  Capacity cap: {max_allowed}")
+            if max_count > max_allowed:
+                raise RuntimeError(f"Capacitated pseudo-labeling violated max_per_anchor={max_allowed}.")
+
         if max_count > 3 * min_count:
             print(f"\n⚠️  Warning: Imbalanced distribution (max={max_count}, min={min_count})")
             print("   Consider using diversity loss if this persists during training.")
@@ -676,6 +822,36 @@ class Trainer:
             print(f"\n✓ Distribution looks balanced (max={max_count}, min={min_count})")
         
         print(f"{'='*80}\n")
+
+    def _resolve_batch_assignments(self, batch_paths, batch_images: torch.Tensor) -> torch.Tensor:
+        """Resolve anchor assignments for a batch.
+
+        Training samples reuse the fixed precomputed mapping. Any unseen paths
+        (for example validation batches during stage-2 anchor alignment) fall
+        back to nearest semantic-anchor assignment in frozen 384D space.
+        """
+        if not self.fixed_pseudo or self.fixed_assignments is None:
+            raise RuntimeError("Fixed pseudo-label assignments were requested but are not available.")
+
+        resolved = [self.fixed_assignments.get(str(path)) for path in batch_paths]
+        missing_indices = [index for index, assignment in enumerate(resolved) if assignment is None]
+
+        if missing_indices:
+            with torch.no_grad():
+                if _get_model_anchor_mode(self.model) == 'patch' and hasattr(self.model, 'compute_label_distances'):
+                    batch_distances = self.model.compute_label_distances(batch_images)
+                    missing_distances = batch_distances[missing_indices]
+                else:
+                    anchor_embeddings_384d = self.model.get_semantic_anchors().to(self.device)
+                    batch_embeddings_384d = self.model.backbone.backbone.forward_features(batch_images)[:, 0]
+                    missing_embeddings = batch_embeddings_384d[missing_indices]
+                    missing_distances = torch.cdist(missing_embeddings, anchor_embeddings_384d)
+                missing_assignments = missing_distances.argmin(dim=1).cpu().tolist()
+
+            for batch_index, assignment in zip(missing_indices, missing_assignments):
+                resolved[batch_index] = int(assignment)
+
+        return torch.tensor(resolved, device=self.device, dtype=torch.long)
     
     def train_epoch(self) -> Dict[str, float]:
         """Train for one epoch"""
@@ -702,11 +878,7 @@ class Trainer:
             images = batch['image'].to(self.device)
             fixed_assign = None
             if self.fixed_pseudo:
-                fixed_assign = torch.tensor(
-                    [self.fixed_assignments[str(p)] for p in batch['path']],
-                    device=self.device,
-                    dtype=torch.long
-                )
+                fixed_assign = self._resolve_batch_assignments(batch['path'], images)
             
             # Forward pass
             self.optimizer.zero_grad()
@@ -809,6 +981,92 @@ class Trainer:
         
         return epoch_metrics
     
+    def _summarize_assignment_subset(
+        self,
+        distances: np.ndarray,
+        assigned: np.ndarray,
+        subset_mask: np.ndarray,
+    ) -> Dict[str, object]:
+        subset_distances = distances[subset_mask]
+        subset_assigned = assigned[subset_mask]
+        n_anchors = int(self.model.n_anchors)
+
+        counts = np.bincount(subset_assigned, minlength=n_anchors).astype(np.int64) if len(subset_assigned) > 0 else np.zeros(n_anchors, dtype=np.int64)
+        nonzero = counts[counts > 0]
+        total = int(counts.sum())
+
+        if total > 0:
+            probs = counts[counts > 0].astype(np.float64) / total
+            entropy = float(-(probs * np.log(probs)).sum())
+            max_entropy = np.log(n_anchors) if n_anchors > 1 else 1.0
+            normalized_entropy = float(entropy / max(max_entropy, 1e-12))
+            largest_anchor_share = float(counts.max() / total)
+        else:
+            entropy = 0.0
+            normalized_entropy = 0.0
+            largest_anchor_share = 0.0
+
+        summary: Dict[str, object] = {
+            'effective_anchors_used': int((counts > 0).sum()),
+            'assignment_entropy': entropy,
+            'assignment_entropy_normalized': normalized_entropy,
+            'largest_anchor_share': largest_anchor_share,
+            'max_min_nonzero_ratio': float(nonzero.max() / max(nonzero.min(), 1)) if len(nonzero) > 0 else 0.0,
+            'assignment_counts': counts.tolist(),
+        }
+
+        if len(subset_distances) == 0:
+            summary.update({
+                'mean_nearest_distance': None,
+                'mean_second_nearest_distance': None,
+                'mean_margin_d2_minus_d1': None,
+                'mean_ratio_d1_over_d2': None,
+            })
+            return summary
+
+        sorted_distances = np.sort(subset_distances, axis=1)
+        nearest = sorted_distances[:, 0]
+        summary['mean_nearest_distance'] = float(nearest.mean())
+
+        if subset_distances.shape[1] > 1:
+            second = sorted_distances[:, 1]
+            margin = second - nearest
+            ratio = nearest / np.maximum(second, 1e-12)
+            summary['mean_second_nearest_distance'] = float(second.mean())
+            summary['mean_margin_d2_minus_d1'] = float(margin.mean())
+            summary['mean_ratio_d1_over_d2'] = float(ratio.mean())
+        else:
+            summary['mean_second_nearest_distance'] = None
+            summary['mean_margin_d2_minus_d1'] = None
+            summary['mean_ratio_d1_over_d2'] = None
+
+        return summary
+
+    def _compute_stage1_cluster_diagnostics(self) -> Dict[str, object]:
+        self.model.eval()
+        all_labels: List[np.ndarray] = []
+        all_assigned: List[np.ndarray] = []
+        all_distances: List[np.ndarray] = []
+
+        with torch.no_grad():
+            for batch in self.val_loader:
+                images = batch['image'].to(self.device)
+                outputs = self.model.compute_anomaly_scores(images, return_maps=False)
+                all_labels.append(batch['label'].cpu().numpy())
+                all_assigned.append(outputs['assigned_anchors'].cpu().numpy())
+                all_distances.append(outputs['all_distances'].cpu().numpy())
+
+        labels = np.concatenate(all_labels)
+        assigned = np.concatenate(all_assigned)
+        distances = np.concatenate(all_distances)
+
+        diagnostics = {
+            'all': self._summarize_assignment_subset(distances, assigned, np.ones_like(labels, dtype=bool)),
+            'normal': self._summarize_assignment_subset(distances, assigned, labels == 0),
+            'anomaly': self._summarize_assignment_subset(distances, assigned, labels == 1),
+        }
+        return diagnostics
+
     def validate(self) -> Dict[str, float]:
         """Run validation - compute both metrics and loss"""
         print("\nRunning validation...")
@@ -862,9 +1120,14 @@ class Trainer:
             device=self.device,
             compute_pixel_auroc=True
         )
+
+        cluster_diagnostics = self._compute_stage1_cluster_diagnostics()
         
         # Combine metrics
         val_metrics = {**val_loss_metrics, **auroc_metrics}
+        for subset_name, subset_metrics in cluster_diagnostics.items():
+            for metric_name, metric_value in subset_metrics.items():
+                val_metrics[f'cluster_{subset_name}_{metric_name}'] = metric_value
         
         return val_metrics
 
@@ -893,10 +1156,15 @@ class Trainer:
         for batch_idx, batch in enumerate(pbar):
             images = batch['image'].to(self.device)
             self.optimizer.zero_grad()
+            fixed_assign = None
+            if self.fixed_pseudo:
+                fixed_assign = self._resolve_batch_assignments(batch['path'], images)
 
             if self.use_amp:
                 with autocast('cuda'):
                     outputs = self.model(images, return_dense=False)
+                    if fixed_assign is not None:
+                        outputs['fixed_assignments'] = fixed_assign
                     loss_dict = self._compute_stage2_losses(outputs, images)
                     loss = loss_dict['loss']
 
@@ -905,6 +1173,8 @@ class Trainer:
                 self.scaler.update()
             else:
                 outputs = self.model(images, return_dense=False)
+                if fixed_assign is not None:
+                    outputs['fixed_assignments'] = fixed_assign
                 loss_dict = self._compute_stage2_losses(outputs, images)
                 loss = loss_dict['loss']
                 loss.backward()
@@ -961,6 +1231,8 @@ class Trainer:
                 labels = batch['label'].cpu().numpy()
 
                 outputs = self.model(images, return_dense=False)
+                if self.fixed_pseudo:
+                    outputs['fixed_assignments'] = self._resolve_batch_assignments(batch['path'], images)
                 loss_dict = self._compute_stage2_losses(outputs, images)
 
                 val_loss['loss'] += float(loss_dict['loss'].item())
@@ -1064,7 +1336,8 @@ class Trainer:
         self,
         num_epochs: int,
         scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
-        early_stopping_patience: int = 10
+        early_stopping_patience: int = 10,
+        min_epochs_before_early_stopping: int = 0,
     ):
         """
         Main training loop
@@ -1073,10 +1346,12 @@ class Trainer:
             num_epochs: Number of epochs to train
             scheduler: Optional learning rate scheduler
             early_stopping_patience: Epochs without improvement before stopping
+            min_epochs_before_early_stopping: Earliest epoch count at which early stopping may trigger
         """
         print(f"Starting training for {num_epochs} epochs")
         print(f"Device: {self.device}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}")
+        print(f"Stage-1 early stopping: patience={early_stopping_patience}, min_epochs={min_epochs_before_early_stopping}")
         
         # Print pseudo-label configuration
         if self.fixed_pseudo:
@@ -1144,6 +1419,23 @@ class Trainer:
                 self.history['val_image_auroc'].append(val_metrics['image_auroc'])
                 if 'pixel_auroc' in val_metrics:
                     self.history['val_pixel_auroc'].append(val_metrics['pixel_auroc'])
+                self.history['val_cluster_all_effective_anchors_used'].append(val_metrics['cluster_all_effective_anchors_used'])
+                self.history['val_cluster_all_assignment_entropy'].append(val_metrics['cluster_all_assignment_entropy'])
+                self.history['val_cluster_all_assignment_entropy_normalized'].append(val_metrics['cluster_all_assignment_entropy_normalized'])
+                self.history['val_cluster_all_largest_anchor_share'].append(val_metrics['cluster_all_largest_anchor_share'])
+                self.history['val_cluster_all_max_min_nonzero_ratio'].append(val_metrics['cluster_all_max_min_nonzero_ratio'])
+                self.history['val_cluster_all_assignment_counts'].append(val_metrics['cluster_all_assignment_counts'])
+                self.history['val_cluster_normal_effective_anchors_used'].append(val_metrics['cluster_normal_effective_anchors_used'])
+                self.history['val_cluster_normal_assignment_entropy'].append(val_metrics['cluster_normal_assignment_entropy'])
+                self.history['val_cluster_normal_assignment_entropy_normalized'].append(val_metrics['cluster_normal_assignment_entropy_normalized'])
+                self.history['val_cluster_normal_largest_anchor_share'].append(val_metrics['cluster_normal_largest_anchor_share'])
+                self.history['val_cluster_normal_max_min_nonzero_ratio'].append(val_metrics['cluster_normal_max_min_nonzero_ratio'])
+                self.history['val_cluster_normal_assignment_counts'].append(val_metrics['cluster_normal_assignment_counts'])
+                self.history['val_cluster_normal_mean_nearest_distance'].append(val_metrics['cluster_normal_mean_nearest_distance'])
+                self.history['val_cluster_normal_mean_second_nearest_distance'].append(val_metrics['cluster_normal_mean_second_nearest_distance'])
+                self.history['val_cluster_normal_mean_margin_d2_minus_d1'].append(val_metrics['cluster_normal_mean_margin_d2_minus_d1'])
+                self.history['val_cluster_normal_mean_ratio_d1_over_d2'].append(val_metrics['cluster_normal_mean_ratio_d1_over_d2'])
+                self.history['val_cluster_anomaly_assignment_counts'].append(val_metrics['cluster_anomaly_assignment_counts'])
                 
                 print(f"\n  Validation Results:")
                 print(f"    Val Loss: {val_metrics['loss']:.4f}")
@@ -1166,6 +1458,23 @@ class Trainer:
                 print(f"    Image AUROC: {val_metrics['image_auroc']:.4f}")
                 if 'pixel_auroc' in val_metrics:
                     print(f"    Pixel AUROC: {val_metrics['pixel_auroc']:.4f}")
+                print(
+                    "    Cluster Normals: "
+                    f"used={val_metrics['cluster_normal_effective_anchors_used']}/{self.model.n_anchors}, "
+                    f"entropy={val_metrics['cluster_normal_assignment_entropy_normalized']:.4f}, "
+                    f"largest_share={val_metrics['cluster_normal_largest_anchor_share']:.4f}, "
+                    f"max/min={val_metrics['cluster_normal_max_min_nonzero_ratio']:.2f}"
+                )
+                second_distance_value = val_metrics['cluster_normal_mean_second_nearest_distance']
+                margin_value = val_metrics['cluster_normal_mean_margin_d2_minus_d1']
+                ratio_value = val_metrics['cluster_normal_mean_ratio_d1_over_d2']
+                print(
+                    "    Cluster Distances (normals): "
+                    f"d1={val_metrics['cluster_normal_mean_nearest_distance']:.4f}, "
+                    f"d2={(second_distance_value if second_distance_value is not None else float('nan')):.4f}, "
+                    f"margin={(margin_value if margin_value is not None else float('nan')):.4f}, "
+                    f"ratio={(ratio_value if ratio_value is not None else float('nan')):.4f}"
+                )
                 
                 # Save best model
                 if val_metrics['image_auroc'] > self.best_val_auroc:
@@ -1177,7 +1486,7 @@ class Trainer:
                     patience_counter += 1
                 
                 # Early stopping
-                if patience_counter >= early_stopping_patience:
+                if (epoch + 1) >= min_epochs_before_early_stopping and patience_counter >= early_stopping_patience:
                     print(f"\nEarly stopping after {epoch+1} epochs")
                     # Save TSNE snapshot before breaking
                     self._save_tsne(epoch=epoch+1, final=True)
@@ -1204,7 +1513,7 @@ class Trainer:
         self._save_tsne(epoch=self.epoch + 1, final=True)
         
         # Create training summary
-        self._create_training_summary(num_epochs, early_stopping_patience)
+        self._create_training_summary(num_epochs, early_stopping_patience, min_epochs_before_early_stopping)
         
         print(f"\nTraining complete!")
         print(f"Best validation AUROC: {self.best_val_auroc:.4f}")
@@ -1324,7 +1633,8 @@ class Trainer:
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'best_val_auroc': self.best_val_auroc,
-            'history': self.history
+            'history': self.history,
+            'anchor_mode': _get_model_anchor_mode(self.model)
         }
         
         if metrics:
@@ -1339,7 +1649,12 @@ class Trainer:
     
     def load_checkpoint(self, checkpoint_path: str):
         """Load model checkpoint"""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        _validate_checkpoint_anchor_mode(
+            checkpoint,
+            expected_anchor_mode=_get_model_anchor_mode(self.model),
+            checkpoint_path=str(checkpoint_path)
+        )
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -1381,7 +1696,7 @@ class Trainer:
             json.dump(history_serializable, f, indent=2)
         print(f"Saved training history: {history_path}")
     
-    def _create_training_summary(self, total_epochs: int, early_stopping_patience: int):
+    def _create_training_summary(self, total_epochs: int, early_stopping_patience: int, min_epochs_before_early_stopping: int):
         """Create a summary JSON file with training information and best model details"""
         import json
         
@@ -1403,6 +1718,7 @@ class Trainer:
             'actual_epochs_trained': actual_epochs,
             'early_stopping_enabled': early_stopping_patience < 1000,
             'early_stopping_patience': early_stopping_patience,
+            'min_epochs_before_early_stopping': min_epochs_before_early_stopping,
             'early_stopped': early_stopped,
             'best_model': {
                 'epoch': best_epoch + 1,  # 1-indexed for readability

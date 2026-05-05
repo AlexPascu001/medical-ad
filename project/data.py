@@ -68,7 +68,8 @@ class BMADDataset(Dataset):
         preprocessor: Optional[BMADPreprocessor] = None,
         augment: bool = False,
         is_training: bool = True,
-        normalize_mode: str = 'zscore_only'
+        normalize_mode: str = 'zscore_only',
+        augment_mode: str = 'full'
     ):
         """
         Args:
@@ -80,6 +81,7 @@ class BMADDataset(Dataset):
             is_training: Training mode flag
             normalize_mode: 'zscore_only' (z-score, no ImageNet norm) or
                             'minmax_imagenet' (min-max [0,1] + ImageNet norm)
+            augment_mode: Training augmentation preset: 'full', 'flip_only', or 'none'
         """
         self.image_paths = image_paths
         self.labels = labels if labels is not None else [0] * len(image_paths)
@@ -90,17 +92,24 @@ class BMADDataset(Dataset):
         # Build transform list
         augment_ops = []
         if augment and is_training:
-            augment_ops = [
-                A.HorizontalFlip(p=0.5),
-                A.ShiftScaleRotate(
-                    shift_limit=0.05,
-                    scale_limit=0.1,
-                    rotate_limit=10,
-                    border_mode=cv2.BORDER_CONSTANT,
-                    value=0,
-                    p=0.5
-                ),
-            ]
+            if augment_mode == 'full':
+                augment_ops = [
+                    A.HorizontalFlip(p=0.5),
+                    A.ShiftScaleRotate(
+                        shift_limit=0.05,
+                        scale_limit=0.1,
+                        rotate_limit=10,
+                        border_mode=cv2.BORDER_CONSTANT,
+                        value=0,
+                        p=0.5
+                    ),
+                ]
+            elif augment_mode == 'flip_only':
+                augment_ops = [A.HorizontalFlip(p=0.5)]
+            elif augment_mode == 'none':
+                augment_ops = []
+            else:
+                raise ValueError(f"Unsupported augment_mode: {augment_mode}")
 
         # Only apply ImageNet normalization when preprocessor outputs [0,1] range
         if normalize_mode == 'minmax_imagenet':
@@ -175,7 +184,8 @@ def create_dataloaders(
     batch_size: int = 64,
     num_workers: int = 4,
     target_size: Tuple[int, int] = (256, 256),
-    normalize_mode: str = 'zscore_only'
+    normalize_mode: str = 'zscore_only',
+    train_augment_mode: str = 'full'
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Create train/val/test dataloaders with proper preprocessing
@@ -192,6 +202,7 @@ def create_dataloaders(
         num_workers: Number of dataloader workers
         target_size: Target image size (H, W)
         normalize_mode: 'zscore_only' or 'minmax_imagenet'
+        train_augment_mode: Training augmentation preset: 'full', 'flip_only', or 'none'
     
     Returns:
         train_loader, val_loader, test_loader
@@ -205,7 +216,8 @@ def create_dataloaders(
         preprocessor=preprocessor,
         augment=True,
         is_training=True,
-        normalize_mode=normalize_mode
+        normalize_mode=normalize_mode,
+        augment_mode=train_augment_mode
     )
     
     # Validation dataset

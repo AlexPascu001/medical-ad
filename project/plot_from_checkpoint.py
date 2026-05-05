@@ -1,6 +1,10 @@
 """
 Load a trained experiment checkpoint and generate visualizations without retraining.
 
+DEPRECATED: Use visualize_pipeline.py instead, which provides a unified
+pipeline visualization covering all 10 diagnostic steps.
+    python visualize_pipeline.py --experiment <experiment_dir>
+
 Capabilities:
 1) Plot training curves from training_history.json
 2) Rebuild model from config + anchors and load best_model.pth (or custom checkpoint)
@@ -169,7 +173,12 @@ def build_model_from_experiment(config: dict, anchor_data: dict, device: torch.d
     learnable_anchors = config['anchor'].get('learnable', False)
     use_embedding_space = config['anchor'].get('use_embedding_space', False)
     reproject_anchors = config['anchor'].get('reproject_anchors', False)
-    use_decoupled = use_embedding_space and (not reproject_anchors) and ('anchor_geometric' in anchor_data)
+    use_decoupled = (
+        use_embedding_space
+        and (not reproject_anchors)
+        and (anchor_data.get('anchor_semantic') is not None)
+        and (anchor_data.get('anchor_geometric') is not None)
+    )
 
     anchor_global = anchor_data.get('anchor_global', None)
     anchor_dense = anchor_data.get('anchor_dense', None)

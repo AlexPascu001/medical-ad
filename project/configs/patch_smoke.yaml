@@ -1,0 +1,67 @@
+seed: 42
+output_dir: './runs/patch_smoke'
+
+data:
+  data_root: './data/BraTS2021_slice'
+  target_size: [240, 240]
+  max_train_samples: 48
+  train_augment_mode: 'none'
+
+anchor:
+  mode: 'patch'
+  strategy: 'kmeans'
+  n_anchors: 4
+  max_images_for_pca: 48
+  learnable: false
+  init_from: null
+  use_embedding_space: false
+  patch:
+    score_reduction: 'mean'
+
+model:
+  backbone: 'vit_small_patch16_dinov3.lvd1689m'
+  freeze_backbone: true
+  projection_dim: 64
+  use_pixel_decoder: false
+
+loss:
+  type: 'cam'
+  margin: 1.0
+  alpha: 1.0
+  beta: 1.0
+  gamma: 0.0
+  delta: 0.1
+  min_norm: 0.5
+  diversity_temperature: 0.1
+  distance_metric: 'euclidean'
+  use_dense: false
+  global_weight: 1.0
+  dense_weight: 0.5
+  spatial_reduction: 'mean'
+
+pretraining:
+  enabled: false
+
+training:
+  epochs: 2
+  batch_size: 16
+  num_workers: 0
+  lr: 0.0001
+  weight_decay: 0.000001
+  use_amp: false
+  log_interval: 1
+  val_interval: 1
+  early_stopping_patience: 2
+  min_epochs_before_early_stopping: 0
+  fixed_pseudo_labels: false
+  dynamic_reassignment: false
+  reassignment_interval: 5
+  pseudo_label_assignment: 'nearest'
+  capacity_multiplier: 2.0
+
+stage2:
+  enabled: false
+
+eval:
+  compute_pixel: false
+  bootstrap_samples: 50

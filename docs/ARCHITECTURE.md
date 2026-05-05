@@ -36,7 +36,7 @@ nearest anchor"}
     F -->|large distance| H(["⚠️ Anomaly"])
 ```
 
-Anomaly detection is **distance-based**: the model learns an embedding space where all healthy brain images lie close to a set of fixed *anchor points*. A test image is anomalous if its embedding is far from every anchor.
+Anomaly detection is **distance-based**: the model learns an embedding space where all healthy brain images lie close to a set of fixed *anchor points*. In the current reproject pipeline, K-means anchors can be represented either by the **nearest real samples** to the kept centroids or by the **centroids themselves**. A test image is anomalous if its embedding is far from every anchor.
 
 ### Two-Stage Architecture
 
@@ -154,7 +154,7 @@ The central entry point that sequences the entire pipeline:
 1. Loads a YAML configuration file (seed, data paths, model settings, loss weights, training schedule, stage-2 options, evaluation flags).
 2. Creates data loaders via `data.py`.
 3. Instantiates the `DINOv3Backbone`.
-4. Generates anchors via `anchors.py` (k-means in 384D DINOv3 embedding space).
+4. Generates anchors via `anchors.py` / `main.py` (k-means in 384D DINOv3 embedding space, with optional post-clustering pruning of the smallest clusters).
 5. Builds the `AnomalyDetector` with the backbone and anchors.
 6. Creates the loss function.
 7. Runs Stage-1 training (and optionally Stage 2).
@@ -195,10 +195,37 @@ Includes a **trainable projection head** (MLP: 384 → hidden → 128D) that map
 
 The main model class that combines all components:
 
-- Stores **anchor embeddings** (384D semantic anchors from k-means).
+- Stores **anchor embeddings** (384D semantic anchors from k-means; either nearest-sample exemplars or true centroids, depending on config).
 - Computes **distances** between projected sample embeddings and re-projected anchor embeddings.
 - Manages the Stage-2 reconstruction branch (stage-2 projection, fuser, decoder, frozen bottleneck).
 - Implements `compute_anomaly_scores()` — the inference entry point that produces image-level scores, pixel maps, divergence signals, and the fused output.
+
+**Score production pipeline** (inference path):
+
+```
+forward(x)
+├── global_distances = L2(proj(CLS), proj(anchors))      # (B, K)
+├── reconstruction = decoder(fuser(stage2_feat ⊕ anchor)) # (B, C, H, W)
+├── reconstruction_error = MSE(x, reconstruction)          # (B,) — per image
+├── bottleneck_divergence = 1 - cos(frozen, stage2)        # (B,) — CLS level
+├── patch_divergence_map = 1 - cos(frozen_patch, stage2_patch)  # (B, H, W)
+└── reconstruction_pixel_map = (x - recon)²                # (B, H, W)
+
+compute_anomaly_scores(x)
+├── anchor_score = global_distances.min(dim=K)             # (B,)
+├── patch_div_aggregated = top_k_percentile(patch_div_map) # (B,)
+├── pixel_aggregated = top_k_percentile(recon_pixel_map)   # (B,)
+└── pixel_scores = reconstruction_pixel_map                # (B, H, W)
+```
+
+The `forward()` method produces raw signals; `compute_anomaly_scores()` wraps it in `torch.no_grad()` and applies aggregation. Dataset-level normalisation and fusion happen later in `eval.py`.
+
+For K-means runs in embedding space, the anchor pipeline now supports two additional controls:
+
+- **Effective-K pruning**: after the initial K-means pass, the smallest configurable fraction of clusters can be dropped before semantic anchors are finalised.
+- **Capacity-constrained fixed pseudo-labeling**: the initial sample-to-anchor labels can enforce a hard maximum occupancy per anchor, computed from the effective K after pruning.
+
+> **"Pixel-level data not available"**: During Stage-1 training/validation, the reconstruction branch does not exist. `compute_anomaly_scores()` produces no `pixel_scores` key, and the evaluation code skips pixel metrics with an informational log. This is expected behaviour, not a bug.
 
 Supports three anchor modes:
 
@@ -258,24 +285,37 @@ Weighted sum of the global `AnchorMarginLoss` and `DenseAnchorMarginLoss`.
 
 The `Trainer` class manages both training stages:
 
-- **Stage 1** (`train_epoch`): forward pass → loss computation → backprop. Supports fixed pseudo-labels (computed once in 384D) or dynamic reassignment.
-- **Stage 2** (`train_epoch_stage2`): reconstruction + alignment loss. Frozen bottleneck kept in eval mode.
+- **Stage 1** (`train_epoch`): forward pass → loss computation → backprop. Supports fixed pseudo-labels (computed once in 384D) with either nearest-anchor or capacity-constrained assignment.
+- **Stage 2** (`train_epoch_stage2`): reconstruction + alignment loss. Frozen bottleneck kept in eval mode. Alignment can target either the frozen sample projection or the sample's fixed Stage-1 anchor target.
 - **Validation** (`validate` / `validate_stage2`): computes AUROC metrics via `eval.py`. Tracks image AUROC (Stage 1) or pixel-aggregated image AUROC (Stage 2) for early stopping.
 - **Checkpointing**: saves `best_model.pth` (Stage 1) and `best_stage2_model.pth` (Stage 2).
 - **Visualisation**: periodic t-SNE and PCA plots of training/test embeddings coloured by anchor assignment.
 
 ### `eval.py` — Evaluation & Scoring
 
-`evaluate_model()` is the main inference function. It computes:
+`evaluate_model()` is the main inference function. It iterates over the test set, collects per-image scores from `model.compute_anomaly_scores()`, then performs dataset-level operations:
 
 | Signal | Description | Available |
 |--------|-------------|-----------|
 | **Anchor score** | Min Euclidean distance to any re-projected anchor | Always |
-| **Reconstruction score** | MSE/L1 between input and reconstructed image | Stage 2 |
-| **Bottleneck divergence** | Distance between frozen (Stage-1) and trainable (Stage-2) projections | Stage 2 with frozen bottleneck |
-| **Patch divergence** | Per-patch (15×15) divergence, aggregated to image level | Stage 2 with frozen bottleneck |
+| **Reconstruction score** | MSE between input and reconstructed image | Stage 2 |
+| **Bottleneck divergence** | Cosine distance: frozen vs. stage-2 projection (CLS) | Stage 2 with frozen bottleneck |
+| **Patch divergence** | Per-patch (15×15) divergence, aggregated via top-k percentile | Stage 2 with frozen bottleneck |
 | **Pixel aggregation** | Top-k percentile of pixel-level reconstruction errors | Stage 2 |
 | **3-signal fusion** | Weighted combination of anchor + divergence + pixel after normalisation | Stage 2 with fusion enabled |
+
+**Score fusion pipeline** (inside `evaluate_model()` → `_norm_fusion()`):
+
+1. **Collect** all per-image signal arrays after test-set iteration.
+2. **Select divergence signal**: compare individual AUROCs of CLS-divergence vs. patch-divergence; pick the higher.
+3. **Anti-correlation guard**: drop any signal with individual AUROC < 0.5 (set its weight to 0).
+4. **Normalise** each surviving signal independently (default: `minmax` across all test samples).
+5. **Fuse**: weighted sum with renormalised weights → final fused score array.
+6. **Compute metrics**: image-level AUROC/AUPR on fused scores; pixel-level AUROC on flattened pixel maps vs. flattened GT masks.
+
+The pixel-to-image aggregation uses `pixel_aggregation.py:aggregate_pixel_scores_torch()`, which supports five strategies: `top_k_percentile` (default, 95th percentile), `mean`, `max`, `self_normalized`, and `threshold_ratio`.
+
+For a detailed analysis of how score signals behave at different K values, see [SCORING_ANALYSIS.md](SCORING_ANALYSIS.md). For exact formulas, see [PIPELINE.md § 5.6](PIPELINE.md#56-score-computation-details).
 
 Additional outputs: bootstrap confidence intervals, operating-point tables (at target FPR), ROC / score-distribution visualisations, per-image score CSV.
 

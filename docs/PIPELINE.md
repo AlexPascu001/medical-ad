@@ -73,21 +73,27 @@ during training"]
 flowchart TD
     A["All training images<br/>(normal only)"] --> B["DINOv3 ViT<br/>(frozen backbone)"]
     B --> C["CLS tokens<br/>N × 384D"]
-    C --> D["K-Means<br/>(K clusters in 384D)"]
-    D --> E["K centroids<br/>K × 384D"]
-    D --> F["Nearest image<br/>to each centroid"]
-    E --> G["Anchor Semantic<br/>Embeddings<br/>(K × 384D)"]
-    F --> H["Anchor Images<br/>(for visualisation)"]
-    G --> I["Stored in<br/>AnomalyDetector"]
+    C --> D["K-Means<br/>(initial K clusters in 384D)"]
+    D --> E["Cluster sizes"]
+    E --> F{"Prune smallest<br/>clusters?"}
+    F -->|No| G["Keep all clusters"]
+    F -->|Yes| H["Drop smallest<br/>configurable fraction"]
+    G --> I["Effective anchor set"]
+    H --> I
+    I --> J["Semantic anchors:<br/>nearest samples OR centroids"]
+    I --> K["Visual artefacts:<br/>sample exemplars OR<br/>cluster-mean images"]
+    J --> L["Stored in<br/>AnomalyDetector"]
 ```
 
 </details>
 
 **Key details:**
 
-- Embeddings are extracted with the **frozen** DINOv3 backbone (before any projection head training).
+- Embeddings are extracted with the **frozen** DINOv3 backbone (before any projection head training). In `regfix` configs the backbone is later finetuned during Stage 1, which means the 384D space drifts — but the stored anchor embeddings are **never recomputed**. This is a deliberate design compromise: the shared projection head (which re-projects both samples and anchors into 128D) learns to bridge the gap between the original and finetuned 384D distributions. Because backbone finetuning is mild (small LR with layer-wise decay), the drift remains small enough for the projection head to compensate.
 - The clustering operates in the **raw 384D CLS-token space**, which captures rich semantic features.
-- The selected anchor images are those closest (L2) to each k-means centroid — they are real training images, not synthetic.
+- For K-means runs, the semantic anchor representation is configurable: either the **nearest real sample** to each kept centroid (`closest_samples`) or the **centroid vector itself** (`centroids`).
+- Optional pruning can drop the smallest clusters **after** the initial K-means pass. This reduces the effective K used downstream; samples that would have belonged to discarded clusters are later re-assigned to the nearest kept anchor during fixed pseudo-label computation.
+- In centroid mode, the saved `anchor_images` visualisation is the **mean preprocessed image** of each kept cluster. This image is only a visual summary; the actual semantic anchor remains the 384D centroid vector.
 - The resulting 384D embeddings are stored in the `AnomalyDetector` as `anchor_global_raw` (a fixed buffer, not a learnable parameter).
 - Typical K values used in experiments: **K = 1** (single anchor, best image AUROC), **K = 512**, **K = 1024**.
 
@@ -174,9 +180,15 @@ flowchart TD
 
 ### 3.3 Fixed Pseudo-Labels
 
-Before training begins, every training image is assigned to its nearest anchor **in the raw 384D DINOv3 space** (not the projected 128D space). This assignment is computed once and remains constant across all epochs.
+Before training begins, every training image is assigned to an anchor **in the raw 384D DINOv3 space** (not the projected 128D space). By default this is nearest-anchor assignment, but the assignment step can also enforce a configurable hard capacity cap per anchor. In both cases the assignment is computed once and remains constant across all epochs.
 
 The rationale: the 384D semantic space provides meaningful, stable cluster assignments before the projection head has been trained. Assigning in the 128D space would use random (untrained) projections, producing meaningless assignments.
+
+When `training.pseudo_label_assignment = capacitated`, the initial assignment also enforces:
+
+$$\max_k n_k \leq \left\lceil m \cdot \frac{N}{K_{\text{effective}}} \right\rceil$$
+
+where $m$ is `training.capacity_multiplier`, $N$ is the number of training samples, and $K_{\text{effective}}$ is the anchor count after any pruning. This cap is applied only during the initial fixed pseudo-label pass.
 
 ### 3.4 Anchor Re-Projection
 
@@ -343,7 +355,7 @@ $$L_{\text{Stage2}} = w_r \cdot L_{\text{recon}} + w_a \cdot L_{\text{align}}$$
 | Term | Default weight | Description |
 |------|---------------|-------------|
 | **Reconstruction** ($w_r = 1.0$) | MSE between input image and reconstructed image |
-| **Alignment** ($w_a = 0.1$) | $1 - \cos(f_{\text{stage2}}, f_{\text{frozen}})$ — keeps stage-2 bottleneck close to stage-1 space |
+| **Alignment** ($w_a = 0.1$) | Configurable: either $1 - \cos(f_{\text{stage2}}, f_{\text{frozen}})$ (`alignment_target = sample`) or $1 - \cos(f_{\text{stage2}}, f_{\text{anchor}})$ (`alignment_target = anchor`) |
 
 ### 4.6 Trainable Components
 
@@ -364,6 +376,8 @@ $$L_{\text{Stage2}} = w_r \cdot L_{\text{recon}} + w_a \cdot L_{\text{align}}$$
 ### 4.7 What the Frozen Bottleneck Provides
 
 The frozen projection produces an embedding that reflects the **Stage-1 learned space**. The trainable stage-2 projection, on the other hand, adapts to the reconstruction task. For normal images the two projections remain close (low divergence). For anomalous images — which the reconstruction branch struggles to faithfully reconstruct — the stage-2 features drift from the frozen reference, creating a **bottleneck divergence** signal.
+
+If `stage2.alignment_target = anchor`, the reconstruction bottleneck is instead regularised toward the sample's **fixed Stage-1 pseudo-label anchor** in the frozen Stage-1 anchor space. This keeps the stage-2 bottleneck near the semantic prototype assigned during Stage 1 rather than near the frozen projection of the current sample itself.
 
 This divergence is measured in two complementary ways:
 
@@ -519,6 +533,99 @@ Four intermediate signals are computed, but only **three** enter the final fusio
 | **Reconstruction score** | MSE between input and reconstructed image | Image-level | Not fused — diagnostic only |
 | **3-signal fusion** | Normalised weighted sum: Signal 1 + Signal 2 + Signal 3 | Image-level | Final score |
 
+### 5.6 Score Computation Details
+
+This section documents exactly how each signal is computed, with references to the source code.
+
+#### Anchor Score (Image-Level)
+
+Computed in `model.py:compute_anomaly_scores()`. The model's `forward()` produces `global_distances` — a (B, K) matrix of Euclidean distances between each sample's 128D projected embedding and all K re-projected anchor embeddings. The anchor score is the **minimum** across anchors:
+
+$$s_{\text{anchor}}(x) = \min_{k=1 \ldots K} \lVert \text{proj}(x) - \text{proj}(a_k) \rVert_2$$
+
+where `proj()` is the trained projection head (384D → 128D) applied to both the sample's CLS token and each anchor's raw 384D embedding. Both are L2-normalised before distance computation.
+
+#### Reconstruction Score (Image-Level)
+
+Computed in `model.py:forward()`. After the fuser merges `stage2_feat` with the assigned anchor's re-projected embedding, the reconstruction decoder produces a reconstructed image. The score is the **mean squared error** across all pixels and channels:
+
+$$s_{\text{recon}}(x) = \frac{1}{C \cdot H \cdot W} \sum_{c,h,w} \bigl(x_{c,h,w} - \hat{x}_{c,h,w}\bigr)^2$$
+
+This is a diagnostic signal — it is **not** included in the 3-signal fusion because the pixel-aggregated version (below) is strictly more informative.
+
+#### Bottleneck Divergence (CLS-Level, Image-Level)
+
+Computed in `model.py:forward()`, gated by `use_frozen_bottleneck = True`. The frozen projection (deep copy of Stage-1 projection head, never updated) and the trainable stage-2 projection are both applied to the raw CLS token:
+
+$$s_{\text{div}}^{\text{CLS}}(x) = 1 - \cos\bigl(f_{\text{frozen}}(\text{CLS}_{\text{raw}}),\; f_{\text{stage2}}(\text{CLS}_{\text{raw}})\bigr)$$
+
+In decoupled mode (when `recon_dim ≠ anchor_dim`), the comparison uses the backbone projection output instead of stage-2 features, so that both terms live in anchor space.
+
+#### Patch-Level Divergence (Spatial → Aggregated Image-Level)
+
+Computed in `model.py:forward()` and aggregated in `compute_anomaly_scores()`. For each of the 15×15 = 225 patch tokens:
+
+$$d_{\text{patch}}(x, i) = 1 - \cos\bigl(f_{\text{frozen}}(\text{patch}_i),\; f_{\text{stage2}}(\text{patch}_i)\bigr)$$
+
+This produces a (B, 15, 15) divergence map, which is bilinearly upsampled to (B, 240, 240). The image-level score is then obtained via top-k percentile aggregation (see below).
+
+#### Pixel Anomaly Map (Pixel-Level, 240×240)
+
+Computed in `model.py:forward()` as the per-pixel reconstruction error:
+
+$$\text{pixel\_map}(x)_{h,w} = \frac{1}{C} \sum_c \bigl(x_{c,h,w} - \hat{x}_{c,h,w}\bigr)^2$$
+
+This map has one value per spatial position (channels averaged). It is the basis for both the pixel-level AUROC metric and the pixel-aggregated image-level score.
+
+#### Pixel-Aggregated Score (Image-Level)
+
+Computed in `pixel_aggregation.py:aggregate_pixel_scores_torch()`. Converts the pixel anomaly map to a single image-level score using **top-k percentile** aggregation (default: 95th percentile):
+
+1. Flatten the (H, W) pixel map to a vector.
+2. Select the top $\lceil 0.05 \cdot H \cdot W \rceil$ largest values.
+3. Take their mean as the image-level score.
+
+$$s_{\text{pixel}}(x) = \text{mean}\bigl(\text{top-}k\%\;\text{of pixel\_map}(x)\bigr)$$
+
+This focuses on the worst-reconstructed region (typically the tumour area), avoiding dilution by the healthy background.
+
+Five aggregation methods are supported:
+
+| Method | Formula | Use case |
+|--------|---------|----------|
+| `top_k_percentile` | Mean of top-k% largest pixel values | Default — robust maximum, captures localised anomalies |
+| `mean` | $\text{mean}(\text{pixel\_map})$ | Baseline — simple but diluted by healthy tissue |
+| `max` | $\max(\text{pixel\_map})$ | Sensitive to single outlier pixels |
+| `self_normalized` | $(\text{top-}k\text{ mean} - \text{median}) / \text{IQR}$ | Content-invariant, removes per-image baseline |
+| `threshold_ratio` | Fraction of pixels exceeding a threshold | Requires calibrated threshold (from training stats) |
+
+#### Three-Signal Fusion (Image-Level)
+
+Computed in `eval.py:evaluate_model()` inside the nested `_norm_fusion()` function. This is a **dataset-level** operation — it runs after all test images have been scored:
+
+1. **Divergence selection:** Compare CLS-level divergence AUROC vs. patch-divergence aggregated AUROC. Select whichever is higher as the divergence signal.
+2. **Anti-correlation guard:** For each of the three signals (anchor, divergence, pixel-aggregated), compute its individual AUROC. If AUROC < 0.5, **drop** the signal (set its weight to 0).
+3. **Normalisation:** Apply the configured normalisation (default: `minmax`) to each surviving signal independently across all test samples.
+4. **Weighted sum:** Compute $\text{score} = w_a \cdot \hat{s}_a + w_d \cdot \hat{s}_d + w_p \cdot \hat{s}_p$ with renormalised weights (so surviving weights still sum to 1).
+
+$$\text{score}_{\text{fused}}(x) = \frac{w_a}{\sum w_{\text{active}}} \hat{s}_a(x) + \frac{w_d}{\sum w_{\text{active}}} \hat{s}_d(x) + \frac{w_p}{\sum w_{\text{active}}} \hat{s}_p(x)$$
+
+where dropped signals contribute 0 and their weight is excluded from $\sum w_{\text{active}}$.
+
+Default weights: $w_a = 0.4$, $w_d = 0.3$, $w_p = 0.3$ (configurable in YAML).
+
+#### Pixel AUROC (Evaluation Metric)
+
+Computed in `eval.py:evaluate_model()`. After scoring all test images, the pixel-level AUROC is:
+
+$$\text{Pixel AUROC} = \text{roc\_auc\_score}\bigl(\text{all\_masks\_flat},\; \text{all\_pixel\_scores\_flat}\bigr)$$
+
+Every pixel across all test images with ground-truth masks is treated as an independent binary classification (0 = normal, 1 = anomalous). The pixel scores come from the pixel anomaly map (reconstruction L2 error). This metric evaluates **localisation** quality — whether the model assigns high error to the correct spatial regions.
+
+> **Note:** Pixel-level metrics are only available after Stage 2. During Stage-1 training and validation, the model has no reconstruction decoder, so `compute_anomaly_scores()` does not produce pixel scores. The log message "Pixel-level data not available" during Stage-1 validation is **expected and harmless** — it indicates that pixel metrics are being skipped, not that something is broken.
+
+For a detailed analysis of how these scores behave at different K values, see [SCORING_ANALYSIS.md](SCORING_ANALYSIS.md).
+
 ---
 
 ## 6. Post-Processing
@@ -588,6 +695,23 @@ Anchor embeddings are `nn.Parameter`s optimised jointly with the projection head
 This mode supports dynamic pseudo-label reassignment every N epochs, allowing cluster assignments to evolve as the embedding space changes.
 
 Configuration: set `learnable: true` in the anchor config section.
+
+### 7.3 Patch / Dense-Anchor Mode
+
+Patch mode keeps the global anchor pipeline intact and adds an alternative detector selected with `anchor.mode: patch`.
+
+- **Anchor representation:** each selected anchor image contributes both a global semantic embedding and a dense 15 x 15 patch grid. In embedding-space mode, those dense anchor maps are now generated alongside the 384D global semantic anchors.
+- **Stage-1 score path:** the detector compares each sample patch only to the corresponding spatial patch in every anchor map, then reduces the per-location distances to a per-anchor image score via `anchor.patch.score_reduction` (`mean` or `max`).
+- **Fixed pseudo-label semantics:** when `training.fixed_pseudo_labels: true`, assignments are precomputed from patch-to-anchor distances on an augmentation-free dataset view so the fixed labels match patch scoring semantics rather than the legacy CLS-only path.
+- **Augmentation constraint:** `data.train_augment_mode: full` is rejected in patch mode because `ShiftScaleRotate` breaks location-wise correspondence. Use `none` or `flip_only`.
+- **Stage-2 support:** patch mode now reuses the standard reconstruction branch. The assigned stage-1 anchor summary is fused with `stage2_feat` exactly as in global mode, and `stage2.alignment_target: anchor` is supported as long as `training.fixed_pseudo_labels: true` is enabled.
+- **Pixel-map provenance:** before Stage 2, patch mode's localization map is an upsampled dense patch-distance map (`pixel_scores_source = dense_patch_upsampled`). Once Stage 2 is enabled, the primary pixel map becomes the reconstruction residual map.
+
+Validated configs:
+
+- `project/configs/patch_fixed_cap_smoke.yaml`: fixed pseudo-labels + capacity-constrained assignment in patch mode.
+- `project/configs/patch_stage2_smoke.yaml`: end-to-end patch Stage-2 smoke test.
+- `project/configs/patch_stage2_quick.yaml`: bounded larger validation run using the default Stage-2 early-stopping metric.
 
 ---
 

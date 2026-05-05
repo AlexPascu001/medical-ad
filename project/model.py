@@ -472,6 +472,7 @@ class AnomalyDetector(nn.Module):
         self.use_pixel_decoder = use_pixel_decoder
         self.target_size = target_size
         self.use_decoupled_anchors = use_decoupled_anchors
+        self.anchor_mode = 'global'
         
         # EXPERT'S APPROACH: Decouple semantic from geometric anchors
         if use_decoupled_anchors:
@@ -483,12 +484,12 @@ class AnomalyDetector(nn.Module):
             # These NEVER move during training - projection head learns to map samples to these
             if learnable_anchors:
                 self.anchor_geometric = nn.Parameter(anchor_geometric_targets.clone())
-                print(f"  ✓ DECOUPLED ANCHORS (Expert's Approach):")
+                print("  [OK] DECOUPLED ANCHORS (Expert's Approach):")
                 print(f"    - Semantic (384D): {anchor_semantic_embeddings.shape} [FROZEN, for pseudo-labels]")
                 print(f"    - Geometric (128D): {anchor_geometric_targets.shape} [LEARNABLE, training targets]")
             else:
                 self.register_buffer('anchor_geometric', anchor_geometric_targets)
-                print(f"  ✓ DECOUPLED ANCHORS (Expert's Approach):")
+                print("  [OK] DECOUPLED ANCHORS (Expert's Approach):")
                 print(f"    - Semantic (384D): {anchor_semantic_embeddings.shape} [FROZEN, for pseudo-labels]")
                 print(f"    - Geometric (128D): {anchor_geometric_targets.shape} [FIXED, never move]")
             
@@ -508,14 +509,14 @@ class AnomalyDetector(nn.Module):
                     self.anchor_dense = nn.Parameter(anchor_dense_embeddings.clone())
                 else:
                     self.anchor_dense = None
-                print(f"  ✓ Anchors are LEARNABLE in PROJECTED space ({anchor_global_embeddings.shape[0]} × {anchor_global_embeddings.shape[1]}D)")
+                print(f"  [OK] Anchors are LEARNABLE in PROJECTED space ({anchor_global_embeddings.shape[0]} x {anchor_global_embeddings.shape[1]}D)")
             else:
                 self.register_buffer('anchor_global', anchor_global_embeddings)
                 if anchor_dense_embeddings is not None:
                     self.register_buffer('anchor_dense', anchor_dense_embeddings)
                 else:
                     self.anchor_dense = None
-                print(f"  ✓ Anchors are FIXED in PROJECTED space ({anchor_global_embeddings.shape[0]} × {anchor_global_embeddings.shape[1]}D)")
+                print(f"  [OK] Anchors are FIXED in PROJECTED space ({anchor_global_embeddings.shape[0]} x {anchor_global_embeddings.shape[1]}D)")
                 print(f"    They will NOT be re-projected - acting as fixed targets")
             
             self.anchor_global_raw = None
@@ -533,14 +534,14 @@ class AnomalyDetector(nn.Module):
                     self.anchor_dense_raw = nn.Parameter(anchor_dense_embeddings.clone())
                 else:
                     self.anchor_dense_raw = None
-                print(f"  ✓ Anchors are LEARNABLE in RAW space ({anchor_global_embeddings.shape[0]} × {anchor_global_embeddings.shape[1]}D)")
+                print(f"  [OK] Anchors are LEARNABLE in RAW space ({anchor_global_embeddings.shape[0]} x {anchor_global_embeddings.shape[1]}D)")
             else:
                 self.register_buffer('anchor_global_raw', anchor_global_embeddings)
                 if anchor_dense_embeddings is not None:
                     self.register_buffer('anchor_dense_raw', anchor_dense_embeddings)
                 else:
                     self.anchor_dense_raw = None
-                print(f"  ⚠ Anchors are FIXED in RAW space ({anchor_global_embeddings.shape[0]} × {anchor_global_embeddings.shape[1]}D)")
+                print(f"  [WARN] Anchors are FIXED in RAW space ({anchor_global_embeddings.shape[0]} x {anchor_global_embeddings.shape[1]}D)")
                 print(f"    WARNING: Will be re-projected each forward - may cause issues!")
             
             # No projected anchors stored
@@ -633,7 +634,8 @@ class AnomalyDetector(nn.Module):
         pixel_map_enabled: bool = True,
         pixel_map_type: str = 'reconstruction_l2',
         use_frozen_bottleneck: bool = False,
-        recon_projection_dim: int = None
+        recon_projection_dim: int = None,
+        no_fuser: bool = False
     ):
         """
         Enable stage-2 branch with optionally decoupled reconstruction projection.
@@ -689,20 +691,26 @@ class AnomalyDetector(nn.Module):
             print(f"  ✓ Frozen bottleneck (stage-1 copy, {anchor_dim}D) created")
 
         # --- Anchor re-projection layer (anchor_dim → recon_dim) ---
-        if recon_dim != anchor_dim:
-            self.anchor_reproject = nn.Linear(anchor_dim, recon_dim)
-            nn.init.orthogonal_(self.anchor_reproject.weight, gain=1.0)
-            nn.init.zeros_(self.anchor_reproject.bias)
-            print(f"  ✓ Anchor re-projection: {anchor_dim} → {recon_dim}")
-        else:
+        self.no_fuser = no_fuser
+        if no_fuser:
             self.anchor_reproject = None
+            self.stage2_fuser = None
+            print(f"  ✓ No-fuser mode: decoder receives stage2_feat ({recon_dim}D) directly")
+        else:
+            if recon_dim != anchor_dim:
+                self.anchor_reproject = nn.Linear(anchor_dim, recon_dim)
+                nn.init.orthogonal_(self.anchor_reproject.weight, gain=1.0)
+                nn.init.zeros_(self.anchor_reproject.bias)
+                print(f"  ✓ Anchor re-projection: {anchor_dim} → {recon_dim}")
+            else:
+                self.anchor_reproject = None
 
-        # --- Fuser and decoder operate in recon_dim space ---
-        self.stage2_fuser = nn.Sequential(
-            nn.Linear(2 * recon_dim, recon_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(recon_dim, recon_dim)
-        )
+            # --- Fuser and decoder operate in recon_dim space ---
+            self.stage2_fuser = nn.Sequential(
+                nn.Linear(2 * recon_dim, recon_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(recon_dim, recon_dim)
+            )
 
         self.reconstruction_decoder = ReconstructionDecoder(
             latent_dim=recon_dim,
@@ -963,11 +971,13 @@ class AnomalyDetector(nn.Module):
             if self.stage2_freeze_anchor_target:
                 assigned_anchor_embeddings = assigned_anchor_embeddings.detach()
 
-            # Re-project anchors to recon_dim if decoupled
-            if self.anchor_reproject is not None:
-                assigned_anchor_embeddings = self.anchor_reproject(assigned_anchor_embeddings)
-
-            recon_latent = self.stage2_fuser(torch.cat([assigned_anchor_embeddings, stage2_feat], dim=1))
+            if self.no_fuser:
+                recon_latent = stage2_feat
+            else:
+                # Re-project anchors to recon_dim if decoupled
+                if self.anchor_reproject is not None:
+                    assigned_anchor_embeddings = self.anchor_reproject(assigned_anchor_embeddings)
+                recon_latent = self.stage2_fuser(torch.cat([assigned_anchor_embeddings, stage2_feat], dim=1))
             reconstruction = self.reconstruction_decoder(recon_latent)
             reconstruction_error = (reconstruction - x).pow(2).mean(dim=(1, 2, 3))
 
@@ -1144,6 +1154,7 @@ class AnomalyDetector(nn.Module):
                 if return_maps:
                     result['reconstruction_pixel_scores'] = reconstruction_pixel_scores
                     result['pixel_scores'] = reconstruction_pixel_scores
+                    result['pixel_scores_source'] = 'reconstruction_pixel_map'
 
                 # Pixel-to-image aggregation — always computed (not gated by return_maps)
                 pixel_aggregated = aggregate_pixel_scores_torch(
@@ -1171,8 +1182,10 @@ class AnomalyDetector(nn.Module):
                     ).squeeze(1)
                 
                 result['anchor_pixel_scores'] = pixel_scores
+                result['anchor_pixel_scores_source'] = 'pixel_decoder_anchor_map'
                 if 'pixel_scores' not in result:
                     result['pixel_scores'] = pixel_scores
+                    result['pixel_scores_source'] = 'pixel_decoder_anchor_map'
                 result['pixel_embeddings'] = outputs.get('pixel_embeddings')
             
             # Fallback: patch-level anomaly map (legacy, upsampled)
@@ -1192,8 +1205,10 @@ class AnomalyDetector(nn.Module):
                     ).squeeze(1)  # (B, H, W)
                 
                 result['anchor_pixel_scores'] = pixel_scores
+                result['anchor_pixel_scores_source'] = 'dense_patch_upsampled'
                 if 'pixel_scores' not in result:
                     result['pixel_scores'] = pixel_scores
+                    result['pixel_scores_source'] = 'dense_patch_upsampled'
 
             # Optional raw combination output (final AUROC combination should be dataset-level in eval)
             if self.score_combination_enabled and ('anchor_scores' in result) and ('reconstruction_scores' in result):

@@ -1,0 +1,109 @@
+# Patch stage-2 e70 family: K=4 anchors
+seed: 42
+output_dir: './runs/patch_stage2e70_k4'
+
+data:
+  data_root: './data/BraTS2021_slice'
+  normalization: 'zscore_only'
+  target_size: [240, 240]
+  train_augment_mode: 'none'
+
+anchor:
+  mode: 'patch'
+  strategy: 'kmeans'
+  n_anchors: 4
+  max_images_for_pca: 5000
+  learnable: false
+  init_from: null
+  use_embedding_space: true
+  reproject_anchors: true
+  representation: 'closest_samples'
+  patch:
+    score_reduction: 'mean'
+
+model:
+  backbone: 'vit_small_patch16_dinov3.lvd1689m'
+  freeze_backbone: true
+  projection_dim: 128
+  projection_dim_recon: null
+  use_pixel_decoder: false
+
+loss:
+  type: 'cam'
+  margin: 1.0
+  alpha: 1.0
+  beta: 0.5
+  gamma: 0.0
+  delta: 0.0
+  min_norm: 0.5
+  diversity_temperature: 0.1
+  distance_metric: 'euclidean'
+  use_dense: false
+  global_weight: 1.0
+  dense_weight: 0.5
+  spatial_reduction: 'mean'
+
+pretraining:
+  enabled: false
+
+training:
+  epochs: 100
+  batch_size: 64
+  num_workers: 4
+  lr: 0.0001
+  weight_decay: 0.0001
+  use_amp: true
+  log_interval: 50
+  val_interval: 1
+  early_stopping_patience: 10
+  min_epochs_before_early_stopping: 0
+  fixed_pseudo_labels: true
+  dynamic_reassignment: false
+  reassignment_interval: 5
+  save_checkpoints: false
+  pseudo_label_assignment: 'capacitated'
+  capacity_multiplier: 2.0
+
+stage2:
+  enabled: true
+  epochs: 70
+  lr: 0.0001
+  weight_decay: 0.0001
+  freeze_encoder: true
+  freeze_anchors: true
+  freeze_anchor_target: true
+  recon_loss: 'mse'
+  recon_weight: 1.0
+  consistency_loss: 'cosine'
+  consistency_weight: 0.1
+  frozen_bottleneck: true
+  alignment_weight: 0.1
+  alignment_target: 'anchor'
+  freeze_encoder_mode: 'full'
+  unfreeze_last_n_blocks: 2
+  unfreeze_lr_multiplier: 0.1
+  early_stopping_patience: 10
+  early_stopping_metric: 'pixel_aggregated_image_auroc'
+  pixel_map:
+    enabled: true
+    type: 'reconstruction_l2'
+  pixel_metrics:
+    enabled: true
+  score_combination:
+    enabled: false
+    alpha: 0.5
+    normalization: 'minmax'
+  pixel_aggregation:
+    method: 'top_k_percentile'
+    percentile: 95
+    threshold_n_std: 2.0
+  score_fusion:
+    enabled: true
+    normalization: 'minmax'
+    anchor_weight: 0.4
+    divergence_weight: 0.3
+    pixel_weight: 0.3
+
+eval:
+  compute_pixel: true
+  bootstrap_samples: 1000

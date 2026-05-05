@@ -125,11 +125,17 @@ Stage-2 in `AnomalyDetector`:
 - Adds copied stage-2 projection branch + fusion block + reconstruction decoder.
 - Uses anchor assignment from stage-1 distance path.
 - Can freeze encoder and/or anchors during stage-2.
+- In `anchor.mode: patch`, the stage-1 assignment path comes from reduced dense patch-to-anchor distances rather than CLS-only distances.
 
 Stage-2 losses:
 
 1. **Reconstruction loss** (`mse` or `l1`) between reconstructed and input normalized image.
 2. **Consistency loss** (`cosine` or `l2`) between stage-2 feature and assigned anchor embedding.
+
+Patch-mode note:
+
+- `stage2.alignment_target: anchor` in patch mode requires `training.fixed_pseudo_labels: true`, because the alignment target is the sample's fixed Stage-1 anchor assignment.
+- Patch mode still forbids `data.train_augment_mode: full`; fixed pseudo-labels are computed from an augmentation-free view to preserve per-location meaning.
 
 Stage-2 pixel map options:
 
@@ -209,15 +215,17 @@ Default config lives in `project/configs/default.yaml`.
 
 Notable knobs:
 
-- `anchor.*`: strategy, count, embedding-space behavior, reproject behavior.
+- `anchor.*`: strategy, count, embedding-space behavior, reproject behavior, and `anchor.mode: global|patch`.
 - `model.*`: backbone and projection head.
 - `loss.*`: margin and component weights.
 - `training.*`: optimizer, epochs, early stopping, pseudo-label mode.
+- `data.train_augment_mode`: `full`, `flip_only`, or `none` training-only augmentation preset. Patch mode supports only `flip_only` or `none`.
 - `stage2.*`:
   - reconstruction and consistency losses,
   - pixel map generation (`pixel_map.enabled/type`),
   - pixel metric toggle (`pixel_metrics.enabled`),
-  - score combination (`score_combination.enabled/alpha/normalization`).
+   - score combination (`score_combination.enabled/alpha/normalization`),
+   - alignment target (`sample` or `anchor`) and early stopping metric (`pixel_aggregated_image_auroc` by default).
 - `eval.*`: pixel metric computation and bootstrap settings.
 
 ---
@@ -242,6 +250,12 @@ Evaluation-only mode:
 1. **Config path typos / cwd mismatch**
    - Running from `project/` vs repo root changes relative path resolution.
    - Prefer root-level invocation with explicit config path.
+2. **Patch mode + full augmentation is invalid**
+   - `data.train_augment_mode: full` includes spatial transforms that destroy patch-to-location correspondence.
+   - Use `train_augment_mode: none` or `flip_only` for patch runs.
+3. **Patch anchor alignment in Stage 2 needs fixed assignments**
+   - `stage2.alignment_target: anchor` depends on a persistent Stage-1 assignment per sample.
+   - In patch mode, set `training.fixed_pseudo_labels: true` so Stage 2 aligns to the same anchor labels used in Stage 1.
 
 2. **Output directory uniqueness behavior**
    - Training mode can auto-append suffixes (`_1`, `_2`, ...), creating many sibling experiment folders.

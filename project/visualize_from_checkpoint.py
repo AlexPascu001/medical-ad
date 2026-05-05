@@ -1,6 +1,10 @@
 """
 Comprehensive Visualization from Existing Checkpoints
 
+DEPRECATED: Use visualize_pipeline.py instead, which provides a unified
+pipeline visualization covering all 10 diagnostic steps.
+    python visualize_pipeline.py --experiment <experiment_dir>
+
 This script loads a trained model from a checkpoint directory and generates:
 1. t-SNE visualization of embeddings (anchors, normal samples, anomaly samples)
 2. Training curves (if history is available)

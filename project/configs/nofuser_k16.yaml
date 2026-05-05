@@ -1,0 +1,95 @@
+# No-fuser ablation: K=16 anchors, decoder receives only bottleneck output (no anchor info)
+seed: 42
+output_dir: './runs/nofuser_k16'
+
+data:
+  data_root: './data/BraTS2021_slice'
+  target_size: [240, 240]
+  normalization: zscore_only
+
+anchor:
+  strategy: 'kmeans'
+  n_components: 50
+  n_anchors: 16
+  max_images_for_pca: 5000
+  learnable: false
+  use_embedding_space: true
+
+model:
+  backbone: 'vit_small_patch16_dinov3.lvd1689m'
+  freeze_backbone: true
+  projection_dim: 128
+
+loss:
+  margin: 1.0
+  alpha: 1.0
+  beta: 0.5
+  gamma: 0.0
+  delta: 0.1
+  min_norm: 0.5
+  diversity_temperature: 0.1
+  distance_metric: 'euclidean'
+  use_dense: false
+  global_weight: 1.0
+  dense_weight: 0.5
+  spatial_reduction: 'mean'
+
+pretraining:
+  enabled: false
+
+training:
+  epochs: 100
+  batch_size: 64
+  num_workers: 4
+  lr: 0.0001
+  weight_decay: 0.0001
+  use_amp: true
+  log_interval: 50
+  val_interval: 1
+  early_stopping_patience: 10
+  fixed_pseudo_labels: true
+  save_checkpoints: false
+
+stage2:
+  enabled: true
+  epochs: 50
+  lr: 0.0001
+  weight_decay: 0.0001
+  freeze_encoder: true
+  freeze_anchors: true
+  freeze_anchor_target: true
+  frozen_bottleneck: true
+  no_fuser: true                  # Decoder receives only stage2_feat (no anchor info)
+  recon_loss: 'mse'
+  recon_weight: 1.0
+  consistency_loss: 'cosine'
+  consistency_weight: 0.1
+  alignment_weight: 0.1
+  freeze_encoder_mode: 'full'
+  unfreeze_last_n_blocks: 2
+  unfreeze_lr_multiplier: 0.1
+  early_stopping_patience: 20
+  early_stopping_metric: 'reconstruction_pixel_auroc'
+  pixel_map:
+    enabled: true
+    type: 'reconstruction_l2'
+  pixel_metrics:
+    enabled: true
+  pixel_aggregation:
+    method: 'top_k_percentile'
+    percentile: 95
+    threshold_n_std: 2.0
+  score_fusion:
+    enabled: true
+    normalization: 'minmax'
+    anchor_weight: 0.4
+    divergence_weight: 0.3
+    pixel_weight: 0.3
+  score_combination:
+    enabled: false
+    alpha: 0.5
+    normalization: 'minmax'
+
+eval:
+  compute_pixel: true
+  bootstrap_samples: 1000

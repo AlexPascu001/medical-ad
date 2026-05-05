@@ -1,0 +1,103 @@
+seed: 42
+output_dir: './runs/smoke_anchor_redesign'
+
+data:
+  data_root: './data/BraTS2021_slice'
+  target_size: [240, 240]
+  max_train_samples: 48
+
+anchor:
+  strategy: 'kmeans'
+  n_anchors: 12
+  max_images_for_pca: 48
+  learnable: false
+  init_from: null
+  use_embedding_space: true
+  reproject_anchors: true
+  representation: 'centroids'
+  prune:
+    min_k: 10
+    discard_ratio: 0.25
+
+model:
+  backbone: 'vit_small_patch16_dinov3.lvd1689m'
+  freeze_backbone: true
+  projection_dim: 64
+  projection_dim_recon: null
+
+loss:
+  margin: 1.0
+  alpha: 1.0
+  beta: 1.0
+  gamma: 0.0
+  delta: 0.1
+  min_norm: 0.5
+  diversity_temperature: 0.1
+  distance_metric: 'euclidean'
+  use_dense: false
+  global_weight: 1.0
+  dense_weight: 0.5
+  spatial_reduction: 'mean'
+
+pretraining:
+  enabled: false
+
+training:
+  epochs: 1
+  batch_size: 16
+  num_workers: 0
+  lr: 0.0001
+  weight_decay: 0.000001
+  use_amp: false
+  log_interval: 1
+  val_interval: 1
+  early_stopping_patience: 1
+  fixed_pseudo_labels: true
+  dynamic_reassignment: false
+  reassignment_interval: 5
+  pseudo_label_assignment: 'capacitated'
+  capacity_multiplier: 2.0
+
+stage2:
+  enabled: true
+  epochs: 1
+  lr: 0.0001
+  weight_decay: 0.000001
+  freeze_encoder: true
+  freeze_anchors: true
+  freeze_anchor_target: true
+  recon_loss: 'mse'
+  recon_weight: 1.0
+  consistency_loss: 'cosine'
+  consistency_weight: 0.1
+  frozen_bottleneck: true
+  alignment_weight: 0.1
+  alignment_target: 'anchor'
+  freeze_encoder_mode: 'full'
+  unfreeze_last_n_blocks: 2
+  unfreeze_lr_multiplier: 0.1
+  early_stopping_patience: 1
+  early_stopping_metric: 'image_auroc'
+  pixel_map:
+    enabled: false
+    type: 'reconstruction_l2'
+  pixel_metrics:
+    enabled: false
+  score_combination:
+    enabled: false
+    alpha: 0.5
+    normalization: 'minmax'
+  pixel_aggregation:
+    method: 'top_k_percentile'
+    percentile: 95
+    threshold_n_std: 2.0
+  score_fusion:
+    enabled: false
+    normalization: 'minmax'
+    anchor_weight: 0.4
+    divergence_weight: 0.3
+    pixel_weight: 0.3
+
+eval:
+  bootstrap_samples: 50
+  compute_pixel: false

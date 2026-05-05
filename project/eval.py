@@ -3,6 +3,8 @@ Evaluation utilities for anomaly detection
 Image-level and pixel-level AUROC, AUPR, operating points
 """
 
+from collections import Counter
+
 import torch
 import numpy as np
 from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve, precision_recall_curve
@@ -12,6 +14,25 @@ from typing import Dict, Tuple, Optional
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+
+def _finalize_pixel_score_sources(source_counts: Counter, metrics: Dict[str, float]) -> None:
+    """Record and report the provenance of pixel-level scores."""
+    if not source_counts:
+        return
+
+    source_count_dict = {str(source): int(count) for source, count in source_counts.items()}
+    metrics['pixel_scores_source_counts'] = source_count_dict
+
+    if len(source_count_dict) == 1:
+        source_name = next(iter(source_count_dict))
+        metrics['pixel_scores_source'] = source_name
+        print(f"  Pixel score source: {source_name}")
+    else:
+        print(f"  Pixel score sources: {source_count_dict}")
+
+    if 'dense_patch_upsampled' in source_count_dict:
+        print("  WARNING: Pixel scores come from upsampled patch distances, not true pixel-decoder maps.")
 
 
 def evaluate_model(
@@ -47,6 +68,7 @@ def evaluate_model(
     all_labels = []
     all_pixel_scores = []
     all_pixel_masks = []
+    pixel_score_sources = Counter()
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc='Evaluating'):
@@ -79,6 +101,7 @@ def evaluate_model(
             if compute_pixel_auroc and 'pixel_scores' in outputs:
                 pixel_scores = outputs['pixel_scores'].cpu().numpy()
                 all_pixel_scores.append(pixel_scores)
+                pixel_score_sources[outputs.get('pixel_scores_source', 'unknown')] += 1
 
                 if 'reconstruction_pixel_scores' in outputs:
                     all_reconstruction_pixel_scores.append(outputs['reconstruction_pixel_scores'].cpu().numpy())
@@ -353,6 +376,8 @@ def evaluate_model(
             traceback.print_exc()
     else:
         print(f"  Pixel-level data not available: scores={len(all_pixel_scores)} batches, masks={len(all_pixel_masks)} batches")
+
+    _finalize_pixel_score_sources(pixel_score_sources, metrics)
     
     return metrics
 
@@ -528,6 +553,7 @@ def evaluate_comprehensive(
     all_paths = []
     all_pixel_scores = []
     all_pixel_masks = []
+    pixel_score_sources = Counter()
     
     with torch.no_grad():
         for batch in dataloader:
@@ -565,6 +591,7 @@ def evaluate_comprehensive(
                 if 'pixel_scores' in pixel_outputs:
                     pixel_scores = pixel_outputs['pixel_scores'].cpu().numpy()
                     all_pixel_scores.append(pixel_scores)
+                    pixel_score_sources[pixel_outputs.get('pixel_scores_source', 'unknown')] += 1
                     
                     if 'mask' in batch:
                         masks = batch['mask'].cpu().numpy()
@@ -572,6 +599,8 @@ def evaluate_comprehensive(
     
     image_scores = np.concatenate(all_image_scores)
     labels = np.concatenate(all_labels)
+
+    _finalize_pixel_score_sources(pixel_score_sources, metrics)
 
     # Save per-sample image-level scores for ensemble post-processing
     try:
@@ -737,12 +766,22 @@ def evaluate_comprehensive(
     except Exception as e:
         print(f"  Warning: pixel anomaly overlay visualization failed: {e}")
 
+    # Full pipeline visualization (unified diagnostic)
+    try:
+        from visualize_pipeline import generate_full_pipeline_visualization
+        generate_full_pipeline_visualization(
+            model=model,
+            dataloader=dataloader,
+            device=device,
+            save_dir=save_dir,
+            target_size=target_size,
+        )
+    except Exception as e:
+        print(f"  Warning: pipeline visualization failed: {e}")
+
     print(f"\nResults saved to {save_dir}")
     
     return metrics
-
-
-def plot_roc_curve(labels: np.ndarray, scores: np.ndarray, save_path: str, level: str = 'Image'):
     """Plot ROC curve
     
     Args:
@@ -761,6 +800,30 @@ def plot_roc_curve(labels: np.ndarray, scores: np.ndarray, save_path: str, level
     plt.ylabel('True Positive Rate', fontsize=12)
     plt.title(f'ROC Curve - {level} Level', fontsize=14)
     plt.legend(fontsize=11)
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def plot_roc_curve(labels: np.ndarray, scores: np.ndarray, save_path, level: str = 'Image'):
+    """Plot ROC curve and save to file."""
+    from sklearn.metrics import roc_curve, auc
+    labels = np.asarray(labels)
+    scores = np.asarray(scores)
+    if len(np.unique(labels)) < 2:
+        return
+    fpr, tpr, _ = roc_curve(labels, scores)
+    roc_auc = auc(fpr, tpr)
+    plt.figure(figsize=(7, 6))
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC (AUC = {roc_auc:.4f})')
+    plt.plot([0, 1], [0, 1], color='navy', lw=1, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate', fontsize=12)
+    plt.ylabel('True Positive Rate', fontsize=12)
+    plt.title(f'{level}-Level ROC Curve', fontsize=14)
+    plt.legend(loc='lower right', fontsize=11)
     plt.grid(alpha=0.3)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -832,6 +895,7 @@ def visualize_predictions(
             
             image_scores = outputs['image_scores'].cpu().numpy()
             pixel_scores = outputs['pixel_scores'].cpu().numpy() if 'pixel_scores' in outputs else None
+            pixel_scores_source = outputs.get('pixel_scores_source') if 'pixel_scores' in outputs else None
             
             # Collect samples
             for i in range(len(images)):
@@ -850,6 +914,7 @@ def visualize_predictions(
                     'label': labels[i],
                     'score': image_scores[i],
                     'pixel_map': pixel_scores[i] if pixel_scores is not None else None,
+                    'pixel_map_source': pixel_scores_source,
                     'mask': batch['mask'][i].cpu().numpy() if 'mask' in batch else None,
                     'scores_detail': detail
                 }

@@ -1,15 +1,17 @@
 # Default Configuration for BMAD Brain MRI Anomaly Detection
 
 seed: 42
-output_dir: './experiments/bmad_baseline'
+output_dir: './runs/bmad_baseline'
 
 # Data configuration
 data:
   data_root: './data/BraTS2021_slice'  # Root directory of the dataset
   target_size: [240, 240]  # Image resolution (H, W) - actual BraTS slice size
+  train_augment_mode: 'full'  # 'full', 'flip_only', or 'none' for training-only augmentation presets
 
 # Anchor configuration
 anchor:
+  mode: 'global'          # 'global' (current pipeline) or 'patch' (separate dense-anchor path)
   strategy: 'eigenface'     # Strategy: 'eigenface' (PCA + clustering) or 'kmeans' (direct clustering) or 'random'
   n_components: 50          # Number of PCA components (M) - only for eigenface strategy
   n_anchors: 8              # Number of anchors (K)
@@ -17,6 +19,12 @@ anchor:
   learnable: false          # Make anchors learnable parameters (requires gamma > 0 for min-norm loss)
   init_from: null           # Path to experiment dir to initialize learnable anchors from (optional)
   use_embedding_space: true # SOLUTION A: Generate anchors in 384D DINOv3 space (not pixel space)
+  representation: 'closest_samples'  # K-means only: 'closest_samples' or 'centroids'
+  patch:
+    score_reduction: 'mean'  # Patch mode: aggregate per-location distances with 'mean' or 'max'
+  prune:
+    min_k: 10              # Only prune smallest clusters when initial K >= min_k
+    discard_ratio: 0.0     # Fraction of smallest K-means clusters to drop after the first clustering pass
 
 # Model configuration
 model:
@@ -62,7 +70,12 @@ training:
   log_interval: 50        # Log every N batches
   val_interval: 1         # Validate every N epochs
   early_stopping_patience: 10
+  min_epochs_before_early_stopping: 0
   fixed_pseudo_labels: true
+  dynamic_reassignment: false
+  reassignment_interval: 5
+  pseudo_label_assignment: 'nearest'  # 'nearest' or 'capacitated' for the initial fixed pseudo-label pass
+  capacity_multiplier: 2.0            # Max samples per anchor = ceil(multiplier * N / effective_K)
 
 # Stage-2 reconstruction training (optional)
 stage2:
@@ -79,8 +92,9 @@ stage2:
   consistency_weight: 0.1
 
   # Dual-bottleneck: frozen stage-1 projection + trainable stage-2 projection
-  frozen_bottleneck: false      # Enable frozen copy of stage-1 projection head
+  frozen_bottleneck: true       # Enable frozen copy of stage-1 projection head
   alignment_weight: 0.1         # Weight for cosine alignment loss between frozen and trainable features
+  alignment_target: 'sample'    # 'sample' (frozen sample projection) or 'anchor' (fixed Stage-1 anchor target)
 
   # Encoder freezing mode for stage-2
   freeze_encoder_mode: 'full'   # 'full' (freeze all), 'partial' (unfreeze last N blocks), 'none' (train all)

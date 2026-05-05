@@ -3,6 +3,7 @@ Main training script for BMAD Brain MRI Anomaly Detection
 """
 
 import argparse
+import os
 import warnings
 import yaml
 import torch
@@ -19,8 +20,173 @@ from anchors import AnchorGenerator, compute_anchor_embeddings, visualize_anchor
 from model import DINOv3Backbone, AnomalyDetector
 from loss import AnchorMarginLoss, DenseAnchorMarginLoss, CombinedAnchorLoss
 from contrastive_loss import CenterLoss, InfoNCEAnchorLoss, HybridAnchorLoss, CombinedContrastiveLoss
+from patch_mode import create_patch_criterion, create_patch_detector
 from train import Trainer
 from eval import evaluate_comprehensive, visualize_predictions, analyze_anchor_assignments
+
+
+def _merge_nested_defaults(target: dict, defaults: dict) -> None:
+    """Recursively fill missing config keys without overwriting user values."""
+    for key, value in defaults.items():
+        if isinstance(value, dict):
+            target.setdefault(key, {})
+            _merge_nested_defaults(target[key], value)
+        else:
+            target.setdefault(key, value)
+
+
+def _get_anchor_mode(config: dict) -> str:
+    """Return the configured anchor mode with backward-compatible defaulting."""
+    return str(config.get('anchor', {}).get('mode', 'global')).lower()
+
+
+def _get_model_anchor_mode(model: torch.nn.Module) -> str:
+    """Return the model anchor mode with backward-compatible defaulting."""
+    return str(getattr(model, 'anchor_mode', 'global')).lower()
+
+
+def _validate_checkpoint_anchor_mode(checkpoint: dict, expected_anchor_mode: str, checkpoint_path: Path) -> None:
+    """Reject checkpoints that were saved from a different anchor mode."""
+    checkpoint_anchor_mode = str(checkpoint.get('anchor_mode', 'global')).lower()
+    if checkpoint_anchor_mode != expected_anchor_mode:
+        raise ValueError(
+            f"Checkpoint anchor_mode mismatch for {checkpoint_path}: "
+            f"expected '{expected_anchor_mode}', found '{checkpoint_anchor_mode}'."
+        )
+
+
+def _load_model_checkpoint(
+    model: torch.nn.Module,
+    checkpoint_path: Path,
+    device: torch.device,
+    *,
+    strict: bool = True
+) -> dict:
+    """Load a checkpoint after validating that its anchor mode matches the model."""
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    _validate_checkpoint_anchor_mode(
+        checkpoint,
+        expected_anchor_mode=_get_model_anchor_mode(model),
+        checkpoint_path=checkpoint_path
+    )
+    model.load_state_dict(checkpoint['model_state_dict'], strict=strict)
+    return checkpoint
+
+
+def _resolve_kept_kmeans_clusters(labels: np.ndarray, n_clusters: int, prune_cfg: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return cluster sizes, kept ids, and discarded ids after optional pruning."""
+    cluster_sizes = np.bincount(labels, minlength=n_clusters).astype(np.int64)
+    min_k = int(prune_cfg.get('min_k', 10))
+    discard_ratio = float(prune_cfg.get('discard_ratio', 0.0))
+
+    if discard_ratio <= 0.0 or n_clusters < min_k:
+        kept_cluster_ids = np.arange(n_clusters, dtype=np.int64)
+        discarded_cluster_ids = np.array([], dtype=np.int64)
+        return cluster_sizes, kept_cluster_ids, discarded_cluster_ids
+
+    n_discard = int(np.floor(discard_ratio * n_clusters))
+    n_discard = max(0, min(n_discard, n_clusters - 1))
+    if n_discard == 0:
+        kept_cluster_ids = np.arange(n_clusters, dtype=np.int64)
+        discarded_cluster_ids = np.array([], dtype=np.int64)
+        return cluster_sizes, kept_cluster_ids, discarded_cluster_ids
+
+    # Deterministic tie-break: smaller cluster first, then lower cluster index.
+    sorted_cluster_ids = np.lexsort((np.arange(n_clusters), cluster_sizes))
+    discarded_cluster_ids = np.sort(sorted_cluster_ids[:n_discard]).astype(np.int64)
+    kept_cluster_ids = np.array([idx for idx in range(n_clusters) if idx not in set(discarded_cluster_ids.tolist())], dtype=np.int64)
+    return cluster_sizes, kept_cluster_ids, discarded_cluster_ids
+
+
+def _reassign_to_kept_centroids(
+    embeddings_384d: torch.Tensor,
+    initial_labels: np.ndarray,
+    centroids_384d: np.ndarray,
+    kept_cluster_ids: np.ndarray,
+    discarded_cluster_ids: np.ndarray
+) -> tuple[np.ndarray, dict[int, int]]:
+    """Map initial K-means labels to the kept effective-K labels."""
+    if len(discarded_cluster_ids) == 0:
+        mapping = {int(cluster_id): new_idx for new_idx, cluster_id in enumerate(kept_cluster_ids.tolist())}
+        final_assignments = np.array([mapping[int(label)] for label in initial_labels], dtype=np.int64)
+        return final_assignments, mapping
+
+    kept_centroids = torch.from_numpy(centroids_384d[kept_cluster_ids]).float()
+    final_assignments = np.full(len(initial_labels), -1, dtype=np.int64)
+    mapping = {int(cluster_id): new_idx for new_idx, cluster_id in enumerate(kept_cluster_ids.tolist())}
+
+    for old_cluster_id, new_cluster_id in mapping.items():
+        final_assignments[initial_labels == old_cluster_id] = new_cluster_id
+
+    discarded_mask = np.isin(initial_labels, discarded_cluster_ids)
+    if discarded_mask.any():
+        discarded_embeddings = embeddings_384d[discarded_mask]
+        distances = torch.cdist(discarded_embeddings, kept_centroids, p=2)
+        reassigned = distances.argmin(dim=1).cpu().numpy().astype(np.int64)
+        final_assignments[discarded_mask] = reassigned
+
+    if (final_assignments < 0).any():
+        raise RuntimeError("Failed to assign some samples to kept K-means clusters.")
+
+    return final_assignments, mapping
+
+
+def _select_kmeans_anchor_artifacts(
+    images_np: np.ndarray,
+    embeddings_384d: torch.Tensor,
+    initial_labels: np.ndarray,
+    final_assignments: np.ndarray,
+    centroids_384d: np.ndarray,
+    kept_cluster_ids: np.ndarray,
+    representation: str
+) -> tuple[np.ndarray, torch.Tensor, list[int], str]:
+    """Build visualization artifacts and semantic anchors for the kept K-means clusters."""
+    anchor_images_list = []
+    anchor_indices: list[int] = []
+
+    if representation == 'centroids':
+        for new_cluster_id, old_cluster_id in enumerate(kept_cluster_ids.tolist()):
+            final_mask = final_assignments == new_cluster_id
+            if final_mask.any():
+                cluster_mean_image = images_np[final_mask].mean(axis=0)
+            else:
+                cluster_mean_image = images_np.mean(axis=0)
+            anchor_images_list.append(cluster_mean_image.astype(np.float32))
+            anchor_indices.append(-1)
+            print(
+                f"   Anchor {new_cluster_id}: source cluster {old_cluster_id:4d}, "
+                f"final members {int(final_mask.sum()):4d}, stored semantic anchor = centroid"
+            )
+
+        anchor_images = np.array(anchor_images_list, dtype=np.float32)
+        anchor_embeddings_384d = torch.from_numpy(centroids_384d[kept_cluster_ids]).float()
+        image_source = 'cluster_mean'
+        return anchor_images, anchor_embeddings_384d, anchor_indices, image_source
+
+    for new_cluster_id, old_cluster_id in enumerate(kept_cluster_ids.tolist()):
+        original_mask = initial_labels == old_cluster_id
+        count = int(original_mask.sum())
+        if count == 0:
+            print(f"   Anchor {new_cluster_id}: kept cluster {old_cluster_id} empty, selecting global nearest")
+            dists = np.linalg.norm(embeddings_384d.numpy() - centroids_384d[old_cluster_id], axis=1)
+            idx = int(np.argmin(dists))
+        else:
+            cluster_embeddings = embeddings_384d[original_mask]
+            dists = torch.norm(cluster_embeddings - torch.from_numpy(centroids_384d[old_cluster_id]).float(), dim=1)
+            local_idx = int(torch.argmin(dists))
+            idx = int(np.where(original_mask)[0][local_idx])
+
+        anchor_indices.append(idx)
+        anchor_images_list.append(images_np[idx])
+        print(
+            f"   Anchor {new_cluster_id}: source cluster {old_cluster_id:4d}, "
+            f"original members {count:4d}, selected sample {idx}"
+        )
+
+    anchor_images = np.array(anchor_images_list)
+    anchor_embeddings_384d = embeddings_384d[anchor_indices]
+    image_source = 'closest_sample'
+    return anchor_images, anchor_embeddings_384d, anchor_indices, image_source
 
 
 def load_dataset_paths(data_root: str):
@@ -131,9 +297,48 @@ def set_seed(seed: int):
 
 def load_config(config_path: str) -> dict:
     """Load configuration from YAML file"""
+    config_path = os.path.abspath(config_path)
+    config_dir = os.path.dirname(config_path)
+
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
+    # Resolve data_root relative to config file so the script works from any CWD.
+    # Absolute paths are left unchanged.
+    data_root = config.get('data', {}).get('data_root', './data/BraTS2021_slice')
+    if not os.path.isabs(data_root):
+        config.setdefault('data', {})['data_root'] = os.path.normpath(
+            os.path.join(config_dir, '../..', data_root)
+        )
+
+    # Resolve output_dir relative to workspace root (configs/ is two levels deep)
+    output_dir = config.get('output_dir', './runs/bmad_baseline')
+    if not os.path.isabs(output_dir):
+        config['output_dir'] = os.path.normpath(
+            os.path.join(config_dir, '../..', output_dir)
+        )
+
+    anchor_defaults = {
+        'mode': 'global',
+        'representation': 'closest_samples',
+        'patch': {
+            'score_reduction': 'mean'
+        },
+        'prune': {
+            'min_k': 10,
+            'discard_ratio': 0.0
+        }
+    }
+    data_defaults = {
+        'train_augment_mode': 'full'
+    }
+    training_defaults = {
+        'fixed_pseudo_labels': True,
+        'dynamic_reassignment': False,
+        'reassignment_interval': 5,
+        'pseudo_label_assignment': 'nearest',
+        'capacity_multiplier': 2.0
+    }
     stage2_defaults = {
         'enabled': False,
         'epochs': 20,
@@ -146,8 +351,9 @@ def load_config(config_path: str) -> dict:
         'recon_weight': 1.0,
         'consistency_loss': 'cosine',
         'consistency_weight': 0.1,
-        'frozen_bottleneck': False,
+        'frozen_bottleneck': True,
         'alignment_weight': 0.1,
+        'alignment_target': 'sample',
         'freeze_encoder_mode': 'full',
         'unfreeze_last_n_blocks': 2,
         'unfreeze_lr_multiplier': 0.1,
@@ -179,17 +385,10 @@ def load_config(config_path: str) -> dict:
         }
     }
 
-    if 'stage2' not in config:
-        config['stage2'] = stage2_defaults
-    else:
-        stage2_cfg = config['stage2']
-        for key, value in stage2_defaults.items():
-            if isinstance(value, dict):
-                stage2_cfg.setdefault(key, {})
-                for sub_key, sub_value in value.items():
-                    stage2_cfg[key].setdefault(sub_key, sub_value)
-            else:
-                stage2_cfg.setdefault(key, value)
+    _merge_nested_defaults(config.setdefault('data', {}), data_defaults)
+    _merge_nested_defaults(config.setdefault('anchor', {}), anchor_defaults)
+    _merge_nested_defaults(config.setdefault('training', {}), training_defaults)
+    _merge_nested_defaults(config.setdefault('stage2', {}), stage2_defaults)
 
     return config
 
@@ -250,7 +449,7 @@ def prepare_anchors_in_embedding_space(
     print("Strategy: Semantic clustering in frozen DINOv3 space")
     print(f"  1. Extract {embed_dim}D embeddings for training images")
     print(f"  2. Run k-means/eigenface in {embed_dim}D space")
-    print("  3. Select images closest to cluster centers")
+    print("  3. Build final effective anchors after optional pruning")
     print(f"  4. Store in RAW {embed_dim}D (re-project each forward)")
     
     # Load training images
@@ -308,32 +507,61 @@ def prepare_anchors_in_embedding_space(
     
     if strategy_name == 'kmeans':
         from sklearn.cluster import KMeans
+        representation = config['anchor'].get('representation', 'closest_samples')
+        if representation not in {'closest_samples', 'centroids'}:
+            raise ValueError(f"Unsupported anchor.representation: {representation}")
+
         kmeans = KMeans(n_clusters=n_anchors, random_state=config['seed'], n_init=10)
         labels = kmeans.fit_predict(embeddings_384d.numpy())
         centroids_384d = kmeans.cluster_centers_  # (K, embed_dim)
-        
-        # Select images closest to each centroid
-        anchor_indices = []
-        anchor_images_list = []
-        for k in range(n_anchors):
-            mask = labels == k
-            count = mask.sum()
-            if count == 0:
-                print(f"   Anchor {k}: empty cluster, selecting global nearest")
-                dists = np.linalg.norm(embeddings_384d.numpy() - centroids_384d[k], axis=1)
-                idx = int(np.argmin(dists))
-            else:
-                cluster_embeddings = embeddings_384d[mask]
-                dists = torch.norm(cluster_embeddings - torch.from_numpy(centroids_384d[k]), dim=1)
-                local_idx = int(torch.argmin(dists))
-                idx = np.where(mask)[0][local_idx]
-            
-            anchor_indices.append(idx)
-            anchor_images_list.append(images_np[idx])
-            print(f"   Anchor {k}: {count:4d} images in cluster, selected sample {idx}")
-        
-        anchor_images = np.array(anchor_images_list)
-        anchor_embeddings_384d = embeddings_384d[anchor_indices]
+        prune_cfg = config['anchor'].get('prune', {})
+        cluster_sizes, kept_cluster_ids, discarded_cluster_ids = _resolve_kept_kmeans_clusters(labels, n_anchors, prune_cfg)
+
+        print("  Initial cluster sizes:")
+        for cluster_id, cluster_size in enumerate(cluster_sizes.tolist()):
+            print(f"    Cluster {cluster_id:4d}: {cluster_size:5d} samples")
+
+        print(
+            f"  Effective K after pruning: {len(kept_cluster_ids)} "
+            f"(discarded {len(discarded_cluster_ids)} / {n_anchors})"
+        )
+        if len(discarded_cluster_ids) > 0:
+            print(f"  Discarded clusters: {discarded_cluster_ids.tolist()}")
+
+        final_assignments, kept_mapping = _reassign_to_kept_centroids(
+            embeddings_384d=embeddings_384d,
+            initial_labels=labels,
+            centroids_384d=centroids_384d,
+            kept_cluster_ids=kept_cluster_ids,
+            discarded_cluster_ids=discarded_cluster_ids
+        )
+        final_cluster_sizes = np.bincount(final_assignments, minlength=len(kept_cluster_ids)).astype(np.int64)
+        moved_from_discarded = int(np.isin(labels, discarded_cluster_ids).sum())
+
+        anchor_images, anchor_embeddings_384d, anchor_indices, anchor_image_source = _select_kmeans_anchor_artifacts(
+            images_np=images_np,
+            embeddings_384d=embeddings_384d,
+            initial_labels=labels,
+            final_assignments=final_assignments,
+            centroids_384d=centroids_384d,
+            kept_cluster_ids=kept_cluster_ids,
+            representation=representation
+        )
+
+        anchor_metadata = {
+            'representation': representation,
+            'initial_k': int(n_anchors),
+            'effective_k': int(len(kept_cluster_ids)),
+            'cluster_sizes_initial': cluster_sizes.tolist(),
+            'cluster_sizes_effective': final_cluster_sizes.tolist(),
+            'kept_cluster_ids': kept_cluster_ids.tolist(),
+            'discarded_cluster_ids': discarded_cluster_ids.tolist(),
+            'moved_from_discarded': moved_from_discarded,
+            'anchor_image_source': anchor_image_source,
+            'anchor_image_indices': anchor_indices,
+            'subset_assignments_effective': final_assignments.tolist(),
+            'kept_cluster_id_to_effective_index': {str(key): int(value) for key, value in kept_mapping.items()}
+        }
         
     elif strategy_name == 'eigenface':
         from sklearn.decomposition import PCA
@@ -370,9 +598,32 @@ def prepare_anchors_in_embedding_space(
         
         anchor_images = np.array(anchor_images_list)
         anchor_embeddings_384d = embeddings_384d[anchor_indices]
+        anchor_metadata = {
+            'representation': 'closest_samples',
+            'initial_k': int(n_anchors),
+            'effective_k': int(n_anchors),
+            'cluster_sizes_initial': np.bincount(labels, minlength=n_anchors).astype(np.int64).tolist(),
+            'cluster_sizes_effective': np.bincount(labels, minlength=n_anchors).astype(np.int64).tolist(),
+            'kept_cluster_ids': list(range(n_anchors)),
+            'discarded_cluster_ids': [],
+            'moved_from_discarded': 0,
+            'anchor_image_source': 'closest_sample',
+            'anchor_image_indices': [int(idx) for idx in anchor_indices]
+        }
     
     else:
         raise ValueError(f"Strategy {strategy_name} not supported in embedding space generation")
+
+    print("\nComputing dense anchor maps for selected embedding-space anchors...")
+    _, anchor_dense_384d = compute_anchor_embeddings(
+        anchor_images=anchor_images,
+        backbone_model=backbone,
+        device=device,
+        batch_size=8,
+        return_projected=False,
+        apply_imagenet_norm=(config['data'].get('normalization', 'zscore_only') == 'minmax_imagenet')
+    )
+    print(f"  Dense anchor maps: {anchor_dense_384d.shape}")
     
     # EXPERT'S APPROACH: Create FIXED geometric targets in 128D projection space
     # SOLUTION A: Skip this step - will re-project anchors each forward instead
@@ -384,6 +635,8 @@ def prepare_anchors_in_embedding_space(
     projection_hidden_dims = config['model'].get('projection_hidden_dims', None)
     projection_dim = projection_hidden_dims[-1] if projection_hidden_dims is not None else config['model'].get('projection_dim', None)
     
+    effective_n_anchors = int(anchor_embeddings_384d.shape[0])
+
     if projection_dim and not reproject_anchors:
         print(f"\n{'='*80}")
         print("CREATING FIXED GEOMETRIC TARGETS (Expert's Approach)")
@@ -394,9 +647,9 @@ def prepare_anchors_in_embedding_space(
         if init_method == 'random_orthogonal':
             # Option A: Random orthogonal normalized vectors
             print(f"  Method: Random orthogonal vectors in {projection_dim}D space")
-            geometric_targets = torch.randn(n_anchors, projection_dim)
+            geometric_targets = torch.randn(effective_n_anchors, projection_dim)
             geometric_targets = torch.nn.functional.normalize(geometric_targets, dim=1)
-            print(f"  ✓ Generated {n_anchors} random orthogonal targets")
+            print(f"  ✓ Generated {effective_n_anchors} random orthogonal targets")
             
         elif init_method == 'project_once':
             # Option B: Project semantic anchors ONCE through random projection head and detach
@@ -406,7 +659,7 @@ def prepare_anchors_in_embedding_space(
                 geometric_targets = backbone.projection(anchor_embeddings_384d.to(device))
                 geometric_targets = torch.nn.functional.normalize(geometric_targets, dim=1)
             geometric_targets = geometric_targets.cpu().detach()
-            print(f"  ✓ Projected {n_anchors} anchors through random projection head (detached)")
+            print(f"  ✓ Projected {effective_n_anchors} anchors through random projection head (detached)")
             
         else:
             raise ValueError(f"Unknown geometric_init method: {init_method}")
@@ -435,12 +688,13 @@ def prepare_anchors_in_embedding_space(
         'anchor_semantic': anchor_embeddings_384d,  # For pseudo-label computation (embed_dim D)
         'anchor_geometric': geometric_targets,       # For training targets (projection_dim D, FIXED)
         'anchor_global': anchor_embeddings_384d,     # Legacy compatibility
-        'anchor_dense': None,
+        'anchor_dense': anchor_dense_384d,
         'embedding_dim': embed_dim,
         'projection_dim': projection_dim,
         'is_projected': False,
-        'use_decoupled': True,
-        'generation_method': 'decoupled_semantic_geometric'
+        'use_decoupled': geometric_targets is not None,
+        'generation_method': 'decoupled_semantic_geometric' if geometric_targets is not None else 'embedding_space_reproject',
+        'anchor_metadata': anchor_metadata
     }, save_dir / 'anchor_embeddings.pt')
     
     # Visualize anchors
@@ -448,7 +702,7 @@ def prepare_anchors_in_embedding_space(
     
     print(f"\n{'='*80}")
     if geometric_targets is not None:
-        print(f"✓ Generated {n_anchors} DECOUPLED anchors (Expert's Approach)")
+        print(f"✓ Generated {effective_n_anchors} DECOUPLED anchors (Expert's Approach)")
         print(f"{'='*80}")
         print(f"  Semantic anchors ({embed_dim}D): {anchor_embeddings_384d.shape} [for pseudo-labels]")
         print(f"  Geometric targets ({projection_dim}D): {geometric_targets.shape} [FIXED training targets]")
@@ -458,8 +712,9 @@ def prepare_anchors_in_embedding_space(
         print(f"{'='*80}")
         print(f"  Semantic anchors ({embed_dim}D): {anchor_embeddings_384d.shape} [for pseudo-labels AND re-projection]")
         print(f"  These will be RE-PROJECTED through projection head each forward pass")
+    print(f"  Dense anchors ({embed_dim}D patch grid): {anchor_dense_384d.shape}")
     
-    return anchor_images, anchor_embeddings_384d, None, geometric_targets
+    return anchor_images, anchor_embeddings_384d, anchor_dense_384d, geometric_targets
 
 
 def prepare_anchors(
@@ -600,6 +855,11 @@ def prepare_anchors(
 
 def create_model(config: dict, anchor_global: torch.Tensor, anchor_dense: torch.Tensor) -> AnomalyDetector:
     """Create anomaly detector model"""
+    anchor_mode = _get_anchor_mode(config)
+    if anchor_mode == 'patch':
+        print("\nPATCH MODE: creating dense-anchor detector")
+        return create_patch_detector(config, anchor_global, anchor_dense)
+
     print("\n" + "="*80)
     print("MODEL CREATION")
     print("="*80)
@@ -669,6 +929,10 @@ def create_criterion(config: dict):
     
     For learnable anchors, 'center', 'infonce', or 'hybrid' are recommended.
     """
+    anchor_mode = _get_anchor_mode(config)
+    if anchor_mode == 'patch':
+        return create_patch_criterion(config)
+
     loss_type = config['loss'].get('type', 'cam')  # Default to CAM loss for backward compatibility
     use_pixel_decoder = config['model'].get('use_pixel_decoder', False)
     
@@ -774,7 +1038,7 @@ def create_criterion(config: dict):
     return criterion
 
 
-def generate_experiment_name(config: dict, base_dir: str = './experiments') -> str:
+def generate_experiment_name(config: dict, base_dir: str = './runs') -> str:
     """
     Generate experiment name based on anchor and distance configuration
     
@@ -817,7 +1081,7 @@ def main(args):
     # Auto/explicit experiment naming and uniqueness
     if args.exp_name:
         save_dir = Path(config['output_dir']) / args.exp_name
-    elif args.auto_name or config['output_dir'] == './experiments/bmad_baseline':
+    elif args.auto_name or config['output_dir'] in ('./experiments/bmad_baseline', './runs/bmad_baseline'):
         base_output = Path(config['output_dir']).parent
         exp_name = generate_experiment_name(config, str(base_output))
         save_dir = base_output / exp_name
@@ -870,7 +1134,16 @@ def main(args):
         print(f"Please check that the dataset exists at: {data_root}")
         print("Expected structure: train/good/*.png, valid/good/img/*.png, etc.")
         return
-    
+
+    # Optional: limit training set size (for quick tests / ablations)
+    max_train = config['data'].get('max_train_samples', None)
+    if max_train is not None and max_train < len(train_paths):
+        import random as _random
+        _rng = _random.Random(config.get('seed', 42))
+        train_paths = _rng.sample(train_paths, max_train)
+        train_paths = sorted(train_paths)
+        print(f"  [quicktest] Limiting to {max_train} training images")
+
     # Create dataloaders
     train_loader, val_loader, test_loader = create_dataloaders(
         train_paths=train_paths,
@@ -883,7 +1156,8 @@ def main(args):
         batch_size=config['training']['batch_size'],
         num_workers=config['training']['num_workers'],
         target_size=tuple(config['data']['target_size']),
-        normalize_mode=normalize_mode
+        normalize_mode=normalize_mode,
+        train_augment_mode=config['data'].get('train_augment_mode', 'full')
     )
     
     print(f"Train batches: {len(train_loader)}")
@@ -974,6 +1248,7 @@ def main(args):
             'anchor_images': anchor_images,
             'anchor_global': anchor_global,
             'anchor_dense': anchor_dense,
+            'anchor_metadata': anchor_data.get('anchor_metadata', {}),
             'initialized_from': str(init_from)
         }, save_dir / 'anchor_embeddings.pt')
         
@@ -985,7 +1260,7 @@ def main(args):
         anchor_dense = anchor_data.get('anchor_dense', None)
         
         # Check if decoupled anchors exist
-        if 'anchor_semantic' in anchor_data and 'anchor_geometric' in anchor_data:
+        if anchor_data.get('anchor_semantic') is not None and anchor_data.get('anchor_geometric') is not None:
             anchor_semantic = anchor_data['anchor_semantic']
             anchor_geometric = anchor_data['anchor_geometric']
             print(f"  \u2713 Loaded decoupled anchors:")
@@ -1000,7 +1275,7 @@ def main(args):
         use_embedding_space = config['anchor'].get('use_embedding_space', True)
         
         if use_embedding_space:
-            print("\n[EXPERT'S APPROACH] Using decoupled semantic/geometric anchors")
+            print("\n[EMBEDDING-SPACE] Using semantic anchors generated in frozen DINOv3 space")
             anchor_images, anchor_semantic, anchor_dense, anchor_geometric = prepare_anchors_in_embedding_space(
                 train_images=train_paths,
                 preprocessor=preprocessor,
@@ -1026,6 +1301,7 @@ def main(args):
     # Now create the full detector with the backbone and anchors
     learnable_anchors = config['anchor'].get('learnable', False)
     target_size = tuple(config['data']['target_size'])
+    anchor_mode = _get_anchor_mode(config)
     
     print("\n" + "="*80)
     print("MODEL CREATION")
@@ -1037,7 +1313,17 @@ def main(args):
     reproject_anchors = config['anchor'].get('reproject_anchors', False)
     use_decoupled = use_embedding_space and not reproject_anchors  # Only use decoupled if NOT Solution A
     
-    if use_decoupled and 'anchor_geometric' in locals():
+    if anchor_mode == 'patch':
+        print("PATCH MODE: using separate dense-anchor detector")
+        model = create_patch_detector(
+            config=config,
+            anchor_global=anchor_global,
+            anchor_dense=anchor_dense,
+            backbone=backbone,
+        )
+        model = model.to(device)
+
+    elif use_decoupled and 'anchor_geometric' in locals() and anchor_geometric is not None:
         print(f"EXPERT'S APPROACH: Decoupled anchors")
         print(f"  Semantic anchors ({anchor_semantic.shape[1]}D): {anchor_semantic.shape} [for pseudo-labels]")
         print(f"  Geometric targets ({anchor_geometric.shape[1]}D): {anchor_geometric.shape} [FIXED training targets]")
@@ -1132,6 +1418,8 @@ def main(args):
             log_interval=config['training']['log_interval'],
             val_interval=config['training']['val_interval'],
             fixed_pseudo_labels=config['training'].get('fixed_pseudo_labels', False),
+            pseudo_label_assignment=config['training'].get('pseudo_label_assignment', 'nearest'),
+            capacity_multiplier=config['training'].get('capacity_multiplier', 2.0),
             dynamic_reassignment=config['training'].get('dynamic_reassignment', False),
             reassignment_interval=config['training'].get('reassignment_interval', 5),
             save_checkpoints=config['training'].get('save_checkpoints', True)
@@ -1140,7 +1428,8 @@ def main(args):
         trainer.train(
             num_epochs=config['training']['epochs'],
             scheduler=scheduler,
-            early_stopping_patience=config['training']['early_stopping_patience']
+            early_stopping_patience=config['training']['early_stopping_patience'],
+            min_epochs_before_early_stopping=config['training'].get('min_epochs_before_early_stopping', 0)
         )
 
         if config.get('stage2', {}).get('enabled', False):
@@ -1151,8 +1440,7 @@ def main(args):
 
             best_model_path = save_dir / 'best_model.pth'
             if best_model_path.exists():
-                checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
-                model.load_state_dict(checkpoint['model_state_dict'])
+                _load_model_checkpoint(model, best_model_path, device)
                 print("Loaded best stage-1 checkpoint for intermediate evaluation")
 
             stage1_eval_dir = save_dir / 'evaluation_stage1'
@@ -1174,8 +1462,7 @@ def main(args):
 
             # Reload best stage-1 checkpoint for stage-2 initialization
             if best_model_path.exists():
-                checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
-                model.load_state_dict(checkpoint['model_state_dict'])
+                _load_model_checkpoint(model, best_model_path, device)
                 print("Loaded best stage-1 checkpoint for stage-2 initialization")
 
             stage2_cfg = config['stage2']
@@ -1190,7 +1477,8 @@ def main(args):
                 pixel_map_enabled=pixel_map_cfg.get('enabled', True),
                 pixel_map_type=pixel_map_cfg.get('type', 'reconstruction_l2'),
                 use_frozen_bottleneck=use_frozen_bottleneck,
-                recon_projection_dim=recon_proj_dim
+                recon_projection_dim=recon_proj_dim,
+                no_fuser=stage2_cfg.get('no_fuser', False)
             )
             model.configure_score_combination(
                 enabled=score_comb_cfg.get('enabled', False),
@@ -1267,7 +1555,9 @@ def main(args):
                 use_amp=config['training']['use_amp'],
                 log_interval=config['training']['log_interval'],
                 val_interval=config['training']['val_interval'],
-                fixed_pseudo_labels=False,
+                fixed_pseudo_labels=config['training'].get('fixed_pseudo_labels', False),
+                pseudo_label_assignment=config['training'].get('pseudo_label_assignment', 'nearest'),
+                capacity_multiplier=config['training'].get('capacity_multiplier', 2.0),
                 dynamic_reassignment=False,
                 reassignment_interval=stage2_cfg.get('reassignment_interval', 5),
                 save_checkpoints=config['training'].get('save_checkpoints', True),
@@ -1288,8 +1578,7 @@ def main(args):
             # Prefer best stage-2 model for final evaluation when available
             best_stage2_path = save_dir / 'best_stage2_model.pth'
             if best_stage2_path.exists():
-                checkpoint = torch.load(best_stage2_path, map_location=device, weights_only=False)
-                model.load_state_dict(checkpoint['model_state_dict'])
+                _load_model_checkpoint(model, best_stage2_path, device)
                 print("Loaded best stage-2 checkpoint for final evaluation")
             trainer = stage2_trainer
     else:
@@ -1301,7 +1590,8 @@ def main(args):
         # Save model anyway for evaluation
         torch.save({
             'model_state_dict': model.state_dict(),
-            'config': config
+            'config': config,
+            'anchor_mode': _get_model_anchor_mode(model)
         }, save_dir / 'best_model.pth')
     
     # ===== STAGE 6: Evaluation =====
@@ -1324,7 +1614,8 @@ def main(args):
                 pixel_map_enabled=pm_cfg.get('enabled', True),
                 pixel_map_type=pm_cfg.get('type', 'reconstruction_l2'),
                 use_frozen_bottleneck=s2_cfg.get('frozen_bottleneck', False),
-                recon_projection_dim=recon_proj_dim
+                recon_projection_dim=recon_proj_dim,
+                no_fuser=s2_cfg.get('no_fuser', False)
             )
         pix_agg_cfg = s2_cfg.get('pixel_aggregation', {})
         agg_method = pix_agg_cfg.get('method', 'top_k_percentile')
@@ -1356,8 +1647,7 @@ def main(args):
     else:
         best_model_path = best_stage2_path if (stage2_enabled and best_stage2_path.exists()) else save_dir / 'best_model.pth'
     if best_model_path.exists():
-        checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        checkpoint = _load_model_checkpoint(model, best_model_path, device)
         if 'epoch' in checkpoint:
             print(f"Loaded best model from epoch {checkpoint['epoch']}")
         else:
@@ -1400,8 +1690,7 @@ def main(args):
     if trainer is not None:
         best_stage1_path = save_dir / 'best_model.pth'
         if best_stage1_path.exists():
-            ckpt_stage1 = torch.load(best_stage1_path, map_location=device, weights_only=False)
-            model.load_state_dict(ckpt_stage1['model_state_dict'], strict=False)
+            _load_model_checkpoint(model, best_stage1_path, device, strict=False)
             print("Loaded best_model.pth for visualization snapshots")
 
         trainer._visualize_training_samples(epoch=0, save_name='train_best_model')

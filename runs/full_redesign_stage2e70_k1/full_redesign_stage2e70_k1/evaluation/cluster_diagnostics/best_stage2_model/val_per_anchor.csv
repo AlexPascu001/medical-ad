@@ -1,0 +1,2 @@
+anchor_idx,count_all,count_normal,count_anomaly,frac_all,frac_normal,frac_anomaly,mean_nearest_distance_assigned,mean_margin_assigned,mean_ratio_assigned
+0,83,39,44,1.0,1.0,1.0,0.005296419374644756,,

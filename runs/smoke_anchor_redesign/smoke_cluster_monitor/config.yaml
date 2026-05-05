@@ -1,0 +1,97 @@
+anchor:
+  init_from: null
+  learnable: false
+  max_images_for_pca: 48
+  n_anchors: 12
+  prune:
+    discard_ratio: 0.25
+    min_k: 10
+  representation: centroids
+  reproject_anchors: true
+  strategy: kmeans
+  use_embedding_space: true
+data:
+  data_root: D:\Documents\FMI\Disertatie\medical-ad\data\BraTS2021_slice
+  max_train_samples: 48
+  target_size:
+  - 240
+  - 240
+eval:
+  bootstrap_samples: 50
+  compute_pixel: false
+loss:
+  alpha: 1.0
+  beta: 1.0
+  delta: 0.1
+  dense_weight: 0.5
+  distance_metric: euclidean
+  diversity_temperature: 0.1
+  gamma: 0.0
+  global_weight: 1.0
+  margin: 1.0
+  min_norm: 0.5
+  spatial_reduction: mean
+  use_dense: false
+model:
+  backbone: vit_small_patch16_dinov3.lvd1689m
+  freeze_backbone: true
+  projection_dim: 64
+  projection_dim_recon: null
+output_dir: D:\Documents\FMI\Disertatie\medical-ad\runs\smoke_anchor_redesign\smoke_cluster_monitor
+pretraining:
+  enabled: false
+seed: 42
+stage2:
+  alignment_target: anchor
+  alignment_weight: 0.1
+  consistency_loss: cosine
+  consistency_weight: 0.1
+  early_stopping_metric: image_auroc
+  early_stopping_patience: 1
+  enabled: true
+  epochs: 1
+  freeze_anchor_target: true
+  freeze_anchors: true
+  freeze_encoder: true
+  freeze_encoder_mode: full
+  frozen_bottleneck: true
+  lr: 0.0001
+  pixel_aggregation:
+    method: top_k_percentile
+    percentile: 95
+    threshold_n_std: 2.0
+  pixel_map:
+    enabled: false
+    type: reconstruction_l2
+  pixel_metrics:
+    enabled: false
+  recon_loss: mse
+  recon_weight: 1.0
+  score_combination:
+    alpha: 0.5
+    enabled: false
+    normalization: minmax
+  score_fusion:
+    anchor_weight: 0.4
+    divergence_weight: 0.3
+    enabled: false
+    normalization: minmax
+    pixel_weight: 0.3
+  unfreeze_last_n_blocks: 2
+  unfreeze_lr_multiplier: 0.1
+  weight_decay: 1.0e-06
+training:
+  batch_size: 16
+  capacity_multiplier: 2.0
+  dynamic_reassignment: false
+  early_stopping_patience: 1
+  epochs: 1
+  fixed_pseudo_labels: true
+  log_interval: 1
+  lr: 0.0001
+  num_workers: 0
+  pseudo_label_assignment: capacitated
+  reassignment_interval: 5
+  use_amp: false
+  val_interval: 1
+  weight_decay: 1.0e-06
