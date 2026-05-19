@@ -1,0 +1,105 @@
+anchor:
+  init_from: null
+  learnable: false
+  max_images_for_pca: 5000
+  mode: patch
+  n_anchors: 32
+  patch:
+    score_reduction: mean
+  prune:
+    discard_ratio: 0.0
+    min_k: 10
+  representation: closest_samples
+  reproject_anchors: true
+  strategy: kmeans
+  use_embedding_space: true
+data:
+  data_root: d:\Documents\FMI\Disertatie\medical-ad\data\BraTS2021_slice
+  normalization: zscore_only
+  target_size:
+  - 240
+  - 240
+  train_augment_mode: none
+eval:
+  bootstrap_samples: 1000
+  compute_pixel: true
+loss:
+  alpha: 1.0
+  beta: 0.5
+  delta: 0.0
+  dense_weight: 0.5
+  distance_metric: euclidean
+  diversity_temperature: 0.1
+  gamma: 0.0
+  global_weight: 1.0
+  margin: 1.0
+  min_norm: 0.5
+  spatial_reduction: mean
+  type: cam
+  use_dense: false
+model:
+  backbone: vit_base_patch16_dinov3.lvd1689m
+  freeze_backbone: true
+  projection_dim: 256
+  projection_dim_recon: null
+  use_pixel_decoder: false
+output_dir: d:\Documents\FMI\Disertatie\medical-ad\runs\patch_stage2e70_vitbase_p256_k32\patch_stage2e70_vitbase_p256_k32
+pretraining:
+  enabled: false
+seed: 42
+stage2:
+  alignment_target: anchor
+  alignment_weight: 0.1
+  consistency_loss: cosine
+  consistency_weight: 0.1
+  early_stopping_metric: pixel_aggregated_image_auroc
+  early_stopping_patience: 10
+  enabled: true
+  epochs: 70
+  freeze_anchor_target: true
+  freeze_anchors: true
+  freeze_encoder: true
+  freeze_encoder_mode: full
+  frozen_bottleneck: true
+  lr: 0.0001
+  pixel_aggregation:
+    method: top_k_percentile
+    percentile: 95
+    threshold_n_std: 2.0
+  pixel_map:
+    enabled: true
+    type: reconstruction_l2
+  pixel_metrics:
+    enabled: true
+  recon_loss: mse
+  recon_weight: 1.0
+  score_combination:
+    alpha: 0.5
+    enabled: false
+    normalization: minmax
+  score_fusion:
+    anchor_weight: 0.4
+    divergence_weight: 0.3
+    enabled: true
+    normalization: minmax
+    pixel_weight: 0.3
+  unfreeze_last_n_blocks: 2
+  unfreeze_lr_multiplier: 0.1
+  weight_decay: 0.0001
+training:
+  batch_size: 64
+  capacity_multiplier: 2.0
+  dynamic_reassignment: false
+  early_stopping_patience: 10
+  epochs: 100
+  fixed_pseudo_labels: true
+  log_interval: 50
+  lr: 0.0001
+  min_epochs_before_early_stopping: 0
+  num_workers: 4
+  pseudo_label_assignment: capacitated
+  reassignment_interval: 5
+  save_checkpoints: false
+  use_amp: true
+  val_interval: 1
+  weight_decay: 0.0001

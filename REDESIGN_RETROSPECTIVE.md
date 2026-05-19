@@ -105,6 +105,14 @@ Interpretation:
 | full_redesign_stage2e70 | 256 | 20 | 1 | 0.7826 |
 | full_redesign_stage2e70 | 1024 | 20 | 1 | 0.8193 |
 
+| K | Stage-1 Epochs Trained | Best Stage-1 Epoch | Best Stage-1 Image AUROC |
+|  --- | ---: | ---: | ---: |
+| 1 | 96 | 86 | 0.8805 |
+| 4 | 20 | 1 | 0.7704 |
+| 16 | 20 | 1 | 0.7861 |
+| 256 | 20 | 1 | 0.7826 |
+| 1024 | 20 | 1 | 0.8193 |
+
 The important pattern is not just the number of epochs. It is that for every `K > 1`, the best stage-1 checkpoint still sits at epoch 1 even after forcing stage-1 to continue to epoch 20.
 
 This strongly suggests:
