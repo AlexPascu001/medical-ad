@@ -4,6 +4,7 @@ Image-level and pixel-level AUROC, AUPR, operating points
 """
 
 from collections import Counter
+import json
 
 import torch
 import numpy as np
@@ -33,6 +34,21 @@ def _finalize_pixel_score_sources(source_counts: Counter, metrics: Dict[str, flo
 
     if 'dense_patch_upsampled' in source_count_dict:
         print("  WARNING: Pixel scores come from upsampled patch distances, not true pixel-decoder maps.")
+
+
+def _convert_to_serializable(obj):
+    """Convert numpy values to JSON-serializable Python types."""
+    if isinstance(obj, dict):
+        return {k: _convert_to_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_convert_to_serializable(item) for item in obj]
+    if isinstance(obj, (np.integer, np.int64, np.int32)):
+        return int(obj)
+    if isinstance(obj, (np.floating, np.float64, np.float32)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
 
 
 def evaluate_model(
@@ -539,6 +555,12 @@ def evaluate_comprehensive(
     if 'anchor_pixel_auroc' in metrics:
         print(f"Anchor Pixel AUROC: {metrics['anchor_pixel_auroc']:.4f}")
         print(f"Anchor Pixel AUPR: {metrics['anchor_pixel_aupr']:.4f}")
+
+    # Save the first-pass metrics immediately so they survive an interrupted run.
+    with open(save_dir / 'evaluation_metrics.json', 'w', encoding='utf-8') as f:
+        json.dump(_convert_to_serializable(metrics), f, indent=2)
+    print(f"Saved interim metrics to {save_dir / 'evaluation_metrics.json'}")
+    print("Collecting per-sample artifacts and plots (second pass over the dataset)...")
     
     # Collect scores for additional analysis
     model.eval()
@@ -556,7 +578,7 @@ def evaluate_comprehensive(
     pixel_score_sources = Counter()
     
     with torch.no_grad():
-        for batch in dataloader:
+        for batch in tqdm(dataloader, desc='Collecting evaluation artifacts'):
             images = batch['image'].to(device)
             labels = batch['label'].cpu().numpy()
             
@@ -724,26 +746,8 @@ def evaluate_comprehensive(
         except Exception as e:
             print(f"  Warning: Could not plot pixel-level ROC curve: {e}")
     
-    # Save metrics to JSON (convert numpy types to native Python types)
-    import json
-    
-    def convert_to_serializable(obj):
-        """Convert numpy types to Python native types for JSON serialization"""
-        if isinstance(obj, dict):
-            return {k: convert_to_serializable(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [convert_to_serializable(item) for item in obj]
-        elif isinstance(obj, (np.integer, np.int64, np.int32)):
-            return int(obj)
-        elif isinstance(obj, (np.floating, np.float64, np.float32)):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        else:
-            return obj
-    
-    with open(save_dir / 'evaluation_metrics.json', 'w') as f:
-        json.dump(convert_to_serializable(metrics), f, indent=2)
+    with open(save_dir / 'evaluation_metrics.json', 'w', encoding='utf-8') as f:
+        json.dump(_convert_to_serializable(metrics), f, indent=2)
     
     # --- Diagnostic visualizations ---
     try:
@@ -767,17 +771,20 @@ def evaluate_comprehensive(
         print(f"  Warning: pixel anomaly overlay visualization failed: {e}")
 
     # Full pipeline visualization (unified diagnostic)
-    try:
-        from visualize_pipeline import generate_full_pipeline_visualization
-        generate_full_pipeline_visualization(
-            model=model,
-            dataloader=dataloader,
-            device=device,
-            save_dir=save_dir,
-            target_size=target_size,
-        )
-    except Exception as e:
-        print(f"  Warning: pipeline visualization failed: {e}")
+    if getattr(model, 'supports_pipeline_visualization', True):
+        try:
+            from visualize_pipeline import generate_full_pipeline_visualization
+            generate_full_pipeline_visualization(
+                model=model,
+                dataloader=dataloader,
+                device=device,
+                save_dir=save_dir,
+                target_size=target_size,
+            )
+        except Exception as e:
+            print(f"  Warning: pipeline visualization failed: {e}")
+    else:
+        print("  [pipeline_visualization] Model opted out — skipping.")
 
     print(f"\nResults saved to {save_dir}")
     

@@ -34,7 +34,7 @@ The project is experimentation-heavy and supports multiple anchor strategies, lo
 - `project/eval.py`: metrics, confidence intervals, plots, and per-sample score export.
 - `project/anchors.py`: anchor generation and embedding utilities.
 - `project/loss.py`: canonical anchor-margin loss implementation used in main pipeline.
-- `project/evaluate_reproject_top3_ensemble.py`: normalized score-level ensemble evaluation.
+- [project/test/legacy_analysis/evaluate_reproject_top3_ensemble.py](project/test/legacy_analysis/evaluate_reproject_top3_ensemble.py): normalized score-level ensemble evaluation.
 
 ---
 
@@ -196,7 +196,7 @@ Problem observed in practice:
 
 Current solution:
 
-- `project/evaluate_reproject_top3_ensemble.py` loads per-sample score CSVs.
+- [project/test/legacy_analysis/evaluate_reproject_top3_ensemble.py](project/test/legacy_analysis/evaluate_reproject_top3_ensemble.py) loads per-sample score CSVs.
 - Applies per-model normalization before weighted aggregation.
 - Supported methods: `none`, `minmax`, `zscore`, `robust`, `rank`.
 - Writes fused results:
@@ -306,7 +306,7 @@ D:/Documents/FMI/Disertatie/medical-ad/venv/Scripts/python.exe project/main.py -
 Normalized ensemble:
 
 ```powershell
-D:/Documents/FMI/Disertatie/medical-ad/venv/Scripts/python.exe project/evaluate_reproject_top3_ensemble.py \
+D:/Documents/FMI/Disertatie/medical-ad/venv/Scripts/python.exe project/test/legacy_analysis/evaluate_reproject_top3_ensemble.py \
   --experiments solution_a_reproject_k1_1 reproject_k256_early reproject_k1024_early \
   --normalization rank \
   --score-column image_score \

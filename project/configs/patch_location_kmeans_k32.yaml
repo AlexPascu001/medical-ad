@@ -1,0 +1,75 @@
+seed: 42
+output_dir: './runs/patch_location_kmeans_k32'
+
+data:
+  data_root: './data/BraTS2021_slice'
+  normalization: 'zscore_only'
+  target_size: [240, 240]
+  train_augment_mode: 'none'
+
+anchor:
+  mode: 'patch'
+  strategy: 'kmeans'
+  n_anchors: 32
+  max_images_for_pca: 5000
+  learnable: false
+  init_from: null
+  use_embedding_space: true
+  reproject_anchors: true
+  representation: 'centroids'
+  patch:
+    variant: 'location_kmeans'
+    score_reduction: 'mean'
+    local_score_reduction: 'percentile'
+    local_score_percentile: 95.0
+    local_distance_metric: 'euclidean'
+
+model:
+  backbone: 'vit_small_patch16_dinov3.lvd1689m'
+  freeze_backbone: true
+  projection_dim: 64
+  projection_dim_recon: null
+  use_pixel_decoder: false
+
+loss:
+  type: 'cam'
+  margin: 1.0
+  alpha: 1.0
+  beta: 1.0
+  gamma: 0.0
+  delta: 0.1
+  min_norm: 0.5
+  diversity_temperature: 0.1
+  distance_metric: 'euclidean'
+  use_dense: false
+  global_weight: 1.0
+  dense_weight: 0.5
+  spatial_reduction: 'mean'
+
+pretraining:
+  enabled: false
+
+training:
+  epochs: 100
+  batch_size: 64
+  num_workers: 4
+  lr: 0.0001
+  weight_decay: 0.0001
+  use_amp: true
+  log_interval: 50
+  val_interval: 1
+  early_stopping_patience: 10
+  min_epochs_before_early_stopping: 0
+  fixed_pseudo_labels: false
+  dynamic_reassignment: false
+  reassignment_interval: 5
+  pseudo_label_assignment: 'nearest'
+  capacity_multiplier: 1.25
+  save_checkpoints: false
+
+stage2:
+  enabled: false
+
+eval:
+  compute_pixel: true
+  bootstrap_samples: 1000

@@ -107,7 +107,7 @@ This creates: `experiments/bmad_eigenface_k8_l2/`
 Initialize learnable anchors from the base experiment:
 
 ```bash
-python project/train_learnable_anchors.py \
+python project/test/legacy_learnable/train_learnable_anchors.py \
     --config project/configs/learnable_anchors.yaml \
     --init-from experiments/bmad_eigenface_k8_l2
 ```
@@ -192,17 +192,17 @@ Run learnable anchors initialized from each strategy:
 
 ```bash
 # From Eigenface
-python project/train_learnable_anchors.py \
+python project/test/legacy_learnable/train_learnable_anchors.py \
     --config project/configs/learnable_anchors.yaml \
     --init-from experiments/bmad_eigenface_k8_l2
 
 # From K-means
-python project/train_learnable_anchors.py \
+python project/test/legacy_learnable/train_learnable_anchors.py \
     --config project/configs/learnable_anchors.yaml \
     --init-from experiments/bmad_kmeans_k8_l2
 
 # From Random
-python project/train_learnable_anchors.py \
+python project/test/legacy_learnable/train_learnable_anchors.py \
     --config project/configs/learnable_anchors.yaml \
     --init-from experiments/bmad_random_k8_l2
 ```
@@ -287,13 +287,13 @@ python project/run_learnable_experiments.py --strategies random kmeans
 ### Visualization from Checkpoints
 
 ```bash
-python project/visualize_from_checkpoint.py --experiment experiments/bmad_learnable_random_fixed
+python project/test/legacy_viz/visualize_from_checkpoint.py --experiment experiments/bmad_learnable_random_fixed
 ```
 
 ### Compare Results
 
 ```bash
-python project/compare_experiment_results.py --experiments-dir experiments
+python project/test/legacy_analysis/compare_experiment_results.py --experiments-dir experiments
 ```
 
 ## Experiment Matrix

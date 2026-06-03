@@ -20,7 +20,7 @@ from anchors import AnchorGenerator, compute_anchor_embeddings, visualize_anchor
 from model import DINOv3Backbone, AnomalyDetector
 from loss import AnchorMarginLoss, DenseAnchorMarginLoss, CombinedAnchorLoss
 from contrastive_loss import CenterLoss, InfoNCEAnchorLoss, HybridAnchorLoss, CombinedContrastiveLoss
-from patch_mode import create_patch_criterion, create_patch_detector
+from patch_mode import create_patch_criterion, create_patch_detector, get_patch_variant, prepare_location_kmeans_anchors
 from train import Trainer
 from eval import evaluate_comprehensive, visualize_predictions, analyze_anchor_assignments
 
@@ -322,7 +322,11 @@ def load_config(config_path: str) -> dict:
         'mode': 'global',
         'representation': 'closest_samples',
         'patch': {
-            'score_reduction': 'mean'
+            'variant': 'legacy',
+            'score_reduction': 'mean',
+            'local_distance_metric': 'euclidean',
+            'local_score_reduction': 'percentile',
+            'local_score_percentile': 95.0
         },
         'prune': {
             'min_k': 10,
@@ -1273,19 +1277,32 @@ def main(args):
         # Generate new anchors only if we didn't get them from pre-training
         # SOLUTION A: Use embedding space generation (semantic clustering)
         use_embedding_space = config['anchor'].get('use_embedding_space', True)
+        patch_variant = get_patch_variant(config) if _get_anchor_mode(config) == 'patch' else 'legacy'
         
         if use_embedding_space:
-            print("\n[EMBEDDING-SPACE] Using semantic anchors generated in frozen DINOv3 space")
-            anchor_images, anchor_semantic, anchor_dense, anchor_geometric = prepare_anchors_in_embedding_space(
-                train_images=train_paths,
-                preprocessor=preprocessor,
-                config=config,
-                save_dir=save_dir,
-                backbone=backbone,
-                device=device
-            )
-            # For compatibility, set anchor_global to semantic anchors
-            anchor_global = anchor_semantic
+            if _get_anchor_mode(config) == 'patch' and patch_variant == 'location_kmeans':
+                print("\n[PATCH/LOCATION_KMEANS] Building same-location centroid bank in frozen DINOv3 patch space")
+                anchor_images, anchor_global, anchor_dense = prepare_location_kmeans_anchors(
+                    train_images=train_paths,
+                    preprocessor=preprocessor,
+                    config=config,
+                    save_dir=save_dir,
+                    backbone=backbone,
+                    device=device
+                )
+                anchor_geometric = None
+            else:
+                print("\n[EMBEDDING-SPACE] Using semantic anchors generated in frozen DINOv3 space")
+                anchor_images, anchor_semantic, anchor_dense, anchor_geometric = prepare_anchors_in_embedding_space(
+                    train_images=train_paths,
+                    preprocessor=preprocessor,
+                    config=config,
+                    save_dir=save_dir,
+                    backbone=backbone,
+                    device=device
+                )
+                # For compatibility, set anchor_global to semantic anchors
+                anchor_global = anchor_semantic
         else:
             print("\n[LEGACY] Using pixel space anchor generation")
             anchor_images, anchor_global, anchor_dense = prepare_anchors(

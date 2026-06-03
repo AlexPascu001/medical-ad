@@ -1,0 +1,36 @@
+seed: 42
+output_dir: './experiments/patchcore_dinov3_vitsmall'
+
+data:
+  data_root: './data/BraTS2021_slice'
+  target_size: [240, 240]
+  normalization: zscore_only
+  train_augment_mode: none
+
+model:
+  backbone: 'vit_small_patch16_dinov3.lvd1689m'
+  freeze_backbone: true
+  projection_dim: null
+
+training:
+  batch_size: 32
+  num_workers: 4
+
+eval:
+  compute_pixel: true
+  bootstrap_samples: 1000
+
+patchcore:
+  n_neighbors: 1
+  distance_metric: euclidean
+  neighbor_reduction: mean
+  query_batch_size: 4096
+  save_memory_bank: true
+  memory_bank:
+    patches_per_image: 64
+    max_features: 150000
+    max_images: null
+  image_score:
+    method: top_k_percentile
+    percentile: 95.0
+    threshold: null

@@ -1,0 +1,89 @@
+anchor:
+  mode: global
+  patch:
+    local_distance_metric: euclidean
+    local_score_percentile: 95.0
+    local_score_reduction: percentile
+    score_reduction: mean
+    variant: legacy
+  prune:
+    discard_ratio: 0.0
+    min_k: 10
+  representation: closest_samples
+data:
+  data_root: D:\Documents\FMI\Disertatie\medical-ad\data\BraTS2021_slice
+  normalization: zscore_only
+  target_size:
+  - 240
+  - 240
+  train_augment_mode: none
+eval:
+  bootstrap_samples: 1000
+  compute_pixel: true
+model:
+  backbone: vit_small_patch16_dinov3.lvd1689m
+  freeze_backbone: true
+  projection_dim: null
+output_dir: D:\Documents\FMI\Disertatie\medical-ad\experiments\patchcore_dinov3_vitsmall_2
+patchcore:
+  distance_metric: euclidean
+  image_score:
+    method: top_k_percentile
+    percentile: 95.0
+    threshold: null
+  memory_bank:
+    max_features: 150000
+    max_images: null
+    patches_per_image: 64
+  n_neighbors: 1
+  neighbor_reduction: mean
+  query_batch_size: 4096
+  save_memory_bank: true
+seed: 42
+stage2:
+  alignment_target: sample
+  alignment_weight: 0.1
+  consistency_loss: cosine
+  consistency_weight: 0.1
+  early_stopping_metric: pixel_aggregated_image_auroc
+  early_stopping_patience: 10
+  enabled: false
+  epochs: 20
+  freeze_anchor_target: true
+  freeze_anchors: true
+  freeze_encoder: true
+  freeze_encoder_mode: full
+  frozen_bottleneck: true
+  lr: 0.0001
+  pixel_aggregation:
+    method: top_k_percentile
+    percentile: 95
+    threshold_n_std: 2.0
+  pixel_map:
+    enabled: true
+    type: reconstruction_l2
+  pixel_metrics:
+    enabled: true
+  recon_loss: mse
+  recon_weight: 1.0
+  score_combination:
+    alpha: 0.5
+    enabled: false
+    normalization: minmax
+  score_fusion:
+    anchor_weight: 0.4
+    divergence_weight: 0.3
+    enabled: false
+    normalization: minmax
+    pixel_weight: 0.3
+  unfreeze_last_n_blocks: 2
+  unfreeze_lr_multiplier: 0.1
+  weight_decay: 1.0e-06
+training:
+  batch_size: 32
+  capacity_multiplier: 2.0
+  dynamic_reassignment: false
+  fixed_pseudo_labels: true
+  num_workers: 4
+  pseudo_label_assignment: nearest
+  reassignment_interval: 5

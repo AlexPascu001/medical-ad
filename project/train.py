@@ -260,7 +260,15 @@ class Trainer:
         frozen_feat = outputs.get('frozen_feat')
         alignment_target = self.stage2_config.get('alignment_target', 'sample')
 
-        if alignment_target == 'anchor':
+        if alignment_target == 'local_anchor_pool':
+            anchor_target = outputs.get('stage2_guidance')
+            if anchor_target is None:
+                raise RuntimeError("Stage-2 local_anchor_pool alignment requires 'stage2_guidance' in model outputs.")
+            if self.stage2_config.get('consistency_loss', 'cosine') == 'l2':
+                alignment_loss = F.mse_loss(stage2_feat, anchor_target.detach())
+            else:
+                alignment_loss = 1.0 - torch.cosine_similarity(stage2_feat, anchor_target.detach(), dim=1).mean()
+        elif alignment_target == 'anchor':
             fixed_assignments = outputs.get('fixed_assignments')
             if fixed_assignments is None:
                 raise RuntimeError("Stage-2 anchor alignment requires fixed pseudo-label assignments.")
@@ -1114,11 +1122,13 @@ class Trainer:
             val_loss_metrics[key] /= num_batches
         
         # Compute AUROC metrics
+        target_size = tuple(getattr(self.model, 'target_size', (256, 256)))
         auroc_metrics = evaluate_model(
             model=self.model,
             dataloader=self.val_loader,
             device=self.device,
-            compute_pixel_auroc=True
+            compute_pixel_auroc=True,
+            target_size=target_size,
         )
 
         cluster_diagnostics = self._compute_stage1_cluster_diagnostics()
