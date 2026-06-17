@@ -1,0 +1,30 @@
+{
+  "image_auroc": 0.6293874491869919,
+  "image_aupr": 0.8922962553300968,
+  "num_normal": 640,
+  "num_anomaly": 3075,
+  "operating_points": {
+    "fpr_0.01": {
+      "threshold": 1.1085938215255737,
+      "fpr": 0.009375,
+      "tpr": 0.0575609756097561
+    },
+    "fpr_0.05": {
+      "threshold": 1.0562763214111328,
+      "fpr": 0.05,
+      "tpr": 0.15707317073170732
+    },
+    "fpr_0.1": {
+      "threshold": 1.0267431735992432,
+      "fpr": 0.1,
+      "tpr": 0.23414634146341465
+    }
+  },
+  "confidence_intervals": {
+    "auroc_mean": 0.6297690004031271,
+    "auroc_std": 0.011349171226928276,
+    "auroc_lower": 0.6073833324889406,
+    "auroc_upper": 0.6521203627120983,
+    "confidence_level": 0.95
+  }
+}

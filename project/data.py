@@ -11,6 +11,48 @@ import cv2
 from typing import Tuple, Optional, List
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+from PIL import Image
+
+
+def _preprocessed_grayscale_to_pil_rgb(img: np.ndarray) -> Image.Image:
+    """Convert a preprocessed grayscale slice to RGB PIL for torchvision/timm."""
+    arr = img.astype(np.float32)
+    mn = float(arr.min())
+    mx = float(arr.max())
+    if mn < 0.0 or mx > 1.0:
+        if mx - mn < 1e-8:
+            arr = np.zeros_like(arr, dtype=np.float32)
+        else:
+            arr = (arr - mn) / (mx - mn)
+    arr = np.clip(arr, 0.0, 1.0)
+    arr_u8 = np.round(arr * 255.0).astype(np.uint8)
+    rgb = np.stack([arr_u8, arr_u8, arr_u8], axis=-1)
+    return Image.fromarray(rgb, mode='RGB')
+
+
+def _timm_input_hw(timm_data_config: dict) -> Tuple[int, int]:
+    input_size = timm_data_config.get('input_size', (3, 240, 240))
+    if len(input_size) == 3:
+        return int(input_size[1]), int(input_size[2])
+    return int(input_size[0]), int(input_size[1])
+
+
+def _apply_timm_eval_spatial_to_mask(mask: np.ndarray, timm_data_config: dict) -> np.ndarray:
+    """Apply the deterministic resize/center-crop shape change used by timm eval transforms."""
+    target_h, target_w = _timm_input_hw(timm_data_config)
+    crop_pct = float(timm_data_config.get('crop_pct', 1.0) or 1.0)
+    resize_h = int(round(target_h / crop_pct))
+    resize_w = int(round(target_w / crop_pct))
+
+    if mask.shape != (resize_h, resize_w):
+        mask = cv2.resize(mask, (resize_w, resize_h), interpolation=cv2.INTER_NEAREST)
+
+    top = max((mask.shape[0] - target_h) // 2, 0)
+    left = max((mask.shape[1] - target_w) // 2, 0)
+    mask = mask[top:top + target_h, left:left + target_w]
+    if mask.shape != (target_h, target_w):
+        mask = cv2.resize(mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+    return mask
 
 
 class BMADPreprocessor:
@@ -69,7 +111,9 @@ class BMADDataset(Dataset):
         augment: bool = False,
         is_training: bool = True,
         normalize_mode: str = 'zscore_only',
-        augment_mode: str = 'full'
+        augment_mode: str = 'full',
+        use_timm_transforms: bool = False,
+        timm_data_config: Optional[dict] = None
     ):
         """
         Args:
@@ -82,12 +126,17 @@ class BMADDataset(Dataset):
             normalize_mode: 'zscore_only' (z-score, no ImageNet norm) or
                             'minmax_imagenet' (min-max [0,1] + ImageNet norm)
             augment_mode: Training augmentation preset: 'full', 'flip_only', or 'none'
+            use_timm_transforms: Use timm.data.create_transform(..., is_training=False)
+                                  for final image conversion and normalization.
+            timm_data_config: Resolved timm data config used with use_timm_transforms.
         """
         self.image_paths = image_paths
         self.labels = labels if labels is not None else [0] * len(image_paths)
         self.mask_paths = mask_paths
         self.preprocessor = preprocessor or BMADPreprocessor(normalize_mode=normalize_mode)
         self.is_training = is_training
+        self.use_timm_transforms = use_timm_transforms
+        self.timm_data_config = timm_data_config
         
         # Build transform list
         augment_ops = []
@@ -111,6 +160,18 @@ class BMADDataset(Dataset):
             else:
                 raise ValueError(f"Unsupported augment_mode: {augment_mode}")
 
+        if use_timm_transforms:
+            if timm_data_config is None:
+                raise ValueError("timm_data_config is required when use_timm_transforms=True")
+            from timm.data import create_transform
+            self.augment_transform = A.Compose(augment_ops) if augment_ops else None
+            self.timm_transform = create_transform(**timm_data_config, is_training=False)
+            self.transform = self.timm_transform
+            return
+
+        self.augment_transform = None
+        self.timm_transform = None
+
         # Only apply ImageNet normalization when preprocessor outputs [0,1] range
         if normalize_mode == 'minmax_imagenet':
             final_ops = [A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), ToTensorV2()]
@@ -131,9 +192,10 @@ class BMADDataset(Dataset):
         # Preprocess
         img = self.preprocessor.preprocess(img)
         
-        # Convert grayscale to 3-channel BEFORE transforms so that
-        # A.Normalize applies per-channel ImageNet stats correctly.
-        img = np.stack([img, img, img], axis=-1)  # (H, W) -> (H, W, 3)
+        if not self.use_timm_transforms:
+            # Convert grayscale to 3-channel BEFORE transforms so that
+            # A.Normalize applies per-channel ImageNet stats correctly.
+            img = np.stack([img, img, img], axis=-1)  # (H, W) -> (H, W, 3)
         
         # Load mask if available
         mask = None
@@ -148,8 +210,18 @@ class BMADDataset(Dataset):
                         mask = cv2.resize(mask, self.preprocessor.target_size, interpolation=cv2.INTER_NEAREST)
                     mask = (mask > 0).astype(np.float32)
         
-        # Apply transforms (includes ImageNet normalization + ToTensorV2)
-        if mask is not None:
+        if self.use_timm_transforms:
+            if self.augment_transform is not None:
+                transformed = self.augment_transform(image=img, mask=mask) if mask is not None else self.augment_transform(image=img)
+                img = transformed['image']
+                if mask is not None:
+                    mask = transformed['mask']
+
+            img = self.timm_transform(_preprocessed_grayscale_to_pil_rgb(img))
+            if mask is not None:
+                mask = _apply_timm_eval_spatial_to_mask(mask, self.timm_data_config)
+                mask = torch.from_numpy(mask.astype(np.float32))
+        elif mask is not None:
             transformed = self.transform(image=img, mask=mask)
             img = transformed['image']
             mask = transformed['mask']
@@ -185,7 +257,9 @@ def create_dataloaders(
     num_workers: int = 4,
     target_size: Tuple[int, int] = (256, 256),
     normalize_mode: str = 'zscore_only',
-    train_augment_mode: str = 'full'
+    train_augment_mode: str = 'full',
+    use_timm_transforms: bool = False,
+    timm_data_config: Optional[dict] = None
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Create train/val/test dataloaders with proper preprocessing
@@ -203,6 +277,9 @@ def create_dataloaders(
         target_size: Target image size (H, W)
         normalize_mode: 'zscore_only' or 'minmax_imagenet'
         train_augment_mode: Training augmentation preset: 'full', 'flip_only', or 'none'
+        use_timm_transforms: Use timm.data.create_transform(..., is_training=False)
+                             for final image transforms.
+        timm_data_config: Resolved timm data config for the configured backbone.
     
     Returns:
         train_loader, val_loader, test_loader
@@ -217,7 +294,9 @@ def create_dataloaders(
         augment=True,
         is_training=True,
         normalize_mode=normalize_mode,
-        augment_mode=train_augment_mode
+        augment_mode=train_augment_mode,
+        use_timm_transforms=use_timm_transforms,
+        timm_data_config=timm_data_config
     )
     
     # Validation dataset
@@ -228,7 +307,9 @@ def create_dataloaders(
         preprocessor=preprocessor,
         augment=False,
         is_training=False,
-        normalize_mode=normalize_mode
+        normalize_mode=normalize_mode,
+        use_timm_transforms=use_timm_transforms,
+        timm_data_config=timm_data_config
     )
     
     # Test dataset
@@ -239,7 +320,9 @@ def create_dataloaders(
         preprocessor=preprocessor,
         augment=False,
         is_training=False,
-        normalize_mode=normalize_mode
+        normalize_mode=normalize_mode,
+        use_timm_transforms=use_timm_transforms,
+        timm_data_config=timm_data_config
     )
     
     # Create dataloaders

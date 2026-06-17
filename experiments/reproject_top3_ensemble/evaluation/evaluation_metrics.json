@@ -1,0 +1,6 @@
+{
+  "image_auroc": 0.7829786585365854,
+  "image_aupr": 0.9404598572356401,
+  "num_normal": 640,
+  "num_anomaly": 3075
+}

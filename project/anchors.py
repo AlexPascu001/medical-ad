@@ -20,8 +20,26 @@ from pathlib import Path
 from abc import ABC, abstractmethod
 
 
+def _preprocessed_grayscale_to_pil_rgb(img: np.ndarray):
+    """Convert a preprocessed grayscale slice to RGB PIL for torchvision/timm."""
+    from PIL import Image
+    arr = img.astype(np.float32)
+    mn = float(arr.min())
+    mx = float(arr.max())
+    if mn < 0.0 or mx > 1.0:
+        if mx - mn < 1e-8:
+            arr = np.zeros_like(arr, dtype=np.float32)
+        else:
+            arr = (arr - mn) / (mx - mn)
+    arr = np.clip(arr, 0.0, 1.0)
+    arr_u8 = np.round(arr * 255.0).astype(np.uint8)
+    rgb = np.stack([arr_u8, arr_u8, arr_u8], axis=-1)
+    return Image.fromarray(rgb, mode='RGB')
+
+
 def _grayscale_batch_to_tensor(images_np: np.ndarray, device: torch.device,
-                               apply_imagenet_norm: bool = False) -> torch.Tensor:
+                               apply_imagenet_norm: bool = False,
+                               timm_transform=None) -> torch.Tensor:
     """Convert a batch of preprocessed grayscale images to 3-channel tensors.
 
     Args:
@@ -29,10 +47,15 @@ def _grayscale_batch_to_tensor(images_np: np.ndarray, device: torch.device,
         device: Target torch device.
         apply_imagenet_norm: If True, apply ImageNet normalization (use when
             preprocessor outputs [0,1] via min-max scaling).
+        timm_transform: Optional transform from timm.data.create_transform.
 
     Returns:
         (B, 3, H, W) tensor ready for DINOv3 backbone.
     """
+    if timm_transform is not None:
+        tensors = [timm_transform(_preprocessed_grayscale_to_pil_rgb(img)) for img in images_np]
+        return torch.stack(tensors).to(device)
+
     import albumentations as A
     from albumentations.pytorch import ToTensorV2
     ops = []
@@ -1295,7 +1318,8 @@ def compute_anchor_embeddings(
     device: torch.device,
     batch_size: int = 8,
     return_projected: bool = False,
-    apply_imagenet_norm: bool = False
+    apply_imagenet_norm: bool = False,
+    timm_data_config: Optional[dict] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Compute DINOv3 embeddings for anchor images.
@@ -1319,6 +1343,10 @@ def compute_anchor_embeddings(
     """
     K = len(anchor_images)
     backbone_model.eval()
+    timm_transform = None
+    if timm_data_config is not None:
+        from timm.data import create_transform
+        timm_transform = create_transform(**timm_data_config, is_training=False)
     
     global_embeds = []
     dense_embeds = []
@@ -1328,7 +1356,12 @@ def compute_anchor_embeddings(
             batch = anchor_images[i:i+batch_size]
             
             # Convert to 3-channel tensor for DINOv3
-            batch_tensor = _grayscale_batch_to_tensor(batch, device, apply_imagenet_norm=apply_imagenet_norm)
+            batch_tensor = _grayscale_batch_to_tensor(
+                batch,
+                device,
+                apply_imagenet_norm=apply_imagenet_norm,
+                timm_transform=timm_transform
+            )
             
             if return_projected:
                 # Use backbone's forward() which applies projection + normalization

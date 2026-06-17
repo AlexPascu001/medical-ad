@@ -159,7 +159,8 @@ def pretrain_projection_head(
     config: dict,
     device: torch.device,
     cache_dir: Path,
-    force_retrain: bool = False
+    force_retrain: bool = False,
+    timm_data_config: dict = None
 ) -> tuple:
     """
     Pre-train projection head with anchors using CAM loss.
@@ -179,6 +180,7 @@ def pretrain_projection_head(
         device: torch device
         cache_dir: Directory to cache pre-trained weights
         force_retrain: Force re-training even if cached weights exist
+        timm_data_config: Optional timm eval transform config for input preprocessing.
         
     Returns:
         (anchor_images, anchor_global_embeddings): Anchors to use for main training
@@ -313,7 +315,8 @@ def pretrain_projection_head(
         backbone_model=backbone,
         device=device,
         batch_size=8,
-        return_projected=True
+        return_projected=True,
+        timm_data_config=timm_data_config
     )
     anchor_global = anchor_global.to(device)  # Ensure on correct device
     print(f"✓ Anchor embeddings: {anchor_global.shape}")
@@ -327,7 +330,9 @@ def pretrain_projection_head(
     temp_dataset = BMADDataset(
         image_paths=train_paths,
         preprocessor=preprocessor,
-        is_training=False  # No augmentation for visualization
+        is_training=False,  # No augmentation for visualization
+        use_timm_transforms=timm_data_config is not None,
+        timm_data_config=timm_data_config
     )
     temp_loader = DataLoader(
         temp_dataset,

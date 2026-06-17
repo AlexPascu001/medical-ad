@@ -201,7 +201,9 @@ class DINOv3Backbone(nn.Module):
         projection_dim: Optional[int] = None,
         pretrained: bool = True,
         multi_scale_indices: Optional[List[int]] = None,
-        projection_hidden_dims: Optional[List[int]] = None
+        projection_hidden_dims: Optional[List[int]] = None,
+        projection_activation: str = 'relu',
+        projection_dropout: float = 0.0
     ):
         """
         Args:
@@ -222,7 +224,13 @@ class DINOv3Backbone(nn.Module):
         self.freeze_backbone = freeze_backbone
         self.projection_dim = projection_dim
         self.projection_hidden_dims = projection_hidden_dims
+        self.projection_activation = str(projection_activation).lower()
+        self.projection_dropout = float(projection_dropout)
         self.multi_scale_indices = multi_scale_indices or []
+        if self.projection_activation not in {'relu', 'gelu'}:
+            raise ValueError(f"Unsupported projection_activation: {projection_activation}. Use 'relu' or 'gelu'.")
+        if not 0.0 <= self.projection_dropout < 1.0:
+            raise ValueError(f"projection_dropout must be in [0, 1), got {projection_dropout}.")
 
         # Load DINOv2 model from timm
         print(f"Loading {model_name}...")
@@ -260,28 +268,37 @@ class DINOv3Backbone(nn.Module):
         if projection_hidden_dims is not None:
             # Configurable multi-layer projection: embed_dim -> [hidden_dims...]
             dims = [self.embed_dim] + list(projection_hidden_dims)
-            layers = []
-            for i in range(len(dims) - 1):
-                layers.append(nn.Linear(dims[i], dims[i + 1]))
-                if i < len(dims) - 2:  # ReLU between all layers except the last
-                    layers.append(nn.ReLU())
+            layers = self._build_projection_layers(dims)
             self.projection = nn.Sequential(*layers)
             self._init_projection_head()
             dims_str = ' -> '.join(str(d) for d in dims)
             print(f"Added trainable projection head: {dims_str}")
+            print(f"  Activation: {self.projection_activation}, dropout: {self.projection_dropout}")
             print(f"  Trainable parameters: {sum(p.numel() for p in self.projection.parameters() if p.requires_grad):,}")
             print(f"  Initialized with orthogonal weights (gain=1.0)")
         elif projection_dim is not None:
-            self.projection = nn.Sequential(
-                nn.Linear(self.embed_dim, self.embed_dim // 2),
-                nn.ReLU(),
-                nn.Linear(self.embed_dim // 2, projection_dim)
-            )
+            self.projection = nn.Sequential(*self._build_projection_layers([self.embed_dim, self.embed_dim // 2, projection_dim]))
             # Initialize with orthogonal weights for better semantic preservation
             self._init_projection_head()
             print(f"Added trainable projection head: {self.embed_dim} -> {self.embed_dim // 2} -> {projection_dim}")
+            print(f"  Activation: {self.projection_activation}, dropout: {self.projection_dropout}")
             print(f"  Trainable parameters: {sum(p.numel() for p in self.projection.parameters() if p.requires_grad):,}")
             print(f"  Initialized with orthogonal weights (gain=1.0)")
+
+    def _make_projection_activation(self) -> nn.Module:
+        if self.projection_activation == 'gelu':
+            return nn.GELU()
+        return nn.ReLU()
+
+    def _build_projection_layers(self, dims: List[int]) -> List[nn.Module]:
+        layers: List[nn.Module] = []
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            if i < len(dims) - 2:
+                layers.append(self._make_projection_activation())
+                if self.projection_dropout > 0.0:
+                    layers.append(nn.Dropout(p=self.projection_dropout))
+        return layers
     
     def _init_projection_head(self):
         """Initialize projection head with orthogonal weights to preserve DINOv3 semantic structure."""
@@ -655,13 +672,25 @@ class AnomalyDetector(nn.Module):
 
         # --- stage-2 projection head ---
         embed_dim = self.backbone.embed_dim
+        projection_activation = getattr(self.backbone, 'projection_activation', 'relu')
+        projection_dropout = float(getattr(self.backbone, 'projection_dropout', 0.0))
+
+        def _activation() -> nn.Module:
+            return nn.GELU() if projection_activation == 'gelu' else nn.ReLU()
+
+        def _projection_layers(dims: List[int]) -> List[nn.Module]:
+            layers: List[nn.Module] = []
+            for i in range(len(dims) - 1):
+                layers.append(nn.Linear(dims[i], dims[i + 1]))
+                if i < len(dims) - 2:
+                    layers.append(_activation())
+                    if projection_dropout > 0.0:
+                        layers.append(nn.Dropout(p=projection_dropout))
+            return layers
+
         if recon_dim != anchor_dim or self.backbone.projection is None:
             # Build a fresh projection head sized for the reconstruction bottleneck
-            self.stage2_projection = nn.Sequential(
-                nn.Linear(embed_dim, embed_dim // 2),
-                nn.ReLU(),
-                nn.Linear(embed_dim // 2, recon_dim)
-            )
+            self.stage2_projection = nn.Sequential(*_projection_layers([embed_dim, embed_dim // 2, recon_dim]))
             # Orthogonal init (same as backbone projection head)
             for m in self.stage2_projection.modules():
                 if isinstance(m, nn.Linear):
@@ -680,11 +709,7 @@ class AnomalyDetector(nn.Module):
             if self.backbone.projection is not None:
                 self.frozen_projection = copy.deepcopy(self.backbone.projection)
             else:
-                self.frozen_projection = nn.Sequential(
-                    nn.Linear(embed_dim, embed_dim),
-                    nn.ReLU(inplace=True),
-                    nn.Linear(embed_dim, anchor_dim)
-                )
+                self.frozen_projection = nn.Sequential(*_projection_layers([embed_dim, embed_dim, anchor_dim]))
             for p in self.frozen_projection.parameters():
                 p.requires_grad = False
             self.frozen_projection.eval()

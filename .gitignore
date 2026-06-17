@@ -13,3 +13,4 @@ data/
 *.ps1
 __pycache__/
 *.pyc
+!evaluation_metrics.json

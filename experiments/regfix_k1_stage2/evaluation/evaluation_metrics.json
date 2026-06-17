@@ -1,0 +1,40 @@
+{
+  "image_auroc": 0.8394961890243902,
+  "image_aupr": 0.9605141797789742,
+  "num_normal": 640,
+  "num_anomaly": 3075,
+  "anchor_image_auroc": 0.8394961890243902,
+  "anchor_image_aupr": 0.9605141797789742,
+  "reconstruction_image_auroc": 0.5666814024390244,
+  "reconstruction_image_aupr": 0.8422117149247699,
+  "pixel_aggregated_image_auroc": 0.6017022357723577,
+  "pixel_aggregated_image_aupr": 0.8795186913050178,
+  "pixel_auroc": 0.8982020764908294,
+  "pixel_aupr": 0.2881735526395972,
+  "reconstruction_pixel_auroc": 0.8982020764908294,
+  "reconstruction_pixel_aupr": 0.2881735526395972,
+  "operating_points": {
+    "fpr_0.01": {
+      "threshold": 0.007159608416259289,
+      "fpr": 0.009375,
+      "tpr": 0.18634146341463415
+    },
+    "fpr_0.05": {
+      "threshold": 0.0041861399076879025,
+      "fpr": 0.05,
+      "tpr": 0.5573983739837398
+    },
+    "fpr_0.1": {
+      "threshold": 0.00363761349581182,
+      "fpr": 0.1,
+      "tpr": 0.6744715447154471
+    }
+  },
+  "confidence_intervals": {
+    "auroc_mean": 0.8391277611376986,
+    "auroc_std": 0.007459615562814914,
+    "auroc_lower": 0.8247539683385824,
+    "auroc_upper": 0.8531926961808883,
+    "confidence_level": 0.95
+  }
+}

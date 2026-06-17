@@ -8,6 +8,8 @@ data:
   data_root: './data/BraTS2021_slice'  # Root directory of the dataset
   target_size: [240, 240]  # Image resolution (H, W) - actual BraTS slice size
   train_augment_mode: 'full'  # 'full', 'flip_only', or 'none' for training-only augmentation presets
+  use_timm_transforms: false  # Use timm.data.create_transform(..., is_training=false) for model inputs
+  timm_data_config: {}        # Optional overrides for resolved timm data config (input_size is set from target_size)
 
 # Anchor configuration
 anchor:
@@ -31,6 +33,8 @@ model:
   backbone: 'vit_small_patch16_dinov3.lvd1689m'  # Options: vit_small_patch16_dinov3.lvd1689m
   freeze_backbone: true       # Freeze DINOv3 weights (only train projection head)
   projection_dim: 128         # Trainable projection head dimension (set to null to disable)
+  projection_activation: 'relu'  # Hidden activation for projection head: 'relu' or 'gelu'
+  projection_dropout: 0.0        # Dropout probability between projection layers
   projection_dim_recon: null    # Stage-2 reconstruction projection dim (null = same as projection_dim)
 
 # Loss configuration

@@ -106,6 +106,7 @@ def prepare_location_kmeans_anchors(
     save_dir: Path,
     backbone: DINOv3Backbone,
     device: torch.device,
+    timm_data_config: Optional[dict] = None,
 ) -> tuple:
     """Build a same-location local centroid bank from frozen DINO patch tokens."""
     _, local_distance_metric, _, local_score_percentile = _validate_location_kmeans_config(config)
@@ -155,6 +156,10 @@ def prepare_location_kmeans_anchors(
     norm_mode = config['data'].get('normalization', 'zscore_only')
     batch_size = 64
     backbone.eval()
+    timm_eval_transform = None
+    if timm_data_config is not None:
+        from timm.data import create_transform
+        timm_eval_transform = create_transform(**timm_data_config, is_training=False)
 
     with torch.no_grad():
         for start_idx in range(0, n_images, batch_size):
@@ -163,6 +168,7 @@ def prepare_location_kmeans_anchors(
                 batch_imgs,
                 device,
                 apply_imagenet_norm=(norm_mode == 'minmax_imagenet'),
+                timm_transform=timm_eval_transform,
             )
             features = backbone.backbone.forward_features(batch_tensor)
             patch_tokens = features[:, 1 + backbone.num_register_tokens:]
@@ -804,6 +810,8 @@ def _build_backbone(config: dict) -> DINOv3Backbone:
         pretrained=True,
         multi_scale_indices=multi_scale_indices if use_pixel_decoder else None,
         projection_hidden_dims=projection_hidden_dims,
+        projection_activation=config['model'].get('projection_activation', 'relu'),
+        projection_dropout=config['model'].get('projection_dropout', 0.0),
     )
 
 

@@ -334,7 +334,13 @@ def load_config(config_path: str) -> dict:
         }
     }
     data_defaults = {
-        'train_augment_mode': 'full'
+        'train_augment_mode': 'full',
+        'use_timm_transforms': False,
+        'timm_data_config': {}
+    }
+    model_defaults = {
+        'projection_activation': 'relu',
+        'projection_dropout': 0.0
     }
     training_defaults = {
         'fixed_pseudo_labels': True,
@@ -390,11 +396,30 @@ def load_config(config_path: str) -> dict:
     }
 
     _merge_nested_defaults(config.setdefault('data', {}), data_defaults)
+    _merge_nested_defaults(config.setdefault('model', {}), model_defaults)
     _merge_nested_defaults(config.setdefault('anchor', {}), anchor_defaults)
     _merge_nested_defaults(config.setdefault('training', {}), training_defaults)
     _merge_nested_defaults(config.setdefault('stage2', {}), stage2_defaults)
 
     return config
+
+
+def build_timm_data_config(config: dict) -> dict | None:
+    """Resolve the eval transform config for the configured timm backbone."""
+    if not config.get('data', {}).get('use_timm_transforms', False):
+        return None
+
+    import timm
+    from timm.data import resolve_model_data_config
+
+    model_for_cfg = timm.create_model(config['model']['backbone'], pretrained=False)
+    data_config = dict(resolve_model_data_config(model_for_cfg))
+    target_h, target_w = tuple(config['data']['target_size'])
+    # Preserve the experiment image size so patch grids, masks, and decoders stay aligned.
+    data_config['input_size'] = (3, target_h, target_w)
+    data_config.update(config['data'].get('timm_data_config', {}) or {})
+    print(f"Using timm eval transforms with data_config={data_config}")
+    return data_config
 
 
 def _validate_anchors(anchor_embeddings: torch.Tensor, margin: float = 1.0) -> None:
@@ -429,7 +454,8 @@ def prepare_anchors_in_embedding_space(
     config: dict,
     save_dir: Path,
     backbone: DINOv3Backbone,
-    device: torch.device
+    device: torch.device,
+    timm_data_config: dict | None = None
 ) -> tuple:
     """
     Generate anchors in DINOv3 embedding space (SOLUTION A).
@@ -485,6 +511,11 @@ def prepare_anchors_in_embedding_space(
     embeddings_384d_list = []
     
     batch_size = 64
+    timm_eval_transform = None
+    if timm_data_config is not None:
+        from timm.data import create_transform
+        timm_eval_transform = create_transform(**timm_data_config, is_training=False)
+
     with torch.no_grad():
         for i in range(0, len(images_np), batch_size):
             batch_imgs = images_np[i:i+batch_size]
@@ -492,8 +523,12 @@ def prepare_anchors_in_embedding_space(
             # Convert to 3-channel tensor (must match BMADDataset preprocessing)
             from anchors import _grayscale_batch_to_tensor
             _norm_mode = config['data'].get('normalization', 'zscore_only')
-            batch_tensor = _grayscale_batch_to_tensor(batch_imgs, device,
-                                                       apply_imagenet_norm=(_norm_mode == 'minmax_imagenet'))
+            batch_tensor = _grayscale_batch_to_tensor(
+                batch_imgs,
+                device,
+                apply_imagenet_norm=(_norm_mode == 'minmax_imagenet'),
+                timm_transform=timm_eval_transform
+            )
             
             # Extract RAW DINOv3 features (CLS token)
             features = backbone.backbone.forward_features(batch_tensor)
@@ -625,7 +660,8 @@ def prepare_anchors_in_embedding_space(
         device=device,
         batch_size=8,
         return_projected=False,
-        apply_imagenet_norm=(config['data'].get('normalization', 'zscore_only') == 'minmax_imagenet')
+        apply_imagenet_norm=(config['data'].get('normalization', 'zscore_only') == 'minmax_imagenet'),
+        timm_data_config=timm_data_config
     )
     print(f"  Dense anchor maps: {anchor_dense_384d.shape}")
     
@@ -727,7 +763,8 @@ def prepare_anchors(
     config: dict,
     save_dir: Path,
     backbone_for_projection: DINOv3Backbone = None,
-    device: torch.device = None
+    device: torch.device = None,
+    timm_data_config: dict | None = None
 ) -> tuple:
     """
     Prepare anchor images and embeddings.
@@ -814,7 +851,9 @@ def prepare_anchors(
             freeze_backbone=True,
             projection_dim=projection_dim,
             pretrained=True,
-            projection_hidden_dims=projection_hidden_dims
+            projection_hidden_dims=projection_hidden_dims,
+            projection_activation=config['model'].get('projection_activation', 'relu'),
+            projection_dropout=config['model'].get('projection_dropout', 0.0)
         )
         backbone = backbone.to(device)
         use_model_backbone = False
@@ -829,7 +868,8 @@ def prepare_anchors(
         device=device,
         batch_size=8,
         return_projected=has_projection,
-        apply_imagenet_norm=(config['data'].get('normalization', 'zscore_only') == 'minmax_imagenet')
+        apply_imagenet_norm=(config['data'].get('normalization', 'zscore_only') == 'minmax_imagenet'),
+        timm_data_config=timm_data_config
     )
     
     # Save embeddings
@@ -881,7 +921,9 @@ def create_model(config: dict, anchor_global: torch.Tensor, anchor_dense: torch.
         projection_dim=projection_dim,
         pretrained=True,
         multi_scale_indices=multi_scale_indices if use_pixel_decoder else None,
-        projection_hidden_dims=projection_hidden_dims
+        projection_hidden_dims=projection_hidden_dims,
+        projection_activation=config['model'].get('projection_activation', 'relu'),
+        projection_dropout=config['model'].get('projection_dropout', 0.0)
     )
     
     # Check if anchors should be learnable
@@ -1102,6 +1144,7 @@ def main(args):
     else:
         save_dir = make_unique_dir(save_dir)
     config['output_dir'] = str(save_dir)
+    timm_data_config = build_timm_data_config(config)
     
     # Create output directory
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -1161,7 +1204,9 @@ def main(args):
         num_workers=config['training']['num_workers'],
         target_size=tuple(config['data']['target_size']),
         normalize_mode=normalize_mode,
-        train_augment_mode=config['data'].get('train_augment_mode', 'full')
+        train_augment_mode=config['data'].get('train_augment_mode', 'full'),
+        use_timm_transforms=config['data'].get('use_timm_transforms', False),
+        timm_data_config=timm_data_config
     )
     
     print(f"Train batches: {len(train_loader)}")
@@ -1186,7 +1231,9 @@ def main(args):
         projection_dim=projection_dim,
         pretrained=True,
         multi_scale_indices=multi_scale_indices if use_pixel_decoder else None,
-        projection_hidden_dims=projection_hidden_dims
+        projection_hidden_dims=projection_hidden_dims,
+        projection_activation=config['model'].get('projection_activation', 'relu'),
+        projection_dropout=config['model'].get('projection_dropout', 0.0)
     )
     backbone = backbone.to(device)
     
@@ -1204,7 +1251,8 @@ def main(args):
         config=config,
         device=device,
         cache_dir=cache_dir,
-        force_retrain=False
+        force_retrain=False,
+        timm_data_config=timm_data_config
     )
     
     # ===== STAGE 3: Anchor Setup =====
@@ -1288,7 +1336,8 @@ def main(args):
                     config=config,
                     save_dir=save_dir,
                     backbone=backbone,
-                    device=device
+                    device=device,
+                    timm_data_config=timm_data_config
                 )
                 anchor_geometric = None
             else:
@@ -1299,7 +1348,8 @@ def main(args):
                     config=config,
                     save_dir=save_dir,
                     backbone=backbone,
-                    device=device
+                    device=device,
+                    timm_data_config=timm_data_config
                 )
                 # For compatibility, set anchor_global to semantic anchors
                 anchor_global = anchor_semantic
@@ -1311,7 +1361,8 @@ def main(args):
                 config=config,
                 save_dir=save_dir,
                 backbone_for_projection=backbone,  # Use MODEL's backbone!
-                device=device
+                device=device,
+                timm_data_config=timm_data_config
             )
     
     # ===== STAGE 4: Complete Model Creation =====

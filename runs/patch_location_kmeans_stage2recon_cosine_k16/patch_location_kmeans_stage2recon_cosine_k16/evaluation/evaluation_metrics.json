@@ -1,0 +1,58 @@
+{
+  "image_auroc": 0.7606935975609757,
+  "image_aupr": 0.9176292688925266,
+  "num_normal": 640,
+  "num_anomaly": 3075,
+  "anchor_image_auroc": 0.7606935975609757,
+  "anchor_image_aupr": 0.9176292688925266,
+  "reconstruction_image_auroc": 0.7338988821138211,
+  "reconstruction_image_aupr": 0.9229196659872982,
+  "divergence_image_auroc": 0.37933790650406507,
+  "divergence_image_aupr": 0.774210186931719,
+  "pixel_aggregated_image_auroc": 0.7338516260162602,
+  "pixel_aggregated_image_aupr": 0.9287528475510693,
+  "patch_divergence_aggregated_image_auroc": 0.30604369918699187,
+  "patch_divergence_aggregated_image_aupr": 0.7403502728798174,
+  "fused_image_auroc": 0.8062347560975609,
+  "fused_image_aupr": 0.9405909601545541,
+  "fusion_weights": {
+    "anchor": 0.4,
+    "divergence": 0.3,
+    "pixel": 0.3
+  },
+  "fusion_normalization": "minmax",
+  "pixel_auroc": 0.9325898425290118,
+  "pixel_aupr": 0.4000024235561286,
+  "reconstruction_pixel_auroc": 0.9325898425290118,
+  "reconstruction_pixel_aupr": 0.4000024235561286,
+  "anchor_pixel_auroc": 0.7402071189527452,
+  "anchor_pixel_aupr": 0.07860260992473876,
+  "pixel_scores_source_counts": {
+    "reconstruction_pixel_map": 59
+  },
+  "pixel_scores_source": "reconstruction_pixel_map",
+  "operating_points": {
+    "fpr_0.01": {
+      "threshold": 0.4011150598526001,
+      "fpr": 0.009375,
+      "tpr": 0.007804878048780488
+    },
+    "fpr_0.05": {
+      "threshold": 0.28339725732803345,
+      "fpr": 0.05,
+      "tpr": 0.13333333333333333
+    },
+    "fpr_0.1": {
+      "threshold": 0.24861592054367065,
+      "fpr": 0.1,
+      "tpr": 0.3147967479674797
+    }
+  },
+  "confidence_intervals": {
+    "auroc_mean": 0.7604656375530767,
+    "auroc_std": 0.011519233367448438,
+    "auroc_lower": 0.7371974845387567,
+    "auroc_upper": 0.7835759139779324,
+    "confidence_level": 0.95
+  }
+}

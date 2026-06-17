@@ -54,7 +54,9 @@ def _build_non_augmented_dataset(dataset) -> DataLoader:
         augment=False,
         is_training=False,
         normalize_mode=normalize_mode,
-        augment_mode='none'
+        augment_mode='none',
+        use_timm_transforms=getattr(dataset, 'use_timm_transforms', False),
+        timm_data_config=getattr(dataset, 'timm_data_config', None)
     )
 
 
