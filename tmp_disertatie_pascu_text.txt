@@ -1,0 +1,1223 @@
+        UNIVERSITY OF BUCHAREST
+
+
+               FACULTY OF
+            MATHEMATICS AND
+            COMPUTER SCIENCE
+
+
+    FIELD OF STUDY: ARTIFICIAL INTELLIGENCE
+
+
+
+
+            Master’s Dissertation
+
+  ADAPTING CLASS-ANCHOR
+LEARNING TO ONE-CLASS BRAIN
+MRI ANOMALY DETECTION WITH
+      DINOV3 FEATURES
+
+
+
+
+                   Graduate
+             Pascu Ionuț Alexandru
+
+
+             Scientific Coordinator
+          Prof. dr. Radu Tudor Ionescu
+
+
+
+
+            Bucharest, June 2026
+                                        Abstract
+
+This thesis investigates one-class anomaly detection in brain magnetic resonance imag-
+ing (MRI) on the BMAD brain MRI benchmark derived from BraTS. The problem is
+motivated by a common medical-imaging setting: normal anatomy can be collected and
+described more reliably than the full range of possible pathologies. The work therefore
+studies whether a model trained only on normal slices can identify tumour-containing
+slices and produce useful pixel-level anomaly maps. In particular, it explores the com-
+bination of DINOv3 visual representations with an objective adapted from Class Anchor
+Margin (CAM) loss, using anchors as prototypes of normal brain structure.
+    The proposed models use DINOv3 features, anchors obtained from normal embed-
+dings, and a two-stage training procedure that combines anchor-distance, reconstruction,
+and divergence-based scores. The experiments follow the evolution of the project: ini-
+tial anchor-construction strategies, global centroid-anchor models, shared patch-anchor
+models, and location-aware patch-centroid models. Across these families, the best trained
+variants reach fused image-level AUROC values of approximately 0.83 and pixel-level
+AUROC values around 0.93. A training-free PatchCore baseline using frozen DINOv3
+features remains the strongest reference result, with 0.8837 image AUROC and 0.9612
+pixel AUROC.
+    The comparison ranks the methods and clarifies the behaviour of class-anchor learning
+in a one-class medical setting. The results show that anchor construction, spatial gran-
+ularity, reconstruction quality, and score fusion all have a visible effect on performance.
+Reconstruction is a useful auxiliary signal for localisation, while divergence is less con-
+sistent and works best when interpreted as an indirect cue. Overall, the thesis presents
+class-anchor learning as an interpretable direction for one-class MRI anomaly detection,
+clarifies where it helps, and identifies the design choices that most strongly shape its
+results.
+                                         Rezumat
+
+Această lucrare investighează detecția anomaliilor în imagini de rezonanță magnetică
+(RMN) cerebrală într-un cadru de tip o singură clasă, folosind benchmark-ul BMAD
+pentru RMN cerebral, derivat din BraTS. Problema pornește de la o situație frecventă în
+imagistica medicală: anatomia normală poate fi colectată și descrisă mai ușor decât întrea-
+ga varietate a patologiilor posibile. Din acest motiv, lucrarea analizează dacă un model
+antrenat doar pe secțiuni normale poate identifica imagini care conțin tumori și poate
+produce hărți utile de anomalie la nivel de pixel. Mai concret, este studiată combinarea
+reprezentărilor vizuale DINOv3 cu un obiectiv adaptat din funcția Class Anchor Margin
+(CAM), în care ancorele joacă rolul unor prototipuri ale structurii cerebrale normale.
+    Modelele propuse folosesc trăsături DINOv3, ancore obținute din reprezentările exem-
+plelor normale și o procedură de antrenare în două etape, care combină scoruri bazate
+pe distanța față de ancore, reconstrucție și divergență. Experimentele urmăresc evoluția
+proiectului: strategii inițiale de construire a ancorelor, modele globale cu ancore de tip
+centroid, modele cu ancore partajate la nivel de patch-uri și modele cu centroizi locali
+dependenți de poziție. În aceste familii, cele mai bune variante antrenate ajung la valori
+AUROC fuzionate la nivel de imagine de aproximativ 0,83 și la valori AUROC la nivel de
+pixel în jur de 0,93. Metoda de referință PatchCore, aplicată fără antrenare peste trăsă-
+turi DINOv3 înghețate, rămâne cel mai puternic reper experimental, cu 0,8837 AUROC
+la nivel de imagine și 0,9612 AUROC la nivel de pixel.
+    Comparația ierarhizează metodele și clarifică comportamentul învățării cu ancore într-
+un cadru medical cu o singură clasă. Rezultatele arată că modul de construire a ancorelor,
+granularitatea spațială, calitatea reconstrucției și fuziunea scorurilor influențează vizibil
+performanța. Reconstrucția oferă un semnal auxiliar util pentru localizare, în timp ce
+divergența este mai puțin consecventă și trebuie interpretată ca un indiciu indirect. În
+ansamblu, teza prezintă învățarea cu ancore ca o direcție interpretabilă pentru detecția
+anomaliilor în RMN cerebral, clarifică situațiile în care aceasta ajută și identifică alegerile
+de proiectare care îi influențează cel mai mult rezultatele.
+Contents
+
+1 Introduction                                                                              6
+  1.1 Overview and Scope . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .        6
+  1.2 Anomaly Detection in Medical Imaging . . . . . . . . . . . . . . . . . . . .          6
+       1.2.1 The One-Class Formulation . . . . . . . . . . . . . . . . . . . . . .          7
+  1.3 Motivation and Research Question . . . . . . . . . . . . . . . . . . . . . .          7
+  1.4 Contributions . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .     7
+  1.5 Structure of the Thesis . . . . . . . . . . . . . . . . . . . . . . . . . . . . .     8
+
+2 Background                                                                                9
+  2.1 Self-Supervised Representation Learning and DINOv3 . . . . . . . . . . . .            9
+  2.2 Paradigms of Unsupervised Anomaly Detection . . . . . . . . . . . . . . .            10
+      2.2.1 Reconstruction-Based Methods . . . . . . . . . . . . . . . . . . . .           10
+      2.2.2 Feature-Based Methods . . . . . . . . . . . . . . . . . . . . . . . .          11
+  2.3 The Class Anchor Margin Loss . . . . . . . . . . . . . . . . . . . . . . . .         11
+  2.4 The BMAD Brain MRI Benchmark and Evaluation Metrics . . . . . . . .                  12
+  2.5 Objectives in Context . . . . . . . . . . . . . . . . . . . . . . . . . . . . .      13
+
+3 Proposed Method                                                                          14
+  3.1 Problem Formulation . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .      14
+  3.2 DINOv3 Feature Extraction . . . . . . . . . . . . . . . . . . . . . . . . . .        15
+  3.3 Anchor Construction . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .      15
+  3.4 Adapted Class-Anchor Objective . . . . . . . . . . . . . . . . . . . . . . .         16
+  3.5 Two-Stage Training . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .     16
+      3.5.1 Stage 1: Anchor-Based Training . . . . . . . . . . . . . . . . . . . .         16
+      3.5.2 Stage 2: Reconstruction and Divergence Signals . . . . . . . . . . .           17
+  3.6 Score Fusion . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .   17
+  3.7 Patch and Location-Aware Variants . . . . . . . . . . . . . . . . . . . . . .        18
+
+4 Experimental Setup and Results                                                    19
+  4.1 Dataset and Evaluation Protocol . . . . . . . . . . . . . . . . . . . . . . . 19
+  4.2 Early Anchor Strategy Experiments . . . . . . . . . . . . . . . . . . . . . . 20
+
+
+                                             4
+   4.3   Global Centroid-Anchor Model . . . . . . . . . . . . . . . . . . . . . . . .       20
+   4.4   Shared Patch-Anchor Model . . . . . . . . . . . . . . . . . . . . . . . . . .      21
+   4.5   Location-Aware Patch-Centroid Model . . . . . . . . . . . . . . . . . . . .        22
+   4.6   Frozen DINOv3 PatchCore Comparison . . . . . . . . . . . . . . . . . . . .         23
+   4.7   Overall Comparison . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .   24
+
+5 Analysis and Discussion                                                                   27
+  5.1 The Frozen-Feature Baseline as a Reference Point . . . . . . . . . . . . . .          27
+  5.2 How the CAM Repeller Changes in One Class . . . . . . . . . . . . . . . .             28
+  5.3 Fixed Cluster Assignments Under a Moving Encoder . . . . . . . . . . . .              28
+  5.4 The Role of Reconstruction . . . . . . . . . . . . . . . . . . . . . . . . . .        29
+  5.5 Divergence Is an Unstable Auxiliary Signal . . . . . . . . . . . . . . . . . .        29
+  5.6 Patch Anchors and the Locality of Tumours . . . . . . . . . . . . . . . . .           30
+  5.7 Comparison With Existing Approaches . . . . . . . . . . . . . . . . . . . .           30
+  5.8 Limitations . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .     30
+  5.9 Practical Recommendations . . . . . . . . . . . . . . . . . . . . . . . . . .         31
+
+6 Conclusions and Future Work                                                               32
+
+Bibliography                                                                                34
+
+
+
+
+                                              5
+Chapter 1
+
+Introduction
+
+1.1     Overview and Scope
+    This thesis lies at the intersection of self-supervised representation learning and un-
+supervised medical anomaly detection. Its central question is whether the dense visual
+representations produced by a modern self-supervised vision backbone, namely DINOv3
+[1], can be combined with a class-anchor metric-learning objective [2] to perform one-
+class anomaly detection on brain magnetic resonance imaging (MRI). The work is framed
+as a systematic empirical study: we adapt a supervised objective to a one-class setting,
+evaluate the resulting models against a strong frozen-feature PatchCore [3] reference, and
+analyse how the anchor, reconstruction, divergence, and patch-based variants contribute
+to the final behaviour.
+
+
+1.2     Anomaly Detection in Medical Imaging
+    Anomaly detection is the task of identifying samples that deviate significantly from
+an expected, normal distribution [4]. In medical imaging, an anomaly typically corre-
+sponds to an abnormal structure, lesion, or pattern that may indicate the presence of a
+disease or other pathological condition [5, 6]. A defining characteristic of this domain
+is a strong asymmetry between the two classes: normal anatomy is comparatively well
+defined and abundant, whereas abnormalities are heterogeneous, individually rare, and
+effectively open-ended. It is implausible to assemble a training set that covers every
+possible pathology, particularly for rare or previously unseen conditions.
+    This asymmetry has direct methodological consequences. A conventional supervised
+classifier, trained to distinguish a fixed set of disease categories, is poorly suited to a
+problem whose negative class cannot be enumerated and tends to fail on abnormalities
+it has never observed during training. The objective of medical anomaly detection is to
+raise an alert whenever an image departs from the learned notion of normality; closed-set
+
+
+                                            6
+disease labels are outside this formulation [4, 5, 6].
+
+
+1.2.1    The One-Class Formulation
+    These considerations motivate the one-class formulation adopted throughout this work.
+Under this paradigm, the model is trained exclusively on normal images and learns a rep-
+resentation of the normal distribution; at inference time, a sample is assigned an anomaly
+score that quantifies its deviation from that distribution. This setting reflects the support-
+estimation view of one-class learning [7] and the realistic situation in clinical practice,
+where disease-free examples are relatively easy to obtain while a comprehensive collection
+of abnormal examples is not. We instantiate the problem on the brain MRI benchmark
+of BMAD [5], which is reorganised from the BraTS2021 tumour segmentation dataset [8]
+and supports both image-level detection and pixel-level localisation of anomalies.
+
+
+1.3     Motivation and Research Question
+    Two recent lines of work motivate the approach studied here. First, large self-supervised
+models such as DINOv3 [1] produce general-purpose dense features that rival or surpass
+specialised and supervised models across a wide range of dense prediction tasks. This
+makes them attractive as a backbone for medical anomaly detection, where annotated
+data is scarce [9, 10]. Second, the Class Anchor Margin (CAM) loss [2] offers a mecha-
+nism for shaping an embedding space into compact, well-separated clusters by attracting
+samples toward learnable anchors, which suggests a natural way to model the normal
+distribution.
+    Combining these ideas yields the hypothesis investigated in this work: if representative
+“basal” prototypes of the normal data are obtained as cluster centroids and used as
+anchors, and if normal images are encouraged to lie close to these anchors during training,
+then at test time a normal sample should fall near some anchor while an anomalous sample
+should lie far from every anchor. The distance to the nearest anchor then serves as an
+anomaly score. The guiding research question is thus whether DINOv3 features, together
+with a class-anchor objective adapted to the one-class setting, constitute an effective basis
+for anomaly detection and localisation on brain MRI, and, where they do not, what the
+underlying reasons are.
+
+
+1.4     Contributions
+   The contributions of this work are the following:
+
+   • We adapt the Class Anchor Margin loss, originally proposed for supervised, multi-
+     class content-based image retrieval [2], to the unsupervised one-class anomaly de-
+
+                                              7
+      tection setting, using a DINOv3 backbone with a projection bottleneck, anchors ob-
+      tained by 𝑘-means clustering of normal features, and a two-stage training procedure
+      that yields an anchor-based score, a reconstruction-based score, and a divergence-
+      based score, combined by late fusion. Both a global (CLS-token) and a dense
+      (patch-token) variant are studied.
+
+  • We evaluate the proposed method systematically on the brain MRI benchmark of
+    BMAD [5], including image-level and pixel-level metrics, and compare it against a
+    simple training-free baseline that applies PatchCore [3] to frozen DINOv3 features.
+
+  • We provide a detailed analysis of the method’s behaviour, identifying how the class-
+    anchor adaptation changes in the one-class regime, including the effect of the inter-
+    anchor repeller term on a single normal manifold, the role of reconstruction as an
+    auxiliary localisation signal, and the influence of training choices on DINOv3 feature
+    geometry. We translate these findings into practical considerations for one-class
+    anomaly detection with self-supervised features.
+
+
+1.5     Structure of the Thesis
+     The remainder of this thesis is organised as follows. Chapter 2 reviews the scien-
+tific background, covering self-supervised representation learning and DINOv3, the main
+paradigms of unsupervised anomaly detection, the Class Anchor Margin loss, and the
+BMAD brain MRI benchmark together with its evaluation metrics. Chapter 3 presents
+the proposed method in detail, including the architecture, the construction of anchors, the
+adapted training objective, the two-stage procedure, and the scoring and fusion strategy.
+Chapter 4 describes the experimental setup and reports the results as an evolution from
+early anchor strategies to global, patch-based, and location-aware variants. Chapter 5
+analyses these results and discusses the method’s limitations and its relation to existing
+approaches. Finally, Chapter 6 draws conclusions and outlines directions for future work.
+
+
+
+
+                                            8
+Chapter 2
+
+Background
+
+    This chapter establishes the concepts on which this work builds. Section 2.1 reviews
+self-supervised representation learning and the DINOv3 model that provides our back-
+bone. Section 2.2 surveys the main paradigms of unsupervised anomaly detection. Sec-
+tion 2.3 presents the Class Anchor Margin loss in its original supervised form. Section 2.4
+describes the BMAD brain MRI benchmark and the metrics used to evaluate anomaly
+detection and localisation. Finally, Section 2.5 states the objectives of the work in relation
+to this context.
+
+
+2.1     Self-Supervised Representation Learning and DI-
+        NOv3
+    Self-supervised learning (SSL) trains representations directly from unlabelled data
+by solving pretext tasks that require no human annotation. In computer vision this is
+particularly attractive, since it removes the dependence on large labelled datasets and
+allows training to scale to very large image collections. The representations learned this
+way have repeatedly been shown to transfer well to downstream tasks, often rivalling or
+surpassing features learned under full supervision [9, 10].
+    The DINO family of methods learns such representations through a form of self-
+distillation, in which a student network is trained to match the output of a teacher network
+built as an exponential moving average of the student, using different augmented views
+of the same image and no labels at all [11]. A notable property of these models is the
+emergence of semantically meaningful structure in their features and attention maps.
+Subsequent work scaled both the model and the training data substantially, producing
+general-purpose features suitable for a broad range of tasks without fine-tuning [12].
+    DINOv3 [1] continues this line of work and is the backbone used here. It is a Vision
+Transformer (ViT) [13] trained at large scale on a curated collection of images. For an
+input image, the model produces a global representation in the form of a class (CLS) to-
+
+
+                                              9
+ken and a set of patch tokens, one per image patch, that constitute a dense feature map;
+it additionally uses a small number of register tokens that absorb global information and
+reduce artefacts in the patch features. A central finding reported for DINOv3 is that
+its dense features match or exceed specialised and supervised models on dense predic-
+tion tasks such as segmentation, depth estimation, and correspondence, which makes the
+backbone a strong general-purpose feature extractor.
+    Two aspects of DINOv3 are directly relevant to this work. First, the authors observe
+that dense patch-level features require care during training at large scale: the consistency
+of the patch feature map may deteriorate even while global benchmarks keep improv-
+ing. They introduce a regularisation technique, termed Gram anchoring, that constrains
+the structure of pairwise patch similarities toward that of an earlier checkpoint, thereby
+preserving local feature quality [1]. This observation motivates the comparison between
+frozen-feature scoring and trained anchor variants in the present study. Second, for down-
+stream use the authors recommend applying the final layer normalisation, which is trained
+to suppress a small number of high-magnitude feature dimensions; this informs our choice
+to use last-layer features with the register tokens excluded.
+    For medical anomaly detection, a backbone of this kind is appealing precisely because
+annotated medical data are scarce: strong, transferable features can be obtained without
+task-specific supervision. At the same time, the features are learned on natural images,
+so a degree of domain shift relative to medical imaging is expected, a point we return to
+in the analysis [9, 10].
+
+
+2.2     Paradigms of Unsupervised Anomaly Detection
+    Unsupervised, or one-class, anomaly detection assumes that only normal samples are
+available at training time. The model learns a representation or a generative account of
+the normal data, and at inference assigns each sample an anomaly score that measures its
+deviation from this learned notion of normality. Existing methods are commonly grouped
+into two families: reconstruction-based and feature-based (also called projection-based)
+approaches [4, 14, 6, 5].
+
+
+2.2.1    Reconstruction-Based Methods
+    Reconstruction-based methods train a generative model, such as an autoencoder, a
+variational autoencoder, a generative adversarial network, or, more recently, a diffusion
+model, to reconstruct normal images. The underlying assumption is that a model trained
+only on normal data will reconstruct normal inputs accurately but fail to reconstruct
+anomalous regions, so that the reconstruction error serves as an anomaly score and sup-
+ports pixel-level localisation. A recurring diﬀiculty is that a suﬀiciently expressive gen-
+
+
+                                            10
+erative model may generalise well enough to reconstruct anomalies too, which weakens
+the contrast between normal and abnormal reconstruction errors [5, 15]. Various regu-
+larisation strategies, including denoising, masking, and memory mechanisms, have been
+proposed to limit this effect.
+
+
+2.2.2    Feature-Based Methods
+    Feature-based methods instead map images into an embedding space, typically using a
+pretrained network, and detect anomalies by reasoning about the geometry or distribution
+of the resulting features. Several sub-families exist. One-class classification methods, such
+as one-class support vector machines and Deep SVDD, seek a compact region, for instance
+a minimum-enclosing hypersphere, that contains the normal features, and treat distance
+from this region as the anomaly score [7, 16]. Memory-bank methods, such as PaDiM
+and PatchCore, store representative normal patch features and score a test patch by
+its distance to the nearest stored features, which makes them effective for fine-grained
+localisation [17, 3]. Teacher–student or knowledge-distillation methods detect anomalies
+through the discrepancy between a teacher and a student network that was trained to
+imitate it only on normal data [18]. Normalising-flow methods explicitly model the density
+of normal features and flag low-likelihood samples as anomalous.
+    Empirically, feature-based methods tend to outperform reconstruction-based ones on
+medical benchmarks, in part because they reason about high-level structure rather than
+pixel-level fidelity [5, 14]. This observation directly motivates the design choices in this
+work, which is primarily feature-based, and informs the inclusion of a memory-bank base-
+line.
+    A further practical consideration is how patch-level scores are aggregated into an
+image-level decision. Because an anomaly often occupies only a small fraction of an image,
+averaging scores over all locations dilutes the signal; strong methods instead aggregate
+using the maximum or the mean of the highest-scoring locations.
+
+
+2.3     The Class Anchor Margin Loss
+    Objective functions for learning discriminative embeddings are often divided into
+statistical-learning losses, such as cross-entropy, and metric-learning losses, such as the
+contrastive and triplet losses, which operate directly in the embedding space but typically
+require mining pairs or tuples of examples [2]. The Class Anchor Margin (CAM) loss [2]
+was proposed for supervised, multi-class content-based image retrieval as a metric-learning
+objective that avoids pair mining by expressing the loss with respect to a set of learnable
+class anchors.
+    Let e𝑖 = 𝑓𝜃 (x𝑖 ) ∈ ℝ𝑛 denote the embedding of an image x𝑖 with label 𝑦𝑖 , produced by
+
+
+                                             11
+an encoder 𝑓𝜃 , and let 𝐶 = {c1 , … , c𝑡 } be a set of learnable anchors, one per class. The
+objective combines three terms. The attractor pulls each embedding toward the anchor
+of its own class,
+                               ℒ𝐴 (x𝑖 , 𝐶) = 21 ‖e𝑖 − c𝑦𝑖 ‖22 ,                         (2.1)
+
+encouraging low intra-class variance. The repeller pushes anchors of different classes apart
+up to a margin 𝑚,
+
+                                                                     2
+                     ℒ𝑅 (𝐶) = 12 ∑ ( max(0, 2𝑚 − ‖c𝑦 − c𝑦′ ‖)) ,                        (2.2)
+                                  𝑦,𝑦′ ∈𝑌
+                                   𝑦≠𝑦′
+
+
+enforcing inter-class separation. The minimum-norm term prevents the anchors from
+collapsing to the origin,
+
+                                                                2
+                           ℒ𝑁 (𝐶) = 12 ∑ ( max(0, 𝑝 − ‖c𝑦 ‖)) ,                         (2.3)
+                                        𝑦∈𝑌
+
+
+for a target minimum norm 𝑝. The full objective is the sum ℒCAM = ℒ𝐴 + ℒ𝑅 + ℒ𝑁 .
+Only the attractor depends on the training examples; the repeller and minimum-norm
+terms act on the anchors alone, so no negative mining is required.
+    The original work reports that this objective yields compact, well-separated clusters, is
+robust to the dimensionality of the embedding space, and supports an eﬀicient two-stage
+retrieval procedure in which a query is first compared with the class anchors and then
+only with the images assigned to the nearest anchor [2]. Two properties are essential for
+the present study. First, the loss is intrinsically supervised and multi-class: the attractor
+relies on ground-truth labels, and the repeller derives its meaning from the existence of
+genuinely distinct classes. Second, the reported robustness to embedding dimensionality
+is a property of the loss itself rather than of any particular task. Both observations are
+revisited when the objective is transferred to the one-class setting.
+
+
+2.4     The BMAD Brain MRI Benchmark and Evalua-
+        tion Metrics
+    BMAD [5] is a benchmark for medical anomaly detection that reorganises existing
+datasets from several imaging domains into a standardised one-class setting, with training
+sets composed only of normal images. This work uses its brain MRI subset, which is
+derived from the FLAIR modality of the BraTS2021 brain tumour segmentation dataset
+[8]. Three-dimensional volumes are sliced along the axial plane within a fixed depth range,
+and slices are labelled according to the tumour segmentation: slices without tumour are
+treated as normal and slices containing tumour as anomalous. The local split used in this
+
+
+                                              12
+thesis provides 7,500 normal training slices, a validation set of 39 normal and 44 anomalous
+slices, and a test set of 3,715 slices composed of 640 normal and 3,075 anomalous samples.
+All slices have a resolution of 240 × 240 pixels, and anomalous slices include segmentation
+masks that enable pixel-level evaluation [5].
+    Anomaly detection is assessed at two levels. Image-level performance is measured
+by the area under the receiver operating characteristic curve (AUROC) computed over
+per-image anomaly scores [19]. Precision-recall metrics are also useful under class im-
+balance [20, 21], and pixel-level localisation is measured by the AUROC computed over
+per-pixel scores. The benchmark also reports the per-region overlap (PRO), a threshold-
+independent localisation metric that averages overlap over individual connected anomaly
+components and therefore weights small and large anomalies more equally [5]. The bench-
+mark authors note that pixel-level AUROC should be interpreted together with qualitative
+maps and, when available, region-level metrics: in brain MRI, the uniform background
+can make pixel classification easier than precise lesion delineation. Pixel AUROC remains
+useful, and the BMAD discussion motivates care when using it as the only localisation
+measure. Among the methods evaluated on this benchmark, feature-based approaches
+such as PatchCore and reverse distillation achieve strong results, providing useful refer-
+ence points for the present method [5, 3, 18].
+
+
+2.5     Objectives in Context
+    The preceding sections allow the objectives of this work to be stated precisely. DINOv3
+provides strong, general-purpose dense features, while the Class Anchor Margin loss offers
+a mechanism for organising an embedding space around anchors. The two components
+are attractive together, but they originate from different settings: CAM was designed
+for a supervised, multi-class problem in which the repeller separates genuinely distinct
+classes, whereas medical anomaly detection is a one-class problem in which only normal
+data are available and any subdivisions of the normal class are obtained algorithmically.
+    The objective of this work is therefore to investigate whether, and to what extent, the
+class-anchor mechanism can be adapted to one-class anomaly detection on top of DINOv3
+features, by replacing class labels with cluster assignments obtained from the normal
+data and by combining the resulting anchor-based score with auxiliary reconstruction-
+and divergence-based scores. The study measures the resulting detection and localisation
+performance on the BMAD brain MRI benchmark, compares it against a simple training-
+free PatchCore baseline built on frozen DINOv3 features, and analyses the mechanisms
+that govern its behaviour. The method that operationalises these objectives is presented
+in the next chapter.
+
+
+
+
+                                            13
+Chapter 3
+
+Proposed Method
+
+    This chapter presents the method investigated in this work. The central idea is to
+adapt a supervised class-anchor objective to a one-class anomaly detection problem. In
+the original Class Anchor Margin loss, anchors correspond to semantic classes and the
+loss learns compact, separated class clusters. In the present setting only normal brain
+MRI slices are available during training. Consequently, anchors cannot represent disease
+categories; instead, they represent prototypes of the normal feature distribution, obtained
+by clustering DINOv3 features extracted from normal training images.
+    The method is an empirical adaptation of CAM to a one-class setting. The design
+choices described below were introduced to answer a specific question: can DINOv3 fea-
+tures be organised around normal anchors in such a way that tumour-containing slices
+become distant from the learned normal manifold?
+
+
+
+
+Figure 3.1: Methodological evolution of the project. The experiments move from global
+image-level anchor prototypes to patch-level and location-aware normal references, with
+PatchCore used as a frozen-feature reference point.
+
+
+
+3.1     Problem Formulation
+  Let 𝒟train = {𝑥𝑖 }𝑁𝑖=1 denote the training set, which contains only normal FLAIR brain
+MRI slices. At test time, each image 𝑥 may be normal or anomalous. The model assigns
+
+                                            14
+an image-level anomaly score 𝑠(𝑥), where larger values indicate a stronger deviation from
+the normal distribution. When pixel-level maps are available, the model also produces
+an anomaly map 𝑀 (𝑥) ∈ ℝ𝐻×𝑊 , where high values indicate image regions considered
+abnormal.
+    The one-class nature of the problem determines the role of the anchors. Since no tu-
+mour images are used to learn a discriminative boundary, the model represents normality
+through the geometry of normal examples alone. Here, that geometry is modelled by
+anchors in a DINOv3 embedding space [7].
+
+
+3.2     DINOv3 Feature Extraction
+    The backbone is a DINOv3 Vision Transformer [13, 1]. Unless otherwise stated, the
+main experiments use the ViT-S/16 DINOv3 checkpoint; a smaller set of ablations also
+tests ViT-B/16 variants. For an input image, the model produces a global class token and
+a grid of patch tokens. The global variant of the method uses the CLS token as the image
+representation, while the patch variant uses the dense patch-token grid. Register tokens
+are excluded from the dense representation, following the intended use of DINO-style ViT
+features for downstream dense tasks.
+    In the global setting, the backbone representation is passed through a projection
+bottleneck,
+                                      𝑧 = 𝑔𝜙 (𝑓𝜃 (𝑥)),                              (3.1)
+
+where 𝑓𝜃 is the DINOv3 backbone and 𝑔𝜙 is a learned projection layer. The projected
+embedding 𝑧 is the space in which anchor distances are computed. In the patch setting,
+the same principle is applied locally: each spatial token is compared with patch-level
+normal anchors, producing a dense anomaly map before aggregation.
+
+
+3.3     Anchor Construction
+    Anchors are built from normal training data. First, features are extracted for normal
+slices using the DINOv3 backbone. Then 𝑘-means clustering is applied to these nor-
+mal features [22]. The resulting centroids, or the nearest real training samples to those
+centroids depending on the experiment family, define the initial normal anchors.
+    For 𝐾 anchors, let
+                                  𝐶 = {𝑐1 , 𝑐2 , … , 𝑐𝐾 }                            (3.2)
+
+be the set of anchor vectors. During training, each normal sample is assigned to its nearest
+anchor or to the cluster determined during anchor preparation. At inference time, the
+
+
+
+
+                                            15
+main image-level anomaly score is the distance to the nearest anchor,
+
+                              𝑠anchor (𝑥) =     min       𝑑(𝑧, 𝑐𝑗 ),                  (3.3)
+                                              𝑗∈{1,…,𝐾}
+
+
+where 𝑑 is usually the Euclidean or cosine distance, depending on the experiment.
+    This formulation has a direct anomaly-detection interpretation: a normal sample
+should lie near at least one normal prototype, whereas an anomalous sample should be
+farther from all of them.
+
+
+3.4     Adapted Class-Anchor Objective
+    The training objective is adapted from the Class Anchor Margin loss. Since all training
+images are normal, cluster assignments replace semantic class labels. The attractor term
+pulls each projected normal embedding toward its assigned anchor:
+
+                                           1
+                                 ℒ𝐴 (𝑥𝑖 ) = ‖𝑧𝑖 − 𝑐𝑎(𝑖) ‖22 ,                         (3.4)
+                                           2
+
+where 𝑎(𝑖) denotes the assigned anchor for 𝑥𝑖 .
+   Some experiment families also include a repeller term between anchors,
+
+                                 1                              2
+                      ℒ𝑅 (𝐶) =     ∑ (max(0, 2𝑚 − ‖𝑐𝑝 − 𝑐𝑞 ‖2 )) .                    (3.5)
+                                 2 𝑝≠𝑞
+
+In the original supervised CAM setting this term separates genuine semantic classes.
+In the one-class setting, all anchors describe normal anatomy, so the term changes role:
+instead of separating semantic categories, it imposes geometric separation between normal
+prototypes. Chapter 5 analyses how this choice affects the learned normal manifold.
+    The min-norm component of the original CAM loss is not central in the final interpre-
+tation, because embeddings are normalised in the implemented pipeline. The resulting
+method is thus primarily driven by attraction to normal anchors, with the repeller acting
+as an optional geometric regulariser, its role being to keep anchors well separated.
+
+
+3.5     Two-Stage Training
+   The trained anchor method uses a two-stage procedure.
+
+
+3.5.1    Stage 1: Anchor-Based Training
+   Stage 1 trains the embedding space for anchor scoring. Normal images are passed
+through DINOv3 and the projection bottleneck, and the adapted anchor objective en-
+
+
+                                               16
+courages their embeddings to approach the selected normal anchors. Depending on the
+experiment family, the DINOv3 backbone is either frozen or trainable. This distinc-
+tion is important because the experiments compare two complementary uses of DINOv3:
+preserving its pretrained feature geometry and adapting that geometry through anchor
+supervision.
+    The output of Stage 1 is an anchor-based anomaly detector. At inference time, an
+image receives a score equal to its distance from the nearest normal anchor.
+
+
+3.5.2    Stage 2: Reconstruction and Divergence Signals
+    Stage 2 adds a reconstruction branch. A decoder is trained to reconstruct normal im-
+ages from the learned representation. The motivation is standard in anomaly detection: if
+the decoder has learned only normal anatomy, anomalous structures may be reconstructed
+poorly, leading to high reconstruction error [15].
+    This stage produces two auxiliary signals. The first is a reconstruction score,
+
+                                                        ̂
+                                     𝑠recon (𝑥) = ‖𝑥 − 𝑥‖,                              (3.6)
+
+computed either globally or through pixel-level reconstruction error. The second is a diver-
+gence score that compares representations before and after the Stage-2 adaptation. The
+intended interpretation is that anomalous images should induce larger representational
+disagreement.
+    These auxiliary signals play different roles in the experiments. Reconstruction provides
+useful pixel-level evidence and can improve fused scores, while divergence is a more indirect
+signal whose contribution depends strongly on the configuration. Chapter 4 reports their
+empirical contribution, and Chapter 5 analyses why they behave differently.
+
+
+3.6     Score Fusion
+   When all signals are available, they are normalised and combined through late fusion:
+
+                    𝑠fused (𝑥) = 𝑤𝑎 𝑠anchor (𝑥) + 𝑤𝑑 𝑠div (𝑥) + 𝑤𝑝 𝑠pixel (𝑥),          (3.7)
+
+where 𝑤𝑎 , 𝑤𝑑 , and 𝑤𝑝 are fusion weights. In the main global centroid-anchor and patch-
+anchor families, the default weights are 0.4, 0.3, and 0.3 for the anchor, divergence, and
+pixel/reconstruction-derived signals. The experiments also report individual scores so
+that the contribution of each branch can be interpreted separately from the fused score.
+   Fusion is evaluated empirically, because each branch can contribute differently after
+normalisation. A weak or anti-correlated branch can dilute the strongest score, so the
+experiments report both individual signals and fused performance.
+
+                                               17
+3.7     Patch and Location-Aware Variants
+    The global centroid-anchor model compares whole-image embeddings to global an-
+chors. However, local anomalies motivate a patch-level variant of the global centroid-
+anchor model in order to better capture those localities. The shared patch-anchor model
+moves the same idea to the dense token grid while still using anchors prepared from
+whole-image clustering. Each patch token is compared with normal patch anchors, and
+the resulting dense distance map is aggregated into an image-level score.
+    The first patch variant uses a shared patch-anchor bank. Later experiments intro-
+duce a location-aware patch-centroid model, where patch features are clustered by spatial
+position. The motivation is anatomical: a normal patch from one brain region is not nec-
+essarily a suitable reference for another region. Location-aware anchors therefore preserve
+some spatial context while retaining the feature-distance principle.
+    This evolution leads to the main methodological arc of the thesis. We first tested
+the core idea of global normal anchors, then we added reconstruction and fusion, then
+turned toward local patch evidence, and finally tested whether location-specific normal
+references improve the patch model. The results show that this evolution improves the
+conceptual alignment with the medical problem and yields competitive trained variants,
+while the frozen-feature PatchCore baseline remains the strongest reference point in this
+experiment set.
+
+
+
+
+                                            18
+Chapter 4
+
+Experimental Setup and Results
+
+   This chapter reports the experiments conducted on the BMAD brain MRI bench-
+mark. It identifies the best-performing configurations and analyses how each design
+choice changes the behaviour of the system. For this reason, the results are presented
+as a controlled evolution of method families: early anchor initialisation strategies, the
+global centroid-anchor model, the shared patch-anchor model, the location-aware patch-
+centroid model, and finally the frozen-feature PatchCore comparison.
+
+
+4.1     Dataset and Evaluation Protocol
+    All experiments use the brain MRI subset of BMAD, derived from BraTS2021 FLAIR
+volumes. The local dataset used in this work contains 7,500 normal training slices. The
+validation set contains 39 normal and 44 anomalous slices. The test set contains 640
+normal and 3,075 anomalous slices, for a total of 3,715 test images. All slices have
+resolution 240 × 240 pixels, and anomalous slices are accompanied by segmentation masks
+for pixel-level evaluation.
+    The main image-level metric is the area under the receiver operating characteristic
+curve (AUROC), computed from per-image anomaly scores [19]. The area under the
+precision-recall curve (AUPR) is also reported where useful, since precision-recall curves
+provide complementary information under skewed class distributions [20, 21]. Pixel-level
+localisation is evaluated with pixel AUROC and pixel AUPR. Following the BMAD bench-
+mark discussion, pixel AUROC is interpreted together with the qualitative maps: in brain
+MRI, the large uniform background can make pixel classification easier than precise le-
+sion delineation. PRO would add a useful region-level view of localisation, but it was not
+computed for the experiment set reported here.
+    The default backbone for the final structured experiments is DINOv3 ViT-S/16. Ad-
+ditional backbone and projection-dimension ablations were also run, including ViT-B/16
+variants with larger projection layers. These runs are used to check whether the main
+conclusions are sensitive to backbone capacity, while the main reported families remain
+
+                                           19
+the ViT-S/16 global, shared patch, and location-aware models. Training was performed
+on a local workstation with an NVIDIA RTX 5070 Ti GPU and 32GB of RAM. In terms
+of time, the overall experiment set runtime was approximately 180 hours.
+    The main trained families follow the same two-stage protocol. Stage 1 trains the
+anchor-scoring model for up to 100 epochs with batch size 64, learning rate 10−4 , weight
+decay 10−4 , mixed precision, and validation after every epoch. Early stopping uses a
+patience of 10 epochs; in the global centroid-anchor family a minimum of 20 epochs is
+enforced before early stopping, whereas the patch families allow earlier stopping. Stage 2
+is enabled for 70 epochs and trains the reconstruction/divergence heads while keeping the
+encoder, anchors, anchor targets, and bottleneck frozen. It uses an MSE reconstruction
+loss, cosine consistency, top-95-percentile aggregation for pixel-derived image scores, and
+late fusion with weights 0.4 for the anchor score, 0.3 for divergence, and 0.3 for the
+pixel/reconstruction score.
+
+
+4.2     Early Anchor Strategy Experiments
+    The first experiments examined how the normal anchors should be initialised. Three
+strategies were tested with 𝐾 = 8 anchors and Euclidean distance across five trials:
+random normal samples, eigenface/PCA-style anchors [23], and 𝑘-means anchors [22].
+These runs were exploratory, but they established the anchor construction strategy used
+by the later models.
+
+          Table 4.1: Early anchor strategy comparison over five 𝐾 = 8 trials.
+    Anchor strategy        Mean image AUROC Best image AUROC Std. dev.
+    Random samples                0.8049                0.8208            0.0138
+    𝑘-means centroids             0.8118                0.8214            0.0100
+    Eigenface/PCA-style           0.7893                0.8162            0.0172
+
+    Across these trials, 𝑘-means strategy achieved the highest single run and a slightly
+higher mean image AUROC, while also being more stable across seeds. Because 𝑘-means
+also provides a data-driven and reproducible anchor construction strategy, it was se-
+lected as the basis for later centroid-anchor experiments. Eigenface/PCA-style anchors
+performed worse on average and were not pursued further.
+
+
+4.3     Global Centroid-Anchor Model
+    The global centroid-anchor experiments use whole-image embeddings and initialise
+anchors from 𝑘-means centroids. They use a longer Stage-2 budget and evaluate several
+values of 𝐾, the number of anchors. The main sweep is shown in Table 4.2.
+
+
+                                            20
+      Table 4.2: Global centroid-anchor results for different numbers of anchors.
+ Run                                Image AUROC Fused AUROC Pixel AUROC
+ Global centroid-anchor, 𝐾 = 1           0.8057             0.7718          0.9332
+ Global centroid-anchor, 𝐾 = 4           0.7050             0.7386          0.9227
+ Global centroid-anchor, 𝐾 = 16          0.6981             0.7435          0.9269
+ Global centroid-anchor, 𝐾 = 256         0.7653             0.7939          0.9280
+ Global centroid-anchor, 𝐾 = 1024        0.7685             0.8260          0.9195
+
+
+    The sweep is not monotonic. The 𝐾 = 1 model gives the strongest raw image score,
+while the 𝐾 = 1024 model gives the strongest fused score. This is one of the central
+empirical patterns of the project. A single centre behaves similarly to a compact one-
+class model and avoids inter-anchor conflict. Large 𝐾 weakens the raw anchor score but
+provides auxiliary signals that can help fusion. The mid-range values are less favourable:
+they introduce inter-anchor structure without yet providing enough anchor density to
+compensate.
+    Additional variants changed the DINOv3 backbone and projection dimension while
+keeping this two-stage training protocol fixed: frozen backbone features, global 𝑘-means
+centroid anchors, Stage 1 anchor training for up to 100 epochs, and a 70-epoch Stage 2
+reconstruction/fusion phase. These runs did not substantially alter the main conclusion.
+The strongest new global image-level challenger was the ViT-S/16, projection-64, 𝐾 = 1
+variant at 0.7922 image AUROC, below the original ViT-S/16, projection-128, 𝐾 = 1
+result of 0.8057. The strongest new global fused result was a ViT-B/16, projection-512,
+𝐾 = 1024 variant at 0.8188 fused AUROC, still below the original 𝐾 = 1024 fused result
+of 0.8260. This suggests that the observed limitations are tied more to the anchor-training
+and fusion protocol than to insuﬀicient backbone capacity alone.
+
+
+4.4     Shared Patch-Anchor Model
+    The shared patch-anchor experiments replace global image-to-anchor comparison with
+local patch-to-anchor comparison. In this first patch family, anchors are still prepared
+from image-level clustering, but scoring is performed on dense patch tokens and then
+aggregated to the image level. This better matches the structure of brain tumours, which
+are spatially local rather than global changes to the entire slice.
+    Compared with the global centroid-anchor family, the shared patch-anchor sweep is
+stronger in the moderate-to-larger tested range. The best result is obtained at 𝐾 = 32,
+with 𝐾 = 16 close behind, while 𝐾 = 8 is a clear negative outlier. The improvement
+is modest, but meaningful: the method is now comparing local evidence against local
+normal references rather than asking a global CLS representation to capture a lesion that
+may occupy only a small region of the image.
+
+
+
+                                            21
+       Table 4.3: Shared patch-anchor results for different numbers of anchors.
+   Run                           Image AUROC Fused AUROC Pixel AUROC
+   Shared patch-anchor, 𝐾 = 1        0.7411              0.7643          0.9281
+   Shared patch-anchor, 𝐾 = 2        0.7568              0.7387          0.9287
+   Shared patch-anchor, 𝐾 = 4        0.7879              0.8131          0.9283
+   Shared patch-anchor, 𝐾 = 8        0.7473              0.7144          0.9343
+   Shared patch-anchor, 𝐾 = 16       0.7932              0.8173          0.9304
+   Shared patch-anchor, 𝐾 = 32       0.8119              0.8282          0.9298
+
+
+
+
+Figure 4.1: Image-level score distributions for the representative location-aware patch-
+centroid model. Anchor and reconstruction scores separate normal and anomalous slices
+more clearly than the divergence signal, while fusion combines the useful cues.
+
+4.5     Location-Aware Patch-Centroid Model
+    The final experiment family introduces location-aware patch centroids. Instead of
+using a shared patch bank for all spatial positions, normal patch features are grouped by
+location before clustering. This design reflects the anatomical prior that a patch from
+one brain region should be compared primarily with normal patches from corresponding
+regions.
+
+      Table 4.4: Location-aware patch-centroid results with cosine local matching.
+ Variant                                 Image AUROC     Fused AUROC     Pixel AUROC
+ Location-aware patch-centroid, 𝐾 = 4       0.7470           0.7892          0.9397
+ Location-aware patch-centroid, 𝐾 = 8       0.7535           0.8010          0.9384
+ Location-aware patch-centroid, 𝐾 = 16      0.7607           0.8062          0.9326
+ Location-aware patch-centroid, 𝐾 = 32      0.7958           0.8295          0.9350
+
+
+   Within the final cosine location-aware sweep, performance improves as 𝐾 increases,
+with the best fused result at 𝐾 = 32. This family narrowly improves the fused AUROC
+over the shared patch-anchor model, from 0.8282 to 0.8295, and improves pixel AUROC
+from 0.9298 to 0.9350. However, it lowers the raw image AUROC relative to the best
+shared patch-anchor run. The result supports spatially constrained patch references as a
+promising direction whose benefit depends on the scoring and fusion mechanism.
+
+
+                                           22
+Figure 4.2: Qualitative anomaly-map comparison on three anomalous slices. The cyan
+contour shows the ground-truth tumour mask. Patch-based maps generally concentrate
+anomaly evidence around the lesion, while also showing some response on anatomical
+boundaries and high-contrast structures.
+
+4.6     Frozen DINOv3 PatchCore Comparison
+    The main external reference point is a training-free PatchCore [3] baseline built on
+frozen DINOv3 features. This baseline extracts patch features from the pretrained back-
+bone, stores representative normal patch embeddings in a memory bank, and scores test
+patches by nearest-neighbour distance to normal memory features. It does not train the
+DINOv3 backbone and does not use the adapted class-anchor objective.
+
+   Table 4.5: Frozen DINOv3 PatchCore baseline on the BMAD brain MRI test set.
+     Method       Image AUROC Image AUPR Pixel AUROC Pixel AUPR
+     PatchCore        0.8837        0.9725          0.9612       0.5094
+
+   This result is the strongest result obtained in the project. It establishes that frozen
+DINOv3 patch features already contain substantial anomaly-detection signal, and it pro-
+vides a clear reference for interpreting the trained class-anchor variants.
+
+
+
+                                           23
+Figure 4.3: Compact reconstruction visualisation for the representative location-aware
+patch-centroid model. The reconstruction branch tends to smooth or partially remove
+tumour structure, making the absolute reconstruction error highlight lesion regions; the
+same maps also show edge responses, which is why pixel AUROC is interpreted together
+with qualitative localisation.
+
+4.7     Overall Comparison
+    Table 4.6 summarises the main results used in the thesis narrative, grouped by exper-
+iment family.
+    The main conclusion from the results is clear. The trained anchor models provide
+useful anomaly scores, reconstruction-based localisation cues, and meaningful ablations
+across global and patch-based designs. The frozen-feature PatchCore baseline remains
+stronger in this experiment set, which makes it a useful point of comparison for analysing
+what the class-anchor adaptation contributes and where it remains limited.
+
+
+
+
+                                           24
+Figure 4.4: Image-level ROC curve for the frozen DINOv3 PatchCore baseline. The table
+reports 0.8837 AUROC; the plotted curve is used as qualitative support for the same
+baseline.
+
+
+
+
+Figure 4.5: Summary of the representative result families. PatchCore remains the
+strongest reference baseline, while the trained anchor variants show useful image-level
+and pixel-level signals, especially after moving from global to patch-based scoring.
+
+
+
+
+                                          25
+Table 4.6: Expanded comparison of main results on the BMAD brain MRI test set.
+        Family            Variant         Image AUROC   Fused AUROC   Pixel AUROC
+        Global centroid   𝐾=1                0.8057         0.7718       0.9332
+        Global centroid   𝐾=4                0.7050         0.7386       0.9227
+        Global centroid   𝐾 = 16             0.6981         0.7435       0.9269
+        Global centroid   𝐾 = 256            0.7653         0.7939       0.9280
+        Global centroid   𝐾 = 1024           0.7685         0.8260       0.9195
+        Shared patch      𝐾=1                0.7411         0.7643       0.9281
+        Shared patch      𝐾=4                0.7879         0.8131       0.9283
+        Shared patch      𝐾 = 16             0.7932         0.8173       0.9304
+        Shared patch      𝐾 = 32             0.8119         0.8282       0.9298
+        Location-aware    𝐾=4                0.7470         0.7892       0.9397
+        Location-aware    𝐾=8                0.7535         0.8010       0.9384
+        Location-aware    𝐾 = 16             0.7607         0.8062       0.9326
+        Location-aware    𝐾 = 32             0.7958         0.8295       0.9350
+        PatchCore         Frozen DINOv3      0.8837            –         0.9612
+
+
+
+
+                                             26
+Chapter 5
+
+Analysis and Discussion
+
+    The results in Chapter 4 show a consistent pattern. DINOv3 features are highly useful
+for anomaly detection, and the class-anchor models provide informative trained variants
+with meaningful anchor, reconstruction, fusion, and patch-based ablations. At the same
+time, the frozen-feature PatchCore baseline remains the strongest result in this experiment
+set. This chapter analyses that outcome by examining how the CAM objective changes
+when it is adapted from supervised multi-class retrieval to one-class medical anomaly
+detection.
+
+
+5.1     The Frozen-Feature Baseline as a Reference Point
+    The strongest result in the project is obtained by PatchCore applied to frozen DINOv3
+features. This is consistent with the motivation of DINOv3 itself: the model is designed
+to provide strong general-purpose dense features without task-specific fine-tuning. For
+anomaly detection, especially patch-level anomaly detection, this is a favourable match.
+PatchCore preserves the pretrained feature geometry and performs nearest-neighbour
+comparison against normal patch features.
+    The trained anchor variants modify this representation. When the backbone is train-
+able, the loss reshapes the DINOv3 space according to normal-data anchor assignments.
+Since the available training data contains only normal slices, the objective can enforce com-
+pactness and anchor structure on normal examples, but it cannot directly learn tumour-
+specific separation. This helps explain why preserving pretrained patch geometry is a
+strong reference point for the trained variants.
+    This explains the central empirical contrast: frozen DINOv3 plus a simple memory
+bank reaches 0.8837 image AUROC, while the main trained anchor families reach fused
+image AUROC values around 0.83. The result suggests that, for this problem, the pre-
+trained dense feature geometry is already highly informative, and that learned anchor
+geometry must preserve this information to improve on it.
+
+
+                                             27
+5.2     How the CAM Repeller Changes in One Class
+    The Class Anchor Margin loss was designed for supervised multi-class retrieval. In
+that setting, the repeller term has a clear role: it pushes anchors of different semantic
+classes apart. This increases inter-class separation and improves retrieval.
+    In the BMAD one-class setting, the situation is different. All training images are
+normal. When 𝐾 > 1, the anchors correspond to clusters within the normal distribution
+instead of true semantic classes. These clusters may capture slice position, acquisition
+variation, anatomical variation, or simply arbitrary partitions introduced by 𝑘-means.
+Repelling these anchors therefore pushes apart regions that all belong to the same normal
+class.
+    This gives a plausible mechanism for the observed 𝐾 behaviour. With 𝐾 = 1, there
+is no inter-anchor repeller and the model behaves like a compact one-centre description
+of normality. With mid-range 𝐾, the repeller can create extra separation inside the
+normal manifold, producing regions between normal clusters that are less well covered by
+anchors. A normal test slice that falls into such a region can receive a higher anomaly
+score. With very large 𝐾, the anchors become dense enough that nearest-anchor scoring
+partly resembles a memory-bank method, so performance can recover through coverage.
+    Thus, the 𝐾 sweep should not be interpreted as simply searching for an optimal
+number of clusters. It shows that a term designed to separate real semantic classes has a
+different effect when the “classes” are artificial subdivisions of normal anatomy.
+
+
+5.3     Fixed Cluster Assignments Under a Moving En-
+        coder
+    Another diﬀiculty is the interaction between cluster assignments and a trainable en-
+coder. The assignments are derived from initial DINOv3 features, but the embedding
+space can change during training. Even when anchor vectors are learnable and move
+with the optimisation, the original assignment of each normal sample to a cluster may no
+longer describe the current feature geometry.
+    This is therefore better understood as a stale-assignment problem than as a strictly
+fixed-centroid problem. The model continues to enforce attraction according to pseudo-
+labels defined by an earlier representation. In multi-class supervised learning, labels
+remain meaningful even as the representation changes. In this one-class clustered setting,
+however, the pseudo-labels are geometric artefacts. If the geometry drifts, the assignments
+may become less meaningful over time.
+    This observation supports two future directions: keep the DINOv3 backbone frozen
+and train only a light scoring layer, or periodically recompute assignments and normal
+clusters if anchor training is retained.
+
+                                            28
+5.4     The Role of Reconstruction
+    The reconstruction branch was introduced to provide pixel-level maps and an auxiliary
+image-level score. It proves useful in this role: the qualitative heatmaps show localisation
+cues, pixel AUROC is often high, and reconstruction contributes to the fused scores in the
+patch and location-aware families. However, reconstruction is not the dominant image-
+level signal.
+    There are two reasons for this. First, reconstruction-based anomaly detection is known
+to be diﬀicult in medical imaging because a suﬀiciently expressive decoder can reconstruct
+abnormal structures or produce errors dominated by anatomy rather than pathology [15].
+Second, the decoder in this project reconstructs from semantic DINOv3 representations.
+These features are excellent for describing image content, but they are not designed to
+preserve every pixel-level detail needed for faithful reconstruction.
+    As a result, reconstruction error can highlight tumours, but it also responds to edges,
+contrast changes, slice complexity, and anatomical structures. This explains why recon-
+struction improves some fused results and supports localisation, while the anchor score
+remains the stronger direct image-level detector. It also explains why pixel AUROC is
+interpreted together with visual maps rather than as the sole measure of localisation
+quality.
+
+
+5.5     Divergence Is an Unstable Auxiliary Signal
+    The divergence score was intended to measure disagreement between representations
+before and after Stage 2. In practice, it is often weak or even anti-correlated with anomaly
+labels. For example, in the patch run reported in Chapter 4, the divergence AUROC is
+below chance, while the anchor and reconstruction-related scores remain useful.
+    The limitation is conceptual. The divergence branch compares changes induced by
+the transition from Stage 1 to Stage 2. Both stages are trained on normal data, so
+the disagreement signal is only indirectly related to pathology. Divergence may capture
+representation drift, reconstruction diﬀiculty, or differences between branches, and these
+effects do not consistently align with anomaly labels.
+    This is why fusion is reported alongside the individual branches. Adding a weak
+or anti-correlated signal to a strong signal can reduce performance after normalisation.
+The main patch and location-aware families therefore support a measured interpretation:
+reconstruction-derived signals are useful, while divergence is less consistent.
+
+
+
+
+                                            29
+5.6     Patch Anchors and the Locality of Tumours
+    Patch-anchor scoring is conceptually better aligned with the medical task than global
+CLS scoring. A tumour is usually a local abnormality; it may not dominate the global
+representation of the slice. Dense patch features preserve spatial evidence and allow the
+model to compare local regions against normal local references.
+    The patch experiments support this reasoning with slightly improved gains in the final
+structured families. The best shared patch run improves fused AUROC relative to the
+global centroid-anchor family, and location-aware patch centroids slightly improve the
+fused and pixel metrics. The raw image AUROC is lower than the best early exploratory
+anchor runs, while the fused patch results are the strongest among the final structured
+families.
+    This suggests that locality is necessary but not suﬀicient. Patch-level scoring works
+best when it preserves the pretrained patch feature geometry and uses a strong nearest-
+neighbour memory mechanism. The learned anchor variants move in that direction, but
+their training and fusion machinery introduce additional sources of instability.
+
+
+5.7     Comparison With Existing Approaches
+    The BMAD benchmark reports strong performance for feature-based anomaly detec-
+tion methods such as PatchCore and reverse distillation. This project confirms the same
+broad lesson with a DINOv3 backbone: feature-based frozen or lightly adapted methods
+are very competitive, while reconstruction-heavy branches are less reliable [5, 14, 6, 15].
+    The proposed anchor method has two advantages. It is interpretable at the level of
+prototypes, and it provides a controlled way to study how a supervised metric-learning
+loss behaves when transferred to one-class anomaly detection. Its main challenge is that
+the class-anchor assumptions change in this new setting. In particular, the repeller term
+and pseudo-classes must be interpreted as geometric structure inside the normal class
+rather than as true semantic class separation.
+    Although PatchCore remains stronger on this benchmark, this work contributes a sys-
+tematic empirical analysis of CAM-style one-class anchor learning with DINOv3 features,
+including the mechanisms that make PatchCore stronger in this experiment set and the
+conditions under which anchor, reconstruction, and patch-based signals remain useful.
+
+
+5.8     Limitations
+   The interpretation of the results has several boundaries. First, the evaluation does
+not include PRO. BMAD recommends this metric for localisation in domains with large
+uniform backgrounds, so it remains a useful future addition. Second, the validation set
+
+
+                                            30
+is small, making fusion-weight selection noisy. Third, the experiments are conducted on
+two-dimensional slices, leaving inter-slice context for future work.
+    Despite these limitations, the experiments are suﬀicient to support the main con-
+clusion: DINOv3 features are strong for this task, and adapting class-anchor training
+to a one-class normal manifold requires care because the meaning of anchor separation
+changes.
+
+
+5.9     Practical Recommendations
+    The analysis suggests several directions for future work. DINOv3 is a strong starting
+point as a dense feature extractor, so future anchor methods should preserve as much of
+its pretrained patch geometry as possible while adding task-specific structure only where
+it is empirically helpful. If multiple normal prototypes are used, they should primarily
+improve coverage of the normal manifold and avoid artificial separation that fragments
+it. Patch-level memory or nearest-neighbour scoring remains a strong design choice for
+localisation, and region-level metrics such as PRO would strengthen future evaluations.
+If anchor learning is retained, promising variants include repeller-free objectives, periodic
+reclustering, frozen-backbone scoring, and location-aware normal references.
+
+
+
+
+                                             31
+Chapter 6
+
+Conclusions and Future Work
+
+    This thesis investigated whether the Class Anchor Margin loss, originally designed
+for supervised multi-class image retrieval, can be adapted to one-class medical anomaly
+detection on brain MRI when combined with DINOv3 features. The proposed system used
+normal-data anchors obtained through 𝑘-means clustering, a DINOv3 backbone with a
+projection bottleneck, and a two-stage training procedure that produced anchor-based,
+reconstruction-based, and divergence-based anomaly scores.
+    The experimental results show that the adapted anchor method can detect anomalies
+and can produce useful pixel-level heatmaps. The final structured families reach fused
+AUROC values around 0.83 with pixel AUROC around 0.93, with the location-aware
+patch-centroid variant obtaining 0.8295 fused image AUROC and 0.9350 pixel AUROC.
+The strongest result in the project is obtained by a simpler frozen-feature PatchCore
+baseline using DINOv3 features, which reaches 0.8837 image AUROC and 0.9612 pixel
+AUROC.
+    The main conclusion is analytical: DINOv3 features are highly valuable for brain MRI
+anomaly detection, and class-anchor learning provides an interpretable way to organise
+normal-data prototypes. The experiments also show that the assumptions of CAM change
+in the one-class setting. In particular, the repeller term is meaningful when anchors
+correspond to different semantic classes, but in this work it separates artificial clusters
+of normal anatomy. This can reshape the normal manifold in ways that are not always
+useful for anomaly detection. Similarly, trainable-backbone variants must preserve the
+dense-feature quality that makes DINOv3 attractive in the first place.
+    The reconstruction and divergence branches provide additional insight. Reconstruc-
+tion supports localisation and contributes to the fused scores, even though its image-level
+signal is not always as direct as the anchor score. Divergence is less consistent because
+representation disagreement is only indirectly related to abnormality. These results show
+why reporting individual branches alongside fusion is important: auxiliary signals can
+help, but their contribution depends on calibration and on the experiment family.
+    The broader lesson is that mixed experimental results can be scientifically useful when
+
+                                            32
+their mechanisms are understood. This work shows that transferring a supervised metric-
+learning loss to one-class medical anomaly detection is not a matter of replacing class
+labels with clusters. The geometry and meaning of the anchors change, and the objective
+must change with them.
+    Future work should therefore focus on preserving the strengths identified in the exper-
+iments while removing the mismatched assumptions. Promising directions include frozen-
+backbone anchor scoring, repeller-free one-class objectives, patch-level nearest-neighbour
+memory banks, location-aware normal references, periodic reclustering when the repre-
+sentation is trained, and evaluation with PRO to better measure lesion-level localisation.
+A three-dimensional extension that uses inter-slice context would also be a natural next
+step for brain MRI.
+    In summary, this work demonstrates that self-supervised dense features are a strong
+foundation for medical anomaly detection, and that class-anchor training is a promising
+but delicate mechanism whose one-class adaptation requires careful design of anchors,
+objectives, and fusion signals.
+
+
+
+
+                                            33
+Bibliography
+
+[1]   Oriane Simeoni, Huy V. Vo, Maximilian Seitzer, Federico Baldassarre, Maxime
+      Oquab, Cijo Jose, Vasil Khalidov, Marc Szafraniec, Seungeun Yi, Michael Rama-
+      monjisoa, Francisco Massa, Daniel Haziza, Luca Wehrstedt, Jianyuan Wang, Tim-
+      othee Darcet, Theo Moutakanni, Patrick Labatut, Piotr Bojanowski, et al. “DI-
+      NOv3.” In: arXiv preprint arXiv:2508.10104 (2025). arXiv: 2508.10104 [cs.CV].
+      url: https://arxiv.org/abs/2508.10104.
+[2]   Alexandru Ghita and Radu Tudor Ionescu. “Class Anchor Margin Loss for Content-
+      Based Image Retrieval.” In: arXiv preprint arXiv:2306.00630 (2023). arXiv: 2306.
+      00630 [cs.CV]. url: https://arxiv.org/abs/2306.00630.
+[3]   Karsten Roth, Latha Pemula, Joaquin Zepeda, Bernhard Scholkopf, Thomas Brox,
+      and Peter Gehler. “Towards Total Recall in Industrial Anomaly Detection.” In:
+      Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recog-
+      nition. 2022, pp. 14318–14328.
+[4]   Varun Chandola, Arindam Banerjee, and Vipin Kumar. “Anomaly Detection: A Sur-
+      vey.” In: ACM Computing Surveys 41.3 (2009), 15:1–15:58. doi: 10.1145/1541880.
+      1541882.
+[5]   Jinan Bao, Hanshi Sun, Hanqiu Deng, Yinsheng He, Zhaoxiang Zhang, and Xingyu
+      Li. “BMAD: Benchmarks for Medical Anomaly Detection.” In: arXiv preprint arXiv:2306.11876
+      (2023). arXiv: 2306.11876 [cs.CV]. url: https://arxiv.org/abs/2306.11876.
+[6]   Tharindu Fernando, Harshala Gammulle, Simon Denman, Sridha Sridharan, and
+      Clinton Fookes. “Deep Learning for Medical Anomaly Detection: A Survey.” In:
+      arXiv preprint arXiv:2012.02364 (2021). arXiv: 2012.02364 [cs.CV]. url: https:
+      //arxiv.org/abs/2012.02364.
+[7]   Bernhard Schoelkopf, John C. Platt, John Shawe-Taylor, Alex J. Smola, and Robert
+      C. Williamson. “Estimating the Support of a High-Dimensional Distribution.” In:
+      Neural Computation 13.7 (2001), pp. 1443–1471. doi: 10.1162/089976601750264965.
+[8]   Ujjwal Baid, Satyam Ghodasara, Suyash Mohan, Michel Bilello, Evan Calabrese,
+      Errol Colak, Keyvan Farahani, Jayashree Kalpathy-Cramer, Felipe C. Kitamura,
+      Sarthak Pati, et al. “The RSNA-ASNR-MICCAI BraTS 2021 Benchmark on Brain
+
+
+                                          34
+       Tumor Segmentation and Radiogenomic Classification.” In: arXiv preprint arXiv:2107.02314
+       (2021). arXiv: 2107 . 02314 [eess.IV]. url: https : / / arxiv . org / abs / 2107 .
+       02314.
+ [9]   Saeed Shurrab and Rehab Duwairi. “Self-supervised learning methods and applica-
+       tions in medical imaging analysis: A survey.” In: PeerJ Computer Science 8 (2022),
+       e1045. doi: 10.7717/peerj-cs.1045.
+[10]   Zongwei Zhou, Vatsal Sodha, Jiaxuan Pang, Michael B. Gotway, and Jianming
+       Liang. “Models Genesis: Generic Autodidactic Models for 3D Medical Image Anal-
+       ysis.” In: Medical Image Computing and Computer Assisted Intervention – MICCAI
+       2019. Springer. 2019, pp. 384–393. arXiv: 1908.06912. url: https://arxiv.org/
+       abs/1908.06912.
+[11]   Mathilde Caron, Hugo Touvron, Ishan Misra, Herve Jegou, Julien Mairal, Piotr
+       Bojanowski, and Armand Joulin. “Emerging Properties in Self-Supervised Vision
+       Transformers.” In: Proceedings of the IEEE/CVF International Conference on Com-
+       puter Vision. 2021, pp. 9650–9660.
+[12]   Maxime Oquab, Timothee Darcet, Theo Moutakanni, Huy Vo, Marc Szafraniec,
+       Vasil Khalidov, Pierre Fernandez, Daniel Haziza, Francisco Massa, Alaaeldin El-
+       Nouby, et al. “DINOv2: Learning Robust Visual Features without Supervision.” In:
+       arXiv preprint arXiv:2304.07193 (2023). arXiv: 2304.07193 [cs.CV]. url: https:
+       //arxiv.org/abs/2304.07193.
+[13]   Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov, Dirk Weissenborn, Xi-
+       aohua Zhai, Thomas Unterthiner, Mostafa Dehghani, Matthias Minderer, Georg
+       Heigold, Sylvain Gelly, Jakob Uszkoreit, and Neil Houlsby. “An Image is Worth
+       16x16 Words: Transformers for Image Recognition at Scale.” In: International Con-
+       ference on Learning Representations. 2021. arXiv: 2010 . 11929. url: https : / /
+       arxiv.org/abs/2010.11929.
+[14]   Guansong Pang, Chunhua Shen, Longbing Cao, and Anton van den Hengel. “Deep
+       Learning for Anomaly Detection: A Review.” In: ACM Computing Surveys 54.2
+       (2021), pp. 1–38. doi: 10 . 1145 / 3439950. arXiv: 2007 . 02500. url: https : / /
+       arxiv.org/abs/2007.02500.
+[15]   Christoph Baur, Stefan Denner, Benedikt Wiestler, Shadi Albarqouni, and Nassir
+       Navab. “Autoencoders for Unsupervised Anomaly Segmentation in Brain MR Im-
+       ages: A Comparative Study.” In: arXiv preprint arXiv:2004.03271 (2020). arXiv:
+       2004.03271 [eess.IV]. url: https://arxiv.org/abs/2004.03271.
+[16]   Lukas Ruff, Robert A. Vandermeulen, Nico Goernitz, Alexander Binder, Emmanuel
+       Muller, Klaus-Robert Muller, and Marius Kloft. “Deep One-Class Classification.”
+       In: International Conference on Machine Learning. PMLR. 2018, pp. 4393–4402.
+
+                                           35
+[17]   Thomas Defard, Aleksandr Setkov, Angelique Loesch, and Romaric Audigier. “PaDiM:
+       A Patch Distribution Modeling Framework for Anomaly Detection and Localiza-
+       tion.” In: International Conference on Pattern Recognition. Springer. 2021, pp. 475–
+       489.
+[18]   Hanqiu Deng and Xingyu Li. “Anomaly Detection via Reverse Distillation from
+       One-Class Embedding.” In: Proceedings of the IEEE/CVF Conference on Computer
+       Vision and Pattern Recognition. 2022, pp. 9737–9746.
+[19]   Tom Fawcett. “An Introduction to ROC Analysis.” In: Pattern Recognition Letters
+       27.8 (2006), pp. 861–874. doi: 10.1016/j.patrec.2005.10.010.
+[20]   Jesse Davis and Mark Goadrich. “The Relationship Between Precision-Recall and
+       ROC Curves.” In: Proceedings of the 23rd International Conference on Machine
+       Learning. 2006, pp. 233–240. doi: 10.1145/1143844.1143874.
+[21]   Takaya Saito and Marc Rehmsmeier. “The Precision-Recall Plot Is More Informative
+       than the ROC Plot When Evaluating Binary Classifiers on Imbalanced Datasets.”
+       In: PLOS ONE 10.3 (2015), e0118432. doi: 10.1371/journal.pone.0118432.
+[22]   Stuart P. Lloyd. “Least Squares Quantization in PCM.” In: IEEE Transactions on
+       Information Theory 28.2 (1982), pp. 129–137. doi: 10.1109/TIT.1982.1056489.
+[23]   Matthew Turk and Alex Pentland. “Eigenfaces for Recognition.” In: Journal of
+       Cognitive Neuroscience 3.1 (1991), pp. 71–86. doi: 10.1162/jocn.1991.3.1.71.
+
+
+
+
+                                           36
+

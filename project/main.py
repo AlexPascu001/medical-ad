@@ -9,6 +9,7 @@ import yaml
 import torch
 import numpy as np
 import copy
+import math
 from pathlib import Path
 import random
 
@@ -347,7 +348,10 @@ def load_config(config_path: str) -> dict:
         'dynamic_reassignment': False,
         'reassignment_interval': 5,
         'pseudo_label_assignment': 'nearest',
-        'capacity_multiplier': 2.0
+        'capacity_multiplier': 2.0,
+        'head_warmup_epochs': 0,
+        'unfreeze_last_n_blocks': 0,
+        'backbone_lr': None
     }
     stage2_defaults = {
         'enabled': False,
@@ -1443,28 +1447,92 @@ def main(args):
     # ===== STAGE 5: Training Setup =====
     criterion = create_criterion(config)
     
-    # Get trainable parameters
-    trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
-    
-    # Optimizer
-    if len(trainable_params) > 0:
+    training_cfg = config['training']
+    head_warmup_epochs = int(training_cfg.get('head_warmup_epochs', 0))
+    unfreeze_last_n_blocks = int(training_cfg.get('unfreeze_last_n_blocks', 0))
+    staged_finetuning = head_warmup_epochs > 0 or unfreeze_last_n_blocks > 0
+    stage1_schedule = {'enabled': False}
+
+    if staged_finetuning:
+        if config['model']['freeze_backbone']:
+            raise ValueError(
+                "Stage-1 head warm-up/partial unfreezing requires model.freeze_backbone=false."
+            )
+        if head_warmup_epochs <= 0:
+            raise ValueError("training.head_warmup_epochs must be greater than zero.")
+        if unfreeze_last_n_blocks <= 0:
+            raise ValueError("training.unfreeze_last_n_blocks must be greater than zero.")
+        if head_warmup_epochs >= training_cfg['epochs']:
+            raise ValueError("training.head_warmup_epochs must be less than training.epochs.")
+
+        head_lr = float(training_cfg['lr'])
+        backbone_lr_value = training_cfg.get('backbone_lr')
+        if backbone_lr_value is None:
+            raise ValueError("training.backbone_lr is required for staged finetuning.")
+        backbone_lr = float(backbone_lr_value)
+        if backbone_lr <= 0.0 or backbone_lr > head_lr:
+            raise ValueError("training.backbone_lr must be positive and no greater than training.lr.")
+
+        selected_backbone_params = model.backbone.configure_partial_backbone_finetuning(
+            last_n_blocks=unfreeze_last_n_blocks,
+            trainable=False,
+        )
+        selected_backbone_ids = {id(parameter) for parameter in selected_backbone_params}
+        head_params = [
+            parameter
+            for parameter in model.parameters()
+            if parameter.requires_grad and id(parameter) not in selected_backbone_ids
+        ]
+        if not head_params:
+            raise RuntimeError("Staged finetuning found no trainable projection-head parameters.")
+
         optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=config['training']['lr'],
-            weight_decay=config['training']['weight_decay']
+            [
+                {'params': head_params, 'lr': head_lr, 'name': 'head'},
+                {'params': selected_backbone_params, 'lr': backbone_lr, 'name': 'backbone'},
+            ],
+            weight_decay=training_cfg['weight_decay'],
         )
-        
-        # Scheduler
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+
+        min_lr_ratio = 0.01
+        total_epochs = int(training_cfg['epochs'])
+
+        def cosine_lr_multiplier(epoch: int) -> float:
+            progress = min(max(epoch, 0), total_epochs) / total_epochs
+            return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
             optimizer,
-            T_max=config['training']['epochs'],
-            eta_min=config['training']['lr'] * 0.01
+            lr_lambda=[cosine_lr_multiplier, cosine_lr_multiplier],
         )
+        stage1_schedule = {
+            'enabled': True,
+            'head_warmup_epochs': head_warmup_epochs,
+            'unfreeze_last_n_blocks': unfreeze_last_n_blocks,
+            'head_lr': head_lr,
+            'backbone_lr': backbone_lr,
+        }
     else:
+        trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
+        if len(trainable_params) > 0:
+            optimizer = torch.optim.AdamW(
+                trainable_params,
+                lr=training_cfg['lr'],
+                weight_decay=training_cfg['weight_decay']
+            )
+
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=training_cfg['epochs'],
+                eta_min=training_cfg['lr'] * 0.01
+            )
+        else:
+            optimizer = None
+            scheduler = None
+
+    if optimizer is None:
         print("\nNote: No trainable parameters (backbone is frozen, no projection head).")
         print("Skipping training and proceeding directly to evaluation...")
-        optimizer = None
-        scheduler = None
     
     # ===== STAGE 5: Training =====
     print("\n" + "="*80)
@@ -1490,7 +1558,8 @@ def main(args):
             capacity_multiplier=config['training'].get('capacity_multiplier', 2.0),
             dynamic_reassignment=config['training'].get('dynamic_reassignment', False),
             reassignment_interval=config['training'].get('reassignment_interval', 5),
-            save_checkpoints=config['training'].get('save_checkpoints', True)
+            save_checkpoints=config['training'].get('save_checkpoints', True),
+            stage1_schedule=stage1_schedule,
         )
         
         trainer.train(

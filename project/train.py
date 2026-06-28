@@ -122,7 +122,8 @@ class Trainer:
         reassignment_interval: int = 5,
         save_checkpoints: bool = True,
         stage2_mode: bool = False,
-        stage2_config: Optional[Dict] = None
+        stage2_config: Optional[Dict] = None,
+        stage1_schedule: Optional[Dict] = None,
     ):
         """
         Args:
@@ -160,6 +161,8 @@ class Trainer:
         self.save_checkpoints = save_checkpoints
         self.stage2_mode = stage2_mode
         self.stage2_config = stage2_config or {}
+        self.stage1_schedule = stage1_schedule or {}
+        self._stage1_backbone_trainable = None
         
         self.epoch = 0
         self.global_step = 0
@@ -218,7 +221,9 @@ class Trainer:
             
             # Per-epoch statistics
             'epochs': [],
-            'learning_rates': []
+            'learning_rates': [],
+            'backbone_learning_rates': [],
+            'stage1_backbone_trainable': []
         }
 
         if self.fixed_pseudo:
@@ -229,6 +234,33 @@ class Trainer:
 
         # Pixel-stats tracker for stage-2 reconstruction threshold
         self.pixel_stats_tracker = None
+
+    def _apply_stage1_backbone_schedule(self) -> None:
+        """Apply head-only warm-up followed by low-LR partial backbone unfreezing."""
+        if not self.stage1_schedule.get('enabled', False):
+            return
+
+        warmup_epochs = int(self.stage1_schedule['head_warmup_epochs'])
+        last_n_blocks = int(self.stage1_schedule['unfreeze_last_n_blocks'])
+        backbone_trainable = self.epoch >= warmup_epochs
+        backbone_wrapper = self.model.backbone
+        backbone_wrapper.configure_partial_backbone_finetuning(
+            last_n_blocks=last_n_blocks,
+            trainable=backbone_trainable,
+        )
+
+        if self._stage1_backbone_trainable != backbone_trainable:
+            if backbone_trainable:
+                print(
+                    f"\n  >> Stage-1 schedule: unfroze the final {last_n_blocks} "
+                    f"DINOv3 blocks at epoch {self.epoch}"
+                )
+            else:
+                print(
+                    f"\n  >> Stage-1 schedule: projection-head-only warm-up "
+                    f"for epochs 0-{warmup_epochs - 1}"
+                )
+            self._stage1_backbone_trainable = backbone_trainable
 
     def _compute_stage2_losses(self, outputs: Dict[str, torch.Tensor], images: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Compute reconstruction + alignment losses for stage-2 training.
@@ -866,6 +898,7 @@ class Trainer:
     def train_epoch(self) -> Dict[str, float]:
         """Train for one epoch"""
         self.model.train()
+        self._apply_stage1_backbone_schedule()
         
         epoch_metrics = {
             'loss': 0.0,
@@ -1364,6 +1397,14 @@ class Trainer:
         print(f"Device: {self.device}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}")
         print(f"Stage-1 early stopping: patience={early_stopping_patience}, min_epochs={min_epochs_before_early_stopping}")
+        if self.stage1_schedule.get('enabled', False):
+            print(
+                "Stage-1 staged finetuning: "
+                f"head-only epochs={self.stage1_schedule['head_warmup_epochs']}, "
+                f"last blocks={self.stage1_schedule['unfreeze_last_n_blocks']}, "
+                f"head LR={self.stage1_schedule['head_lr']:.2e}, "
+                f"backbone LR={self.stage1_schedule['backbone_lr']:.2e}"
+            )
         
         # Print pseudo-label configuration
         if self.fixed_pseudo:
@@ -1397,6 +1438,11 @@ class Trainer:
             self.history['train_loss_dense'].append(0.0)
             self.history['train_loss_dense_attract'].append(0.0)
             self.history['epochs'].append(epoch)
+            self.history['stage1_backbone_trainable'].append(
+                bool(self._stage1_backbone_trainable)
+                if self.stage1_schedule.get('enabled', False)
+                else bool(not self.model.backbone.freeze_backbone)
+            )
             
             print(f"\nEpoch {epoch} Summary:")
             print(f"  Train Loss: {train_metrics['loss']:.4f}")
@@ -1511,10 +1557,20 @@ class Trainer:
             
             # Update scheduler
             if scheduler is not None:
-                current_lr = scheduler.get_last_lr()[0]
+                current_lrs = scheduler.get_last_lr()
+                current_lr = current_lrs[0]
+                backbone_lr = None
+                for group_index, group in enumerate(self.optimizer.param_groups):
+                    if group.get('name') == 'backbone':
+                        backbone_lr = current_lrs[group_index]
+                        break
                 scheduler.step()
                 self.history['learning_rates'].append(current_lr)
-                print(f"  LR: {current_lr:.6f}")
+                self.history['backbone_learning_rates'].append(backbone_lr)
+                if backbone_lr is None:
+                    print(f"  LR: {current_lr:.6f}")
+                else:
+                    print(f"  LR: head={current_lr:.6e}, backbone={backbone_lr:.6e}")
             
             print("-" * 80)
         

@@ -438,6 +438,66 @@ class DINOv3Backbone(nn.Module):
             self.backbone.eval()
         return self
 
+    def get_partial_backbone_parameters(
+        self,
+        last_n_blocks: int,
+        include_final_norm: bool = True,
+    ) -> List[nn.Parameter]:
+        """Return parameters for the final ViT blocks used by staged Stage-1 finetuning."""
+        last_n_blocks = int(last_n_blocks)
+        if last_n_blocks <= 0:
+            raise ValueError("training.unfreeze_last_n_blocks must be greater than zero.")
+        if last_n_blocks > self.num_blocks:
+            raise ValueError(
+                f"training.unfreeze_last_n_blocks={last_n_blocks} exceeds "
+                f"the backbone block count ({self.num_blocks})."
+            )
+
+        modules: List[nn.Module] = list(self.backbone.blocks[-last_n_blocks:])
+        if include_final_norm and hasattr(self.backbone, 'norm'):
+            modules.append(self.backbone.norm)
+
+        parameters: List[nn.Parameter] = []
+        seen = set()
+        for module in modules:
+            for parameter in module.parameters():
+                if id(parameter) not in seen:
+                    parameters.append(parameter)
+                    seen.add(id(parameter))
+        return parameters
+
+    def configure_partial_backbone_finetuning(
+        self,
+        last_n_blocks: int,
+        trainable: bool,
+        include_final_norm: bool = True,
+    ) -> List[nn.Parameter]:
+        """
+        Freeze the full pretrained encoder, then optionally unfreeze its final blocks.
+
+        During the head-only warm-up, ``trainable=False`` also activates the
+        no-grad backbone path. After warm-up, only the selected blocks and final
+        norm receive gradients; the earlier encoder remains frozen and in eval mode.
+        """
+        selected_parameters = self.get_partial_backbone_parameters(
+            last_n_blocks=last_n_blocks,
+            include_final_norm=include_final_norm,
+        )
+        selected_ids = {id(parameter) for parameter in selected_parameters}
+
+        for parameter in self.backbone.parameters():
+            parameter.requires_grad = bool(trainable and id(parameter) in selected_ids)
+
+        self.freeze_backbone = not trainable
+        self.backbone.eval()
+        if trainable and self.training:
+            for block in self.backbone.blocks[-int(last_n_blocks):]:
+                block.train(True)
+            if include_final_norm and hasattr(self.backbone, 'norm'):
+                self.backbone.norm.train(True)
+
+        return selected_parameters
+
 
 class AnomalyDetector(nn.Module):
     """

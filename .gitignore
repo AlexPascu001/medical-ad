@@ -11,6 +11,9 @@ data/
 *.json
 *.log
 *.ps1
+!run_gelu_dropout_timm_warmup_sweep.ps1
 __pycache__/
 *.pyc
 !evaluation_metrics.json
+work/
+tmp*

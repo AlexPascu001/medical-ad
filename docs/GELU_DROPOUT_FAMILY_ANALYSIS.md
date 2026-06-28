@@ -2,430 +2,429 @@
 
 Scope:
 
-- `gelu_dropout_global_*`
-- `gelu_dropout_patch_location_*`
+- original `gelu_dropout_global_*` experiments;
+- original `gelu_dropout_patch_location_*` experiments;
+- staged `gelu_dropout_*_finetune_timm` follow-ups.
 
-This note analyzes the GELU/dropout experiment sweep, which adds an explicit projection-head change on top of the late stage2e70-style recipe:
+The family adds an explicitly regularized projection head to the late stage2e70-style recipe:
 
-- `projection_activation: gelu`
-- `projection_dropout: 0.2`
-- `projection_dim: 128`
-- stage-2 reconstruction and score fusion enabled
+- `projection_activation: gelu`;
+- `projection_dropout: 0.2`;
+- `projection_dim: 128`;
+- stage-2 reconstruction and fixed score fusion enabled.
 
-The sweep was intended to cross three axes:
+The original sweep compared two coupled recipes:
 
-- anchor family: global CLS/redesign vs patch `location_kmeans`
-- training policy: frozen backbone with timm transforms vs trainable backbone with legacy transforms
-- K: `1`, `64`, `1024`
+- frozen backbone + timm eval preprocessing;
+- full-backbone finetuning + legacy preprocessing.
 
-The practical questions are:
+That design could not distinguish backbone policy from input preprocessing. The follow-up holds timm preprocessing fixed and introduces a gentler finetuning schedule:
 
-- did GELU/dropout improve the late-stage CAM-anchor recipes?
-- is the better setting frozen+timm or finetune+legacy?
-- does large K still help once the projection head is regularized?
-- did the patch-location branch remain competitive with the stronger patch/location-kmeans family?
+- epochs `0-4`: train the projection head only;
+- epoch `5+`: also train DINOv3 blocks `10-11` and final norm;
+- projection-head LR `1e-4`;
+- backbone LR `1e-6`;
+- earlier DINOv3 blocks remain frozen.
 
-The conclusions here are based on:
+This analysis asks:
 
-- `project/configs/gelu_dropout_*.yaml`
-- `run_gelu_dropout_sweep.ps1`
-- `runs/gelu_dropout_*/.../evaluation/evaluation_metrics.json`
-- `runs/gelu_dropout_*/.../evaluation_stage1/evaluation_metrics.json`
-- `runs/gelu_dropout_*/.../training_summary.json`
-- `runs/gelu_dropout_sweep_timings.json`
-- `runs/gelu_dropout_sweep_logs/gelu_dropout_patch_location_k1024_frozen_timm.log`
-- `runs/gelu_dropout_sweep_logs/gelu_dropout_patch_location_k1024_finetune.log`
-- comparison baselines in `docs/STAGE2E70_FAMILY_ANALYSIS.md` and `docs/PATCH_LOCATION_KMEANS_FAMILY_ANALYSIS.md`
+1. Did staged finetuning recover the pretrained anchor geometry lost by the original full-finetune recipe?
+2. Did it improve on frozen+timm, or merely avoid degradation?
+3. Did global and patch-location branches respond differently?
+4. Did better Stage-1 behavior improve reconstruction, pixel evidence, or fixed fusion?
+
+The conclusions are based on:
+
+- `project/configs/gelu_dropout_*.yaml`;
+- `run_gelu_dropout_sweep.ps1`;
+- `run_gelu_dropout_timm_warmup_sweep.ps1`;
+- `runs/gelu_dropout_*/.../evaluation/evaluation_metrics.json`;
+- `runs/gelu_dropout_*/.../evaluation_stage1/evaluation_metrics.json`;
+- `runs/gelu_dropout_*/.../training_history.json`;
+- `runs/gelu_dropout_*/.../training_summary.json`;
+- both sweep timing files and logs;
+- comparison baselines in `docs/STAGE2E70_FAMILY_ANALYSIS.md` and `docs/PATCH_LOCATION_KMEANS_FAMILY_ANALYSIS.md`.
 
 ## 1. Experiment Matrix
 
-There were `12` planned GELU/dropout runs.
+The original sweep planned `12` runs and completed `10`. The staged follow-up planned and completed `5`.
 
-| Bucket | Planned Runs | Completed Final Evaluations | K Values | Backbone Policy | Anchor Mode | Stage 2 |
-| --- | ---: | ---: | --- | --- | --- | --- |
-| Global frozen+timm | 3 | 3 | `1, 64, 1024` | frozen backbone, timm transforms | global CLS/redesign | enabled |
-| Global finetune+legacy | 3 | 3 | `1, 64, 1024` | trainable backbone, legacy transforms | global CLS/redesign | enabled |
-| Patch-location frozen+timm | 3 | 2 | `1, 64, 1024` | frozen backbone, timm transforms | patch/location_kmeans | enabled |
-| Patch-location finetune+legacy | 3 | 2 | `1, 64, 1024` | trainable backbone, legacy transforms | patch/location_kmeans | enabled |
+| Bucket | Planned | Completed | K Values | Input Pipeline | Stage-1 Backbone |
+|---|---:|---:|---|---|---|
+| Global frozen+timm | 3 | 3 | `1, 64, 1024` | timm eval | frozen |
+| Global full finetune+legacy | 3 | 3 | `1, 64, 1024` | legacy | all blocks, LR `1e-4` |
+| Global staged finetune+timm | 3 | 3 | `1, 64, 1024` | timm eval | head warm-up, then last 2 blocks at `1e-6` |
+| Patch-location frozen+timm | 3 | 2 | `1, 64, 1024` | timm eval | frozen |
+| Patch-location full finetune+legacy | 3 | 2 | `1, 64, 1024` | legacy | all blocks, LR `1e-4` |
+| Patch-location staged finetune+timm | 2 | 2 | `1, 64` | timm eval | head warm-up, then last 2 blocks at `1e-6` |
 
-The two missing final evaluations are both patch-location `K=1024` runs.
+Both original patch-location `K=1024` runs failed with CUDA OOM during the first Stage-1 backward pass. No staged `K=1024` patch run was attempted.
 
-- `gelu_dropout_patch_location_k1024_frozen_timm` started, built the local centroid bank, and failed during epoch `0` with CUDA OOM.
-- `gelu_dropout_patch_location_k1024_finetune` was attempted manually after the sweep stop and failed the same way.
+Across both sweeps:
 
-So this is a complete global sweep, but only a partial patch-location sweep.
+- `17` configurations were attempted;
+- `15` produced final evaluations;
+- `2` failed because of patch-bank memory pressure.
 
 ## 2. What Changed
 
-The family keeps the late stage2e70-style training envelope:
+All completed experiments retain:
 
-- DINOv3 `vit_small_patch16_dinov3.lvd1689m`
-- `projection_dim: 128`
-- `loss.beta: 0.5`
-- `loss.delta: 0.0`
-- stage-2 reconstruction enabled
-- stage-2 frozen bottleneck enabled
-- pixel map type `reconstruction_l2`
-- pixel aggregation `top_k_percentile` at percentile `95`
-- fixed score fusion weights `0.4 / 0.3 / 0.3`
+- DINOv3 `vit_small_patch16_dinov3.lvd1689m`;
+- `projection_dim: 128`;
+- `loss.beta: 0.5`;
+- `loss.delta: 0.0`;
+- stage-2 reconstruction;
+- frozen Stage-1 bottleneck for divergence;
+- reconstruction-L2 pixel maps;
+- 95th-percentile pixel aggregation;
+- fixed fusion weights `0.4 / 0.3 / 0.3`.
 
-The new explicit projection-head settings are:
+The follow-up changes only the finetune-side recipe:
 
-| Setting | GELU/Dropout Value | Why It Matters |
-| --- | --- | --- |
-| `model.projection_activation` | `gelu` | changes the nonlinearity inside the projection head |
-| `model.projection_dropout` | `0.2` | regularizes the learned projection space |
-| `model.freeze_backbone` | swept | isolates frozen projection-head training from full backbone finetuning |
-| `data.use_timm_transforms` | swept with freeze policy | tests timm eval-style preprocessing against legacy transforms |
+| Setting | Original Full Finetune | Staged Finetune |
+|---|---|---|
+| preprocessing | legacy | timm eval |
+| initial backbone state | trainable from epoch 0 | frozen for epochs 0-4 |
+| trainable depth | entire backbone | final 2/12 blocks + final norm |
+| backbone LR | `1e-4` | `1e-6` |
+| head LR | `1e-4` | `1e-4` |
 
-The frozen+timm and finetune+legacy axes are coupled in these configs. That means the sweep cannot cleanly isolate whether a difference comes from freezing, transform choice, or their interaction. It can only compare the two complete recipes.
+This is a controlled comparison against frozen+timm, because both sides use timm preprocessing. It is not a component-level ablation of warm-up, trainable depth, and LR; those remain bundled.
 
-## 3. How The Two Branches Work
+## 3. Branch Definitions
 
 ### 3.1 Global Branch
 
-The global branch uses centroid anchors in CLS/global embedding space.
+The global branch uses centroid anchors in CLS embedding space:
 
-- `anchor.strategy: kmeans`
-- `anchor.representation: centroids`
-- `anchor.use_embedding_space: true`
-- `anchor.reproject_anchors: true`
-- `training.fixed_pseudo_labels: true`
-- `training.pseudo_label_assignment: capacitated`
-- `stage2.alignment_target: anchor`
+- `anchor.strategy: kmeans`;
+- `anchor.representation: centroids`;
+- `anchor.use_embedding_space: true`;
+- `anchor.reproject_anchors: true`;
+- `training.fixed_pseudo_labels: true`;
+- `training.pseudo_label_assignment: capacitated`;
+- `stage2.alignment_target: anchor`.
 
-This is closest to the redesign/global side of the stage2e70 family.
+Anchors are extracted in the pretrained 384D DINOv3 space and re-projected through the current head. When the backbone is updated, sample embeddings can drift relative to those stored raw anchor embeddings.
 
 ### 3.2 Patch-Location Branch
 
-The patch branch uses same-location local centroid banks.
+The patch branch uses same-location local centroid banks:
 
-- `anchor.mode: patch`
-- `anchor.patch.variant: location_kmeans`
-- `anchor.representation: centroids`
-- `anchor.patch.local_score_reduction: percentile`
-- `anchor.patch.local_score_percentile: 95`
-- `anchor.patch.local_distance_metric: euclidean`
-- `training.fixed_pseudo_labels: false`
-- `stage2.alignment_target: local_anchor_pool`
+- `anchor.mode: patch`;
+- `anchor.patch.variant: location_kmeans`;
+- `anchor.representation: centroids`;
+- 95th-percentile local score reduction;
+- Euclidean local distance;
+- dynamic per-patch nearest-centroid assignment;
+- `stage2.alignment_target: local_anchor_pool`.
 
-This is closest to the location-kmeans stage2recon family, except this sweep uses the GELU/dropout projection head and tests the frozen+timm vs finetune+legacy policy directly.
+This branch is especially sensitive to changes in pretrained patch geometry because each stored centroid is tied to a spatial patch location.
 
 ## 4. Best-Run Summary
 
-| Objective | Winner | Image AUROC | Fused AUROC | Pixel AUROC | Comment |
-| --- | --- | ---: | ---: | ---: | --- |
-| Best GELU/dropout image AUROC | `gelu_dropout_patch_location_k1_frozen_timm` | `0.8429` | `0.7469` | `0.8898` | strongest raw detector in this family |
-| Best GELU/dropout fused AUROC | `gelu_dropout_global_k1_finetune` | `0.7974` | `0.7724` | `0.9193` | best stored fusion, but below older fused leaders |
-| Best GELU/dropout pixel AUROC | `gelu_dropout_global_k64_finetune` | `0.6860` | `0.7609` | `0.9257` | strong pixel map but weak anchor score |
-| Best frozen+timm global image AUROC | `gelu_dropout_global_k1_frozen_timm_2` | `0.7966` | `0.6956` | `0.8926` | raw image close to finetune `k1`, fusion poor |
-| Best finetune global image AUROC | `gelu_dropout_global_k1_finetune` | `0.7974` | `0.7724` | `0.9193` | best global result |
-| Best frozen+timm patch image AUROC | `gelu_dropout_patch_location_k1_frozen_timm` | `0.8429` | `0.7469` | `0.8898` | large raw gain, weak fusion |
-| Best finetune patch image AUROC | `gelu_dropout_patch_location_k1_finetune` | `0.7179` | `0.6884` | `0.9214` | much weaker raw detector |
+| Objective | Winner | Image AUROC | Fused AUROC | Pixel AUROC | Interpretation |
+|---|---|---:|---:|---:|---|
+| Best family raw image AUROC | `patch_location_k1_finetune_timm` | **`0.8479`** | `0.6948` | `0.8961` | staged result, but only `+0.0050` over frozen |
+| Best family fused AUROC | `global_k1_finetune` | `0.7974` | **`0.7724`** | `0.9193` | old full-finetune recipe |
+| Best family pixel AUROC | `global_k64_finetune` | `0.6860` | `0.7609` | **`0.9257`** | strong pixels, weak anchor score |
+| Best staged fused AUROC | `patch_location_k64_finetune_timm` | `0.8354` | **`0.7303`** | `0.8843` | fusion still loses `0.1051` |
+| Best reconstruction AUROC | `patch_location_k64_finetune_timm` | `0.8354` | `0.7303` | `0.8843` | reconstruction AUROC `0.7447` |
+| Best frozen raw AUROC | `patch_location_k1_frozen_timm` | `0.8429` | `0.7469` | `0.8898` | statistically/practically near staged K=1 |
 
-The headline result is:
-
-- GELU/dropout produced one very strong raw image detector: `gelu_dropout_patch_location_k1_frozen_timm` at `0.8429`
-- the same run did not produce a strong fused result
-- the best fused result in the family is only `0.7724`
-- the global branch becomes worse as K increases
-- the patch branch strongly favors frozen+timm over finetune+legacy at both completed K values
-- patch-location `K=1024` did not complete because of GPU memory pressure
-
-So this sweep improved one raw image score, but it did not improve the thesis-facing fused leaderboard.
+The headline changed slightly: the best raw score now comes from staged finetuning, but the gain is too small and inconsistent across K to establish finetuning as the preferred default.
 
 ## 5. Evaluation Results
 
-### 5.1 Completed Runs
+### 5.1 All Completed Runs
 
-| Run | Image AUROC | Fused AUROC | Pixel AUROC | Reconstruction AUROC | Divergence AUROC |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `gelu_dropout_global_k1_finetune` | `0.7974` | `0.7724` | `0.9193` | `0.7195` | `0.5104` |
-| `gelu_dropout_global_k1_frozen_timm_2` | `0.7966` | `0.6956` | `0.8926` | `0.6746` | `0.3807` |
-| `gelu_dropout_global_k64_finetune` | `0.6860` | `0.7609` | `0.9257` | `0.7314` | `0.6321` |
-| `gelu_dropout_global_k64_frozen_timm` | `0.7474` | `0.7125` | `0.8858` | `0.7053` | `0.7015` |
-| `gelu_dropout_global_k1024_finetune` | `0.7057` | `0.7445` | `0.9135` | `0.6055` | `0.6198` |
-| `gelu_dropout_global_k1024_frozen_timm` | `0.7770` | `0.7249` | `0.8797` | `0.7088` | `0.6869` |
-| `gelu_dropout_patch_location_k1_finetune` | `0.7179` | `0.6884` | `0.9214` | `0.6078` | `0.6387` |
-| `gelu_dropout_patch_location_k1_frozen_timm` | `0.8429` | `0.7469` | `0.8898` | `0.6810` | `0.4908` |
-| `gelu_dropout_patch_location_k64_finetune` | `0.5870` | `0.6886` | `0.9253` | `0.6225` | `0.4438` |
-| `gelu_dropout_patch_location_k64_frozen_timm` | `0.8391` | `0.7657` | `0.8916` | `0.7368` | `0.2445` |
+| Family | K | Recipe | Image AUROC | Fused AUROC | Pixel AUROC | Recon AUROC | Divergence AUROC |
+|---|---:|---|---:|---:|---:|---:|---:|
+| Global | 1 | Frozen+timm | `0.7966` | `0.6956` | `0.8926` | `0.6746` | `0.3807` |
+| Global | 1 | Full finetune+legacy | `0.7974` | `0.7724` | `0.9193` | `0.7195` | `0.5104` |
+| Global | 1 | Staged finetune+timm | **`0.8104`** | `0.7068` | `0.8916` | `0.6831` | `0.3719` |
+| Global | 64 | Frozen+timm | **`0.7474`** | `0.7125` | `0.8858` | `0.7053` | `0.7015` |
+| Global | 64 | Full finetune+legacy | `0.6860` | **`0.7609`** | **`0.9257`** | **`0.7314`** | `0.6321` |
+| Global | 64 | Staged finetune+timm | **`0.7474`** | `0.7121` | `0.8939` | `0.6879` | `0.6999` |
+| Global | 1024 | Frozen+timm | **`0.7770`** | `0.7249` | `0.8797` | **`0.7088`** | **`0.6869`** |
+| Global | 1024 | Full finetune+legacy | `0.7057` | **`0.7445`** | **`0.9135`** | `0.6055` | `0.6198` |
+| Global | 1024 | Staged finetune+timm | **`0.7770`** | `0.7198` | `0.8866` | `0.6729` | `0.6823` |
+| Patch-location | 1 | Frozen+timm | `0.8429` | **`0.7469`** | `0.8898` | **`0.6810`** | `0.4908` |
+| Patch-location | 1 | Full finetune+legacy | `0.7179` | `0.6884` | **`0.9214`** | `0.6078` | **`0.6387`** |
+| Patch-location | 1 | Staged finetune+timm | **`0.8479`** | `0.6948` | `0.8961` | `0.6727` | `0.5123` |
+| Patch-location | 64 | Frozen+timm | **`0.8391`** | **`0.7657`** | `0.8916` | `0.7368` | `0.2445` |
+| Patch-location | 64 | Full finetune+legacy | `0.5870` | `0.6886` | **`0.9253`** | `0.6225` | **`0.4438`** |
+| Patch-location | 64 | Staged finetune+timm | `0.8354` | `0.7303` | `0.8843` | **`0.7447`** | `0.2360` |
 
 ### 5.2 Global Branch
 
-| K | Frozen Image | Finetune Image | Frozen Fused | Finetune Fused | Frozen Pixel | Finetune Pixel |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `1` | `0.7966` | `0.7974` | `0.6956` | `0.7724` | `0.8926` | `0.9193` |
-| `64` | `0.7474` | `0.6860` | `0.7125` | `0.7609` | `0.8858` | `0.9257` |
-| `1024` | `0.7770` | `0.7057` | `0.7249` | `0.7445` | `0.8797` | `0.9135` |
+| K | Frozen Image | Full-FT Image | Staged Image | Frozen Fused | Full-FT Fused | Staged Fused |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | `0.7966` | `0.7974` | **`0.8104`** | `0.6956` | **`0.7724`** | `0.7068` |
+| 64 | **`0.7474`** | `0.6860` | **`0.7474`** | `0.7125` | **`0.7609`** | `0.7121` |
+| 1024 | **`0.7770`** | `0.7057` | **`0.7770`** | `0.7249` | **`0.7445`** | `0.7198` |
 
-The global branch is mixed.
+The staged recipe recovers the raw image AUROC lost by full finetuning:
 
-- raw image AUROC is essentially tied at `K=1`
-- frozen+timm has better raw image AUROC at `K=64` and `K=1024`
-- finetune+legacy has better fused and pixel AUROC at every K
-- increasing K hurts the finetune raw image score badly
-- increasing K also does not improve frozen+timm beyond the `K=1` raw score
+- `+0.0614` at `K=64`;
+- `+0.0713` at `K=1024`.
 
-So the global branch did not recover the old large-K redesign pattern where `K=1024` gave the best fused score. Under GELU/dropout, global `K=1` finetune is the most useful completed global run.
+But these are not successful post-unfreeze models. Both selected epoch `1`, during the head-only warm-up. Their best post-unfreeze validation AUROCs were lower:
+
+- global `K=64`: `0.7069` post-unfreeze versus `0.7552` during warm-up;
+- global `K=1024`: `0.7319` post-unfreeze versus `0.8019` during warm-up.
+
+Global `K=1` behaves differently. Its selected epoch is `96`, and raw test AUROC improves from `0.7966` frozen to `0.8104` staged. This is the clearest evidence that low-K global features can benefit from gentle adaptation.
 
 ### 5.3 Patch-Location Branch
 
-| K | Frozen Image | Finetune Image | Frozen Fused | Finetune Fused | Frozen Pixel | Finetune Pixel |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `1` | `0.8429` | `0.7179` | `0.7469` | `0.6884` | `0.8898` | `0.9214` |
-| `64` | `0.8391` | `0.5870` | `0.7657` | `0.6886` | `0.8916` | `0.9253` |
-| `1024` | failed OOM | failed OOM | failed OOM | failed OOM | failed OOM | failed OOM |
+| K | Frozen Image | Full-FT Image | Staged Image | Frozen Fused | Full-FT Fused | Staged Fused |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | `0.8429` | `0.7179` | **`0.8479`** | **`0.7469`** | `0.6884` | `0.6948` |
+| 64 | **`0.8391`** | `0.5870` | `0.8354` | **`0.7657`** | `0.6886` | `0.7303` |
 
-The patch-location branch has the clearest result in the sweep.
+The staged schedule removes the catastrophic degradation seen under full finetuning:
 
-- frozen+timm strongly beats finetune+legacy on raw image AUROC
-- the frozen advantage is `+0.1249` at `K=1`
-- the frozen advantage is `+0.2521` at `K=64`
-- finetune+legacy gives higher pixel AUROC, but this does not translate into better image-level detection
-- `K=64` barely changes frozen raw image AUROC relative to `K=1`
+- K=1 improves by `+0.1300` over full finetune;
+- K=64 improves by `+0.2484`.
 
-This is the main practical finding: for GELU/dropout patch-location, the trainable-backbone recipe is actively harmful to the anchor detector, while frozen+timm is strong and stable at the completed K values.
+Both staged patch runs selected checkpoints after unfreezing:
+
+- K=1 selected epoch `18`;
+- K=64 selected epoch `22`.
+
+Their validation scores improved after unfreezing by `+0.0093` and `+0.0181` over the best warm-up values. On test, however, the differences relative to frozen+timm are only `+0.0050` and `-0.0037`.
+
+The correct conclusion is that gentle adaptation is safe for patch-location at these K values, not that it materially outperforms freezing.
 
 ### 5.4 Fusion Behavior
 
-The stored fused score often underperforms the raw anchor/image score.
+The strongest raw staged runs are damaged severely by fixed fusion:
 
-| Run | Image AUROC | Fused AUROC | Fused Delta |
-| --- | ---: | ---: | ---: |
-| `gelu_dropout_patch_location_k1_frozen_timm` | `0.8429` | `0.7469` | `-0.0959` |
-| `gelu_dropout_patch_location_k64_frozen_timm` | `0.8391` | `0.7657` | `-0.0734` |
-| `gelu_dropout_global_k1_frozen_timm_2` | `0.7966` | `0.6956` | `-0.1010` |
-| `gelu_dropout_global_k1024_frozen_timm` | `0.7770` | `0.7249` | `-0.0521` |
-| `gelu_dropout_global_k1_finetune` | `0.7974` | `0.7724` | `-0.0250` |
-| `gelu_dropout_global_k64_finetune` | `0.6860` | `0.7609` | `+0.0749` |
-| `gelu_dropout_patch_location_k64_finetune` | `0.5870` | `0.6886` | `+0.1016` |
+| Run | Image AUROC | Fused AUROC | Delta |
+|---|---:|---:|---:|
+| Global K=1 staged | `0.8104` | `0.7068` | `-0.1036` |
+| Global K=64 staged | `0.7474` | `0.7121` | `-0.0353` |
+| Global K=1024 staged | `0.7770` | `0.7198` | `-0.0572` |
+| Patch K=1 staged | `0.8479` | `0.6948` | `-0.1531` |
+| Patch K=64 staged | `0.8354` | `0.7303` | `-0.1051` |
 
-This is the same broad warning seen in other stage-2 families, but more severe for the strongest GELU/dropout raw runs.
+The staged K=1 patch detector has pixel-aggregated AUROC `0.4609`. Its fixed positive pixel weight therefore adds a weak or misaligned signal to an excellent anchor ranker.
 
-- fusion can rescue weak anchor runs when the pixel/reconstruction/divergence branches are better aligned
-- fusion can damage strong anchor runs when auxiliary signals are weaker or misweighted
-- the fixed `0.4 / 0.3 / 0.3` fusion rule is not appropriate for all runs
-
-For the best raw run, fusion is not a value add. It hides the most important result.
+The old full-finetune recipe often produces the opposite pattern: weak anchor scores but stronger reconstruction and pixel signals, allowing fusion to rescue the result. That does not make its anchor representation better.
 
 ## 6. Training Behavior
 
-### 6.1 Stage-1 Validation vs Test
+### 6.1 Validation Versus Test
 
-| Run | Best Val Image | Best Epoch | Actual Epochs | Test Image | Val-Test Gap |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `gelu_dropout_global_k1_finetune` | `0.9071` | `34` | `44` | `0.7974` | `0.1096` |
-| `gelu_dropout_global_k1_frozen_timm_2` | `0.8240` | `98` | `100` | `0.7966` | `0.0274` |
-| `gelu_dropout_global_k64_finetune` | `0.8304` | `5` | `20` | `0.6860` | `0.1444` |
-| `gelu_dropout_global_k64_frozen_timm` | `0.7552` | `1` | `20` | `0.7474` | `0.0078` |
-| `gelu_dropout_global_k1024_finetune` | `0.8368` | `5` | `20` | `0.7057` | `0.1311` |
-| `gelu_dropout_global_k1024_frozen_timm` | `0.8019` | `1` | `20` | `0.7770` | `0.0249` |
-| `gelu_dropout_patch_location_k1_finetune` | `0.8566` | `42` | `52` | `0.7179` | `0.1387` |
-| `gelu_dropout_patch_location_k1_frozen_timm` | `0.8642` | `13` | `23` | `0.8429` | `0.0214` |
-| `gelu_dropout_patch_location_k64_finetune` | `0.7652` | `25` | `35` | `0.5870` | `0.1782` |
-| `gelu_dropout_patch_location_k64_frozen_timm` | `0.8800` | `67` | `77` | `0.8391` | `0.0408` |
+| Run | Best Val | Best Epoch | Actual Epochs | Test Image | Gap |
+|---|---:|---:|---:|---:|---:|
+| Global K=1 frozen | `0.8240` | `98` | `100` | `0.7966` | `0.0274` |
+| Global K=1 full-FT | `0.9071` | `34` | `44` | `0.7974` | `0.1096` |
+| Global K=1 staged | `0.8193` | `96` | `100` | `0.8104` | **`0.0089`** |
+| Global K=64 frozen | `0.7552` | `1` | `20` | `0.7474` | `0.0078` |
+| Global K=64 full-FT | `0.8304` | `5` | `20` | `0.6860` | `0.1444` |
+| Global K=64 staged | `0.7552` | `1` | `20` | `0.7474` | `0.0078` |
+| Global K=1024 frozen | `0.8019` | `1` | `20` | `0.7770` | `0.0249` |
+| Global K=1024 full-FT | `0.8368` | `5` | `20` | `0.7057` | `0.1311` |
+| Global K=1024 staged | `0.8019` | `1` | `20` | `0.7770` | `0.0249` |
+| Patch K=1 frozen | `0.8642` | `13` | `23` | `0.8429` | `0.0214` |
+| Patch K=1 full-FT | `0.8566` | `42` | `52` | `0.7179` | `0.1387` |
+| Patch K=1 staged | `0.8666` | `18` | `28` | `0.8479` | `0.0186` |
+| Patch K=64 frozen | `0.8800` | `67` | `77` | `0.8391` | `0.0408` |
+| Patch K=64 full-FT | `0.7652` | `25` | `35` | `0.5870` | `0.1782` |
+| Patch K=64 staged | `0.8409` | `22` | `32` | `0.8354` | **`0.0056`** |
 
-The training behavior is one of the clearest diagnostics.
+The staged runs generalize much more cleanly than the old full-finetune runs. Their validation-test gaps are in the same small range as frozen+timm.
 
-- finetune+legacy runs have large validation-to-test gaps
-- frozen+timm runs have much smaller validation-to-test gaps
-- the strongest raw run, `patch_location_k1_frozen_timm`, has both high validation AUROC and a small test gap
-- `patch_location_k64_frozen_timm` trains much longer and also transfers well
+The old full-finetune validation scores were misleadingly optimistic. This is especially severe for patch K=64: validation `0.7652`, test `0.5870`.
 
-This strongly suggests that the finetune+legacy recipe is overfitting or miscalibrating the projection space under GELU/dropout, especially for patch-location.
+### 6.2 Warm-Up And Unfreeze Transition
 
-### 6.2 Runtime And Failure
+| Staged Run | Best Warm-up Val | Best Post-Unfreeze Val | Selected Phase |
+|---|---:|---:|---|
+| Global K=1 | `0.7529` | **`0.8193`** | partial unfreeze |
+| Global K=64 | **`0.7552`** | `0.7069` | warm-up |
+| Global K=1024 | **`0.8019`** | `0.7319` | warm-up |
+| Patch K=1 | `0.8572` | **`0.8666`** | partial unfreeze |
+| Patch K=64 | `0.8228` | **`0.8409`** | partial unfreeze |
 
-The recorded sweep runtime was `1238.52` minutes before failure.
+The schedule executed as configured in all five logs:
 
-| Run | Status | Runtime (min) |
-| --- | --- | ---: |
-| `gelu_dropout_global_k1_frozen_timm` | completed | `232.66` |
-| `gelu_dropout_global_k1_finetune` | completed | `107.56` |
-| `gelu_dropout_patch_location_k1_frozen_timm` | completed | `75.55` |
-| `gelu_dropout_patch_location_k1_finetune` | completed | `109.33` |
-| `gelu_dropout_global_k64_frozen_timm` | completed | `68.02` |
-| `gelu_dropout_global_k64_finetune` | completed | `73.65` |
-| `gelu_dropout_patch_location_k64_frozen_timm` | completed | `160.54` |
-| `gelu_dropout_patch_location_k64_finetune` | completed | `99.49` |
-| `gelu_dropout_global_k1024_frozen_timm` | completed | `68.66` |
-| `gelu_dropout_global_k1024_finetune` | completed | `58.19` |
-| `gelu_dropout_patch_location_k1024_frozen_timm` | failed | `184.88` |
-| `gelu_dropout_patch_location_k1024_finetune` | failed | `459.27` |
+- epochs `0-4`: `stage1_backbone_trainable = false`;
+- epoch `5+`: `stage1_backbone_trainable = true`;
+- epoch-5 head LR approximately `9.94e-5`;
+- epoch-5 backbone LR approximately `9.94e-7`.
 
-Both failed runs built:
+Checkpoint selection is essential to interpreting the result. A configuration can execute partial unfreezing while its final reported detector still comes from the earlier head-only phase.
 
-- local centroid bank: `(1024, 15, 15, 384)`
-- summary anchors: `(1024, 384)`
+### 6.3 Runtime And Memory
 
-It then failed during the first training epoch:
+The staged sweep completed in `960.19` minutes:
 
-- error: CUDA out of memory
-- attempted allocation: `7.03 GiB`
-- GPU capacity: `15.92 GiB`
+| Run | Runtime (min) |
+|---|---:|
+| Global K=1 staged | `389.29` |
+| Patch K=1 staged | `162.91` |
+| Global K=64 staged | `129.07` |
+| Patch K=64 staged | `162.98` |
+| Global K=1024 staged | `115.93` |
 
-That failure is methodologically important. Patch-location `K=1024` is not just "missing"; under the current batch size and implementation, both frozen and finetune variants are beyond available memory.
+The patch-location `K=1024` memory failure remains:
+
+- local bank `(1024, 15, 15, 384)`;
+- summary anchors `(1024, 384)`;
+- failure during first backward pass;
+- allocation request about `7.03 GiB` on a 16 GB GPU.
+
+Freezing or partially unfreezing DINOv3 does not remove the dense projection graph for `1024 × 15 × 15` local anchors.
 
 ## 7. Comparison To Existing Baselines
 
 | Run | Image AUROC | Fused AUROC | Pixel AUROC | Comment |
-| --- | ---: | ---: | ---: | --- |
-| `gelu_dropout_patch_location_k1_frozen_timm` | `0.8429` | `0.7469` | `0.8898` | best GELU/dropout raw run |
-| `gelu_dropout_patch_location_k64_frozen_timm` | `0.8391` | `0.7657` | `0.8916` | nearly same raw image score |
-| `gelu_dropout_global_k1_finetune` | `0.7974` | `0.7724` | `0.9193` | best GELU/dropout fused run |
-| `patch_location_kmeans_stage2recon_cosine_k32` | `0.7958` | `0.8295` | `0.9350` | best location-kmeans fused baseline |
-| `patch_stage2e70_k32` | `0.8119` | `0.8282` | `0.9298` | best original patch stage2e70 baseline |
-| `full_redesign_stage2e70_k1024` | `0.7685` | `0.8260` | `0.9195` | best redesign fused baseline |
-| `patchcore_dinov3_vitsmall_2` | `0.8837` | n/a | `0.9612` | strongest non-CAM-anchor baseline |
+|---|---:|---:|---:|---|
+| `gelu_dropout_patch_location_k1_finetune_timm` | **`0.8479`** | `0.6948` | `0.8961` | new GELU/dropout raw leader |
+| `gelu_dropout_patch_location_k1_frozen_timm` | `0.8429` | `0.7469` | `0.8898` | simpler near-tied detector |
+| `gelu_dropout_patch_location_k64_finetune_timm` | `0.8354` | `0.7303` | `0.8843` | best family reconstruction AUROC |
+| `patch_location_kmeans_stage2recon_cosine_k32` | `0.7958` | `0.8295` | `0.9350` | stronger fused location-kmeans baseline |
+| `patch_stage2e70_k32` | `0.8119` | `0.8282` | `0.9298` | stronger fused original patch baseline |
+| `full_redesign_stage2e70_k1024` | `0.7685` | `0.8260` | `0.9195` | stronger fused global baseline |
+| `patchcore_dinov3_vitsmall_2` | `0.8837` | n/a | `0.9612` | strongest listed non-CAM-anchor baseline |
 
-The comparison is nuanced.
-
-1. `gelu_dropout_patch_location_k1_frozen_timm` is a strong raw image detector. It beats the late patch/location-kmeans and stage2e70 raw image baselines listed here.
-2. It does not beat the strongest historical raw-image or PatchCore results in `docs/EXPERIMENT_INVENTORY.md`.
-3. It does not produce a competitive fused score.
-4. Pixel AUROC is weaker than the late reconstruction-heavy patch/location baselines.
-
-So the GELU/dropout sweep gives a potentially useful raw anchor baseline, not a new best overall fused detector.
+The staged run improves the GELU/dropout raw leaderboard but does not improve the thesis-facing fused leaderboard. PatchCore remains stronger on both image and pixel AUROC.
 
 ## 8. What Happened, And Why
 
-### 8.1 GELU/Dropout Helped The Frozen Patch Anchor Path
+### 8.1 The Staged Recipe Preserved Pretrained Geometry
 
-The strongest result is not global and not large-K. It is:
+The old full-finetune setup exposed all DINOv3 blocks to gradients from a new stochastic projection head at the same `1e-4` LR. It also used a different preprocessing path from the frozen runs.
 
-- patch-location
-- `K=1`
-- frozen backbone
-- timm transforms
-- GELU/dropout projection head
+The staged recipe reduces all three risks:
 
-That result reached `0.8429` image AUROC with a small validation-to-test gap. `K=64` stayed close at `0.8391`.
+- the projection head learns for five epochs before DINOv3 receives gradients;
+- only the final two blocks and final norm are trainable;
+- their LR is 100 times lower than the head LR;
+- timm preprocessing matches the frozen control.
 
-This suggests the projection-head regularization can make the frozen local-anchor detector more robust, but it does not need many anchors to do so.
+The large raw-AUROC recovery, especially in patch-location, is consistent with preservation of pretrained anchor geometry.
 
-### 8.2 Finetuning Was Usually Harmful For Image AUROC
+### 8.2 Preservation Is Not The Same As Beneficial Adaptation
 
-The finetune+legacy recipe was especially poor in patch-location mode.
+Four of five staged-vs-frozen raw comparisons are within `0.005`, except global K=1 at `+0.0138`.
 
-- `K=1`: `0.8429 -> 0.7179` when moving from frozen+timm to finetune+legacy
-- `K=64`: `0.8391 -> 0.5870`
+For global K=64 and K=1024, the selected checkpoints precede unfreezing entirely. Those experiments actively argue against adapting the backbone for global multi-anchor scoring under the current objective.
 
-The validation-test gaps support the interpretation that this is not just undertraining. Finetune runs often looked much better on validation than on test.
+### 8.3 Patch Adaptation Is Stable But Test-Neutral
 
-### 8.3 Pixel AUROC And Image AUROC Split Apart
+Both patch runs improve validation after epoch 5 and select post-unfreeze checkpoints. This means the optimization is not simply falling back to a frozen solution.
 
-Finetune+legacy often had higher pixel AUROC but lower image AUROC.
+Nevertheless:
 
-That means the reconstruction maps remained locally useful, but the image-level anchor ranking became worse. This is another reminder that pixel AUROC is not a substitute for image-level detection quality in this project.
+- K=1 test delta versus frozen is `+0.0050`;
+- K=64 test delta is `-0.0037`.
 
-### 8.4 Fixed Fusion Weights Are A Problem Here
+The adaptation is safe and well-regularized, but its benefit does not survive as a material test improvement.
 
-The best raw runs are damaged by stored fusion.
+### 8.4 Anchor And Reconstruction Objectives Still Pull Differently
 
-For `gelu_dropout_patch_location_k1_frozen_timm`, fused AUROC is almost `0.096` below raw image AUROC. For `gelu_dropout_patch_location_k64_frozen_timm`, it is about `0.073` lower.
+Full finetuning often improves reconstruction and pixel AUROC while damaging anchor AUROC. Staged finetuning restores the anchor score but usually gives up those auxiliary gains.
 
-That means the current fusion rule should not be used uncritically for this family. If this family is cited, the raw image score and fused score need to be reported separately.
+Patch K=64 shows that a middle ground is possible: reconstruction AUROC rises to `0.7447` while raw image AUROC stays near frozen. Its fixed fusion still drops to `0.7303` because divergence remains anti-informative (`0.2360`).
 
-### 8.5 Large K Did Not Help In The Completed Runs
+### 8.5 GELU/Dropout Still Does Not Favor Large K
 
-In the global branch:
+Global K=1 staged is the best global raw result (`0.8104`). K=64 and K=1024 prefer epoch-1 warm-up checkpoints and do not benefit from partial unfreezing.
 
-- `K=1` is best for finetune raw image and fused AUROC
-- `K=1` is also effectively best for frozen raw image
-- `K=1024` does not recover a large-K advantage
+Patch K=64 does not improve raw AUROC over K=1, and patch K=1024 remains infeasible.
 
-In the patch branch:
-
-- `K=64` does not improve raw image AUROC over `K=1`
-- `K=1024` fails on memory before a result exists
-
-So GELU/dropout does not currently support a "larger K is better" conclusion.
+Nothing in the extended sweep supports a “larger K is better” conclusion.
 
 ## 9. Practical Verdict
 
-The GELU/dropout family is valuable, but for a narrower reason than originally hoped.
+### 9.1 What The Extended Family Shows
 
-### 9.1 What It Proves
+1. The original full-finetune+legacy recipe was unnecessarily destructive to anchor geometry.
+2. Warm-up, partial unfreezing, low backbone LR, and timm preprocessing form a much safer combined recipe.
+3. Staged finetuning produces small validation-test gaps and avoids the severe overfitting of full finetuning.
+4. Global K=1 can gain modestly from gentle adaptation.
+5. Global K=64 and K=1024 still prefer head-only checkpoints.
+6. Patch-location can tolerate gentle adaptation, but test AUROC remains effectively tied with frozen+timm.
+7. Fixed fusion remains unsuitable for the strongest raw detectors.
 
-1. A GELU/dropout projection head can produce a strong frozen patch-location raw detector.
-2. Frozen+timm is much safer than finetune+legacy for patch-location image AUROC.
-3. Finetuning with this recipe creates large validation-test gaps.
-4. The fixed stage-2 fusion rule can hide strong raw anchor performance.
-5. Patch-location `K=1024` needs memory-oriented changes before it can be evaluated.
+### 9.2 What It Does Not Show
 
-### 9.2 What It Does Not Prove
-
-1. It does not prove GELU/dropout is a universal improvement.
-2. It does not produce a new best fused CAM-anchor detector.
-3. It does not show that large K helps.
-4. It does not give a completed patch-location `K=1024` comparison.
-5. It does not isolate freezing from transform choice, because those settings are coupled.
+1. It does not isolate whether warm-up, timm preprocessing, partial depth, or lower LR caused the recovery.
+2. It does not establish staged finetuning as superior to freezing.
+3. It does not rescue global multi-anchor adaptation.
+4. It does not make GELU/dropout the strongest fused CAM-anchor family.
+5. It does not solve patch-location K=1024 memory usage.
 
 ## 10. Recommendations
 
-### 10.1 Keep As A Raw-Image Baseline
+### 10.1 Keep Two Raw-Image References
 
-Keep `gelu_dropout_patch_location_k1_frozen_timm` as a serious raw image AUROC baseline:
+Report both:
 
-- image AUROC: `0.8429`
-- fused AUROC: `0.7469`
-- pixel AUROC: `0.8898`
+- `patch_location_k1_finetune_timm`: image AUROC `0.8479`;
+- `patch_location_k1_frozen_timm`: image AUROC `0.8429`.
 
-It is not the best overall method, but it is one of the cleaner late-family raw anchor results.
+The staged run is numerically best; the frozen run is simpler and nearly tied.
 
-### 10.2 Do Not Use Stored Fusion As The Main Claim
+### 10.2 Treat Frozen+Timm As The Default
 
-For this family, stored fusion is often misleading. Any thesis table should include raw image AUROC alongside fused AUROC.
+Frozen+timm remains the best default when:
 
-The most honest presentation is:
+- simplicity and reproducibility matter;
+- the raw score difference is negligible;
+- global K is greater than 1;
+- preserving pretrained patch geometry is the primary goal.
 
-- GELU/dropout improves a frozen patch-location anchor score
-- the current stage-2 fusion recipe is not calibrated for that improved anchor score
+Use staged finetuning as a focused low-K option, not as the universal training policy.
 
-### 10.3 Rerun Only Focused Follow-Ups
+### 10.3 Separate The Staged Components
 
-The most useful follow-ups are small and targeted:
+Before another broad sweep, run K=1 pilots for:
 
-1. Retune fusion weights for `gelu_dropout_patch_location_k1_frozen_timm` and `k64_frozen_timm`, especially reducing or removing divergence.
-2. Decouple the two recipe axes:
-   - frozen + legacy transforms
-   - frozen + timm transforms
-   - finetune + legacy transforms
-   - finetune + timm transforms
-3. Retry patch-location high K only after lowering memory pressure:
-   - smaller batch size
-   - gradient accumulation
-   - fewer local centroids, such as `K=128` or `K=256`
-   - chunked local distance computation
-4. Search the lower K region first:
-   - `K=1`, `K=4`, `K=16`, `K=32`, `K=64`
+1. timm + one unfrozen block;
+2. timm + two unfrozen blocks;
+3. timm + low LR without head warm-up;
+4. timm + head-only throughout.
 
-### 10.4 Avoid Broad Claims About Finetuning
+This would determine whether the gain comes from actual backbone adaptation or simply from avoiding the original aggressive recipe.
 
-The sweep shows that this finetune+legacy recipe is harmful here. It does not prove that all finetuning is harmful.
+### 10.4 Fix Fusion Before Expanding K
 
-The right claim is narrower:
+For strong raw patch runs:
 
-- under GELU/dropout, with these transforms and training settings, finetuning generalizes poorly compared with frozen+timm, especially for patch-location.
+- allow anchor-only selection;
+- tune fusion weights on validation;
+- permit zero weight for divergence or pixel aggregation;
+- report per-signal AUROC alongside fused AUROC.
+
+The fixed `0.4 / 0.3 / 0.3` rule should not be the primary endpoint when an auxiliary signal has AUROC below `0.5`.
+
+### 10.5 Keep Patch K=1024 Out Of Training Sweeps
+
+Retry only after:
+
+- chunking local distance computation;
+- pre-projecting or caching dense anchors;
+- reducing batch size;
+- or reducing K to `128` or `256`.
 
 ## 11. Bottom Line
 
-The GELU/dropout sweep produced one important result:
+The follow-up changes the interpretation of the original sweep.
 
-- `gelu_dropout_patch_location_k1_frozen_timm` reached `0.8429` raw image AUROC
+It is no longer accurate to say that finetuning itself is categorically harmful. Aggressive full-backbone finetuning at the head LR, combined with legacy preprocessing, was harmful. A five-epoch head warm-up followed by two-block finetuning at `1e-6` with timm preprocessing preserves the pretrained detector far more effectively.
 
-That is a meaningful late-stage raw detector result. But the broader family is not a new overall winner.
+But the staged recipe mostly converges back to frozen+timm performance:
 
-- the best fused result is only `0.7724`
-- the strongest raw runs are damaged by fixed fusion
-- finetune+legacy often overfits
-- larger K does not help in the completed runs
-- patch-location `K=1024` is currently blocked by memory
+- modest gain for global K=1;
+- near-tie for both patch runs;
+- head-only checkpoint selection for global K=64 and K=1024.
 
-So the current interpretation is:
+The family’s strongest claim is therefore:
 
-- GELU/dropout is useful for the frozen patch-location anchor path
-- frozen+timm is the better policy for image-level detection in this sweep
-- the stage-2 fusion recipe needs retuning before this family can be fairly judged as a fused detector
-- the family should be cited as a promising raw-anchor ablation, not as a replacement for `patch_location_kmeans_stage2recon_cosine_k32`, `patch_stage2e70_k32`, or PatchCore
+> Gentle staged finetuning is a viable way to avoid destroying DINOv3 anchor geometry, but it provides limited evidence of improvement over simply freezing the backbone.

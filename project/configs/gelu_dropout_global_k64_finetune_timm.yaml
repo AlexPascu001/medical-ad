@@ -1,0 +1,113 @@
+# GELU/dropout global CLS family: K=64, trainable backbone, timm eval transforms.
+seed: 42
+output_dir: './runs/gelu_dropout_global_k64_finetune_timm'
+
+data:
+  data_root: './data/BraTS2021_slice'
+  target_size: [240, 240]
+  normalization: zscore_only
+  train_augment_mode: 'none'
+  use_timm_transforms: true
+  timm_data_config: {}
+
+anchor:
+  strategy: 'kmeans'
+  n_components: 50
+  n_anchors: 64
+  max_images_for_pca: 5000
+  learnable: false
+  use_embedding_space: true
+  reproject_anchors: true
+  representation: 'centroids'
+  prune:
+    min_k: 10
+    discard_ratio: 0.2
+
+model:
+  backbone: 'vit_small_patch16_dinov3.lvd1689m'
+  freeze_backbone: false
+  projection_dim: 128
+  projection_activation: 'gelu'
+  projection_dropout: 0.2
+
+loss:
+  margin: 1.0
+  alpha: 1.0
+  beta: 0.5
+  gamma: 0.0
+  delta: 0.0
+  min_norm: 0.5
+  diversity_temperature: 0.1
+  distance_metric: 'euclidean'
+  use_dense: false
+  global_weight: 1.0
+  dense_weight: 0.5
+  spatial_reduction: 'mean'
+
+pretraining:
+  enabled: false
+
+training:
+  epochs: 100
+  batch_size: 64
+  num_workers: 4
+  lr: 0.0001
+  head_warmup_epochs: 5
+  unfreeze_last_n_blocks: 2
+  backbone_lr: 0.000001
+  weight_decay: 0.0001
+  use_amp: true
+  log_interval: 50
+  val_interval: 1
+  early_stopping_patience: 10
+  min_epochs_before_early_stopping: 20
+  fixed_pseudo_labels: true
+  dynamic_reassignment: false
+  reassignment_interval: 5
+  pseudo_label_assignment: 'capacitated'
+  capacity_multiplier: 2.0
+  save_checkpoints: false
+
+stage2:
+  enabled: true
+  epochs: 70
+  lr: 0.0001
+  weight_decay: 0.0001
+  freeze_encoder: true
+  freeze_anchors: true
+  freeze_anchor_target: true
+  frozen_bottleneck: true
+  recon_loss: 'mse'
+  recon_weight: 1.0
+  consistency_loss: 'cosine'
+  consistency_weight: 0.1
+  alignment_weight: 0.1
+  alignment_target: 'anchor'
+  freeze_encoder_mode: 'full'
+  unfreeze_last_n_blocks: 2
+  unfreeze_lr_multiplier: 0.1
+  early_stopping_patience: 10
+  early_stopping_metric: 'pixel_aggregated_image_auroc'
+  pixel_map:
+    enabled: true
+    type: 'reconstruction_l2'
+  pixel_metrics:
+    enabled: true
+  pixel_aggregation:
+    method: 'top_k_percentile'
+    percentile: 95
+    threshold_n_std: 2.0
+  score_fusion:
+    enabled: true
+    normalization: 'minmax'
+    anchor_weight: 0.4
+    divergence_weight: 0.3
+    pixel_weight: 0.3
+  score_combination:
+    enabled: false
+    alpha: 0.5
+    normalization: 'minmax'
+
+eval:
+  compute_pixel: true
+  bootstrap_samples: 1000
